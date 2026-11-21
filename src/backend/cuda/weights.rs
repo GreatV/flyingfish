@@ -1934,12 +1934,423 @@ struct DenseSlot {
     loaded: Option<usize>,
 }
 
+/// One layer range the disk supply reads into its pinned slot.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+struct SupplyRange {
+    source_offset: usize,
+    shard: Arc<str>,
+    offset: u64,
+    len: u64,
+}
+
+/// Per-layer state of the disk supply: queued by the consumer's pump, claimed into a
+/// slot by a worker, published for the consumer's demand, retired after its upload.
+#[derive(Clone)]
+enum SupplyLayer {
+    Waiting,
+    Queued,
+    Reading,
+    Ready(usize),
+    Consumed,
+    Failed,
+}
+
+struct SupplyState {
+    layer: Vec<SupplyLayer>,
+    /// Completed reads per layer.
+    reads: Vec<u64>,
+    pending: std::collections::VecDeque<usize>,
+    free: Vec<bool>,
+    outstanding: usize,
+    failure: Option<String>,
+    published: u64,
+    retired: u64,
+}
+
+impl SupplyState {
+    /// Admits `layer` unless it is already in flight; `false` when capacity holds.
+    /// A layer the consumer will demand next stays at or ahead of the pump cursor.
+    fn admit(&mut self, layer: usize, capacity: usize) -> bool {
+        if !matches!(
+            self.layer[layer],
+            SupplyLayer::Waiting | SupplyLayer::Consumed
+        ) {
+            return true;
+        }
+        if self.outstanding >= capacity {
+            return false;
+        }
+        self.layer[layer] = SupplyLayer::Queued;
+        self.pending.push_back(layer);
+        self.outstanding += 1;
+        true
+    }
+
+    /// The layer's published slot, `None` while its read is queued, in flight or failed.
+    /// A layer with no read queued or in flight errors naming its next visit.
+    fn ready(&self, layer: usize) -> Result<Option<usize>> {
+        match self.layer[layer] {
+            SupplyLayer::Ready(slot) => Ok(Some(slot)),
+            SupplyLayer::Queued | SupplyLayer::Reading | SupplyLayer::Failed => Ok(None),
+            SupplyLayer::Waiting | SupplyLayer::Consumed => bail!(
+                "dense supply layer {layer} is demanded on visit {} with no read queued or in flight",
+                self.reads[layer] + 1
+            ),
+        }
+    }
+}
+
+/// State shared between the dense consumer and the supply workers.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+struct SupplyShared {
+    ranges: Vec<Vec<SupplyRange>>,
+    source_bytes: Vec<usize>,
+    slot_base: Vec<*mut u8>,
+    readers: BTreeMap<String, crate::experts::disk::SpanReader>,
+    events: Vec<crate::backend::gpu::CudaEvent>,
+    context: Arc<CudaContext>,
+    state: std::sync::Mutex<SupplyState>,
+    changed: std::sync::Condvar,
+    abort: std::sync::atomic::AtomicBool,
+}
+
+// SAFETY: a slot's base is written only by its owning worker between the free claim and
+// the ready publish, and read only by the consumer between demand and retire.
+unsafe impl Send for SupplyShared {}
+unsafe impl Sync for SupplyShared {}
+
+/// Concurrent disk supply of a dense streaming tier: `workers` threads read whole disk
+/// layers through the aligned direct reader into per-layer pinned slots; the consumer
+/// uploads from a slot and retires it by event, and a worker reuses a slot only after its
+/// event completed. A failed read replays on every demand; `Drop` joins the workers
+/// before the slots free.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub(crate) struct LayerSupply {
+    shared: Arc<SupplyShared>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+    /// Registered slot buffers; `Drop` unregisters every address before they free.
+    registrations: Vec<(usize, crate::experts::disk::AlignedBytes)>,
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+impl LayerSupply {
+    fn spawn(
+        workers: usize,
+        ranges: Vec<Vec<SupplyRange>>,
+        source_bytes: Vec<usize>,
+        slot_bytes: usize,
+        dir: &Path,
+        context: &Arc<CudaContext>,
+    ) -> Result<Self> {
+        ensure!(workers > 0, "dense supply worker count is zero");
+        ensure!(
+            ranges.len() == source_bytes.len(),
+            "dense supply ranges and sizes differ"
+        );
+        let disk_layers = ranges.iter().filter(|ranges| !ranges.is_empty()).count();
+        ensure!(disk_layers > 0, "dense supply holds no disk layers");
+        let slot_count = workers.min(disk_layers);
+        ensure!(slot_bytes > 0, "dense supply slot bytes is zero");
+        let mut readers = BTreeMap::new();
+        for shard in ranges
+            .iter()
+            .flatten()
+            .map(|range| range.shard.as_ref())
+            .collect::<BTreeSet<_>>()
+        {
+            readers.insert(
+                shard.to_string(),
+                crate::experts::disk::SpanReader::open(&dir.join(shard), true)?,
+            );
+        }
+        let alignment = readers
+            .values()
+            .map(|reader| reader.alignment as usize)
+            .max()
+            .unwrap_or(4096);
+        context.bind_to_thread()?;
+        let mut registrations = Vec::with_capacity(slot_count);
+        let mut slot_base = Vec::with_capacity(slot_count);
+        let mut events = Vec::with_capacity(slot_count);
+        for _ in 0..slot_count {
+            let mut buffer = crate::experts::disk::AlignedBytes::new(slot_bytes, alignment)?;
+            let base = buffer.as_mut().as_mut_ptr();
+            // SAFETY: the buffer lives in `registrations` through the supply's Drop,
+            // which unregisters the address before it frees.
+            #[cfg(feature = "cuda")]
+            unsafe {
+                cudarc::driver::sys::cuMemHostRegister_v2(base.cast(), slot_bytes, 0)
+                    .result()
+                    .context("register dense supply slot")?;
+            }
+            #[cfg(feature = "rocm")]
+            unsafe {
+                context
+                    .register_host(base as u64, slot_bytes, false)
+                    .context("register dense supply slot")?;
+            }
+            registrations.push((base as usize, buffer));
+            slot_base.push(base);
+            events.push(context.new_event(None)?);
+        }
+        let state = SupplyState {
+            layer: vec![SupplyLayer::Waiting; ranges.len()],
+            reads: vec![0; ranges.len()],
+            pending: std::collections::VecDeque::new(),
+            free: vec![true; slot_count],
+            outstanding: 0,
+            failure: None,
+            published: 0,
+            retired: 0,
+        };
+        let shared = Arc::new(SupplyShared {
+            ranges,
+            source_bytes,
+            slot_base,
+            readers,
+            events,
+            context: context.clone(),
+            state: std::sync::Mutex::new(state),
+            changed: std::sync::Condvar::new(),
+            abort: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut handles = Vec::with_capacity(slot_count);
+        for slot in 0..slot_count {
+            let worker = std::thread::Builder::new()
+                .name(format!("dense-supply-{slot}"))
+                .spawn({
+                    let shared = Arc::clone(&shared);
+                    move || supply_worker(shared, slot, alignment)
+                })
+                .context("spawn dense supply worker");
+            match worker {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    shared
+                        .abort
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    shared.changed.notify_all();
+                    for handle in handles {
+                        let _ = handle.join();
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(Self {
+            shared,
+            handles,
+            registrations,
+        })
+    }
+
+    /// Admits layers from the demand cursor while capacity holds, for at most one turn of the
+    /// cyclic `chain` from the cursor's position. The cursor moves only past layers that are
+    /// admitted or already in flight, so it stops at the first layer capacity holds.
+    fn pump(&self, cursor: &mut Option<usize>, chain: impl Fn(usize) -> Option<usize>) {
+        let capacity = self.handles.len();
+        let turn = *cursor;
+        let mut state = self.shared.state.lock().expect("dense supply lock");
+        while let Some(index) = *cursor {
+            if !state.admit(index, capacity) {
+                break;
+            }
+            *cursor = chain(index);
+            if *cursor == turn {
+                break;
+            }
+        }
+        drop(state);
+        self.shared.changed.notify_all();
+    }
+
+    /// Waits the layer's pinned slot. The bytes stay live until [`Self::retire`]. A layer with
+    /// no read queued or in flight errors.
+    fn demand(&self, layer: usize) -> Result<(*const u8, usize)> {
+        let mut state = self.shared.state.lock().expect("dense supply lock");
+        loop {
+            if let Some(failure) = &state.failure {
+                bail!("dense supply read failed: {failure}");
+            }
+            if let Some(slot) = state.ready(layer)? {
+                return Ok((self.shared.slot_base[slot] as *const u8, slot));
+            }
+            state = self.shared.changed.wait(state).expect("dense supply lock");
+        }
+    }
+
+    /// Retires the layer's slot after its upload was issued on `stream`.
+    fn retire(&self, layer: usize, slot: usize, stream: &Arc<CudaStream>) -> Result<()> {
+        self.shared.events[slot].record(stream)?;
+        let mut state = self.shared.state.lock().expect("dense supply lock");
+        state.layer[layer] = SupplyLayer::Consumed;
+        state.free[slot] = true;
+        state.outstanding = state
+            .outstanding
+            .checked_sub(1)
+            .context("dense supply retire without outstanding layer")?;
+        state.retired = state
+            .retired
+            .checked_add(1)
+            .expect("dense supply retired overflow");
+        drop(state);
+        self.shared.changed.notify_all();
+        Ok(())
+    }
+
+    /// Waits until no layer is queued or reading; returns published and retired counts.
+    #[cfg(test)]
+    fn flush_counts(&self) -> Result<(u64, u64)> {
+        let mut state = self.shared.state.lock().expect("dense supply lock");
+        loop {
+            if let Some(failure) = &state.failure {
+                bail!("dense supply read failed: {failure}");
+            }
+            if state.pending.is_empty()
+                && state
+                    .layer
+                    .iter()
+                    .all(|layer| !matches!(layer, SupplyLayer::Reading))
+            {
+                let counts = (state.published, state.retired);
+                return Ok(counts);
+            }
+            state = self.shared.changed.wait(state).expect("dense supply lock");
+        }
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+impl Drop for LayerSupply {
+    fn drop(&mut self) {
+        self.shared
+            .abort
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.shared.changed.notify_all();
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+        let context = self.shared.context.clone();
+        for (address, _) in self.registrations.drain(..) {
+            let _ = context.bind_to_thread();
+            // SAFETY: the workers joined; no access remains to the registered range.
+            #[cfg(feature = "cuda")]
+            let _ = unsafe {
+                cudarc::driver::sys::cuMemHostUnregister(address as *mut std::ffi::c_void)
+            }
+            .result();
+            #[cfg(feature = "rocm")]
+            let _ = unsafe { context.unregister_host(address as u64) };
+        }
+    }
+}
+
+/// One supply worker: claims the next queued layer into its slot, waits the slot's
+/// previous upload event, reads the layer's ranges through the aligned direct reader,
+/// and publishes the slot or records the failure.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+fn supply_worker(shared: Arc<SupplyShared>, slot: usize, alignment: usize) {
+    if let Err(error) = shared.context.bind_to_thread() {
+        let mut state = shared.state.lock().expect("dense supply lock");
+        state.failure = Some(format!("{error:#}"));
+        shared.changed.notify_all();
+        return;
+    }
+    let mut bounce = crate::experts::disk::AlignedBytes::new(alignment, alignment)
+        .expect("dense supply bounce allocation");
+    loop {
+        let layer = {
+            let mut state = shared.state.lock().expect("dense supply lock");
+            loop {
+                if shared.abort.load(std::sync::atomic::Ordering::SeqCst) || state.failure.is_some()
+                {
+                    return;
+                }
+                if let Some(index) = state.pending.front().copied()
+                    && matches!(state.layer[index], SupplyLayer::Queued)
+                    && state.free[slot]
+                {
+                    state.pending.pop_front();
+                    state.layer[index] = SupplyLayer::Reading;
+                    state.free[slot] = false;
+                    break index;
+                }
+                state = shared.changed.wait(state).expect("dense supply lock");
+            }
+        };
+        let outcome = (|| -> Result<()> {
+            shared.events[slot].synchronize()?;
+            read_supply_layer(&shared, layer, slot, &mut bounce, alignment)
+        })();
+        let mut state = shared.state.lock().expect("dense supply lock");
+        match outcome {
+            Ok(()) => {
+                state.layer[layer] = SupplyLayer::Ready(slot);
+                state.reads[layer] = state.reads[layer]
+                    .checked_add(1)
+                    .expect("dense supply read count overflow");
+                state.published = state
+                    .published
+                    .checked_add(1)
+                    .expect("dense supply published overflow");
+            }
+            Err(error) => {
+                state.layer[layer] = SupplyLayer::Failed;
+                state.failure = Some(format!("{error:#}"));
+            }
+        }
+        drop(state);
+        shared.changed.notify_all();
+    }
+}
+
+/// Reads the layer's ranges through the aligned direct reader into its slot.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+fn read_supply_layer(
+    shared: &SupplyShared,
+    layer: usize,
+    slot: usize,
+    bounce: &mut crate::experts::disk::AlignedBytes,
+    alignment: usize,
+) -> Result<()> {
+    let bytes = shared.source_bytes[layer];
+    // SAFETY: the worker owns the slot between its claim and the ready publish.
+    let destination = unsafe { std::slice::from_raw_parts_mut(shared.slot_base[slot], bytes) };
+    for range in &shared.ranges[layer] {
+        let reader = shared
+            .readers
+            .get(range.shard.as_ref())
+            .with_context(|| format!("dense layer {layer}: shard not open"))?;
+        let head = (range.offset as usize) % alignment;
+        let begin = range
+            .offset
+            .checked_sub(head as u64)
+            .context("dense supply aligned begin underflow")?;
+        let width = range
+            .len
+            .checked_add(head as u64)
+            .and_then(|bytes| bytes.checked_add((alignment - 1) as u64))
+            .context("dense supply span overflow")?
+            & !((alignment - 1) as u64);
+        let width = width
+            .min(reader.file_len().saturating_sub(begin))
+            .max(range.len + head as u64) as usize;
+        if bounce.len() < width + alignment {
+            *bounce = crate::experts::disk::AlignedBytes::new(width + alignment, alignment)?;
+        }
+        let span = bounce.as_mut();
+        reader.read_direct(begin, width as u64, span)?;
+        let source = &span[head..head + range.len as usize];
+        destination[range.source_offset..range.source_offset + range.len as usize]
+            .copy_from_slice(source);
+    }
+    Ok(())
+}
+
 pub(crate) struct DenseStreaming {
     layers: Vec<DenseLayer>,
     slots: Vec<DenseSlot>,
-    disk: Option<super::engine::Reader>,
-    events: Option<super::engine::Events>,
-    read_ahead: super::engine::ReadAhead,
+    supply: Option<LayerSupply>,
     next_disk_read: Option<usize>,
     upload: Arc<CudaStream>,
     staging: Option<CudaSlice<u8>>,
@@ -1949,14 +2360,12 @@ pub(crate) struct DenseStreaming {
     /// sm below 80. Disk reads of BF16 weights are rewritten to FP16 before the copy.
     fp16_weights: bool,
     fp16_scratch: Vec<u8>,
-    #[cfg(test)]
-    skip_reclaim: bool,
 }
 
 impl Drop for DenseStreaming {
     fn drop(&mut self) {
         let context = self.upload.context();
-        let _ = self.read_ahead.receive_reader(&mut self.disk, true);
+        let _ = self.supply.take();
         context.record_err(context.synchronize());
     }
 }
@@ -2011,7 +2420,7 @@ impl DenseStreaming {
         preloaded: Option<&[usize]>,
         narrow: Option<fn(&str) -> bool>,
     ) -> Result<Self> {
-        use crate::experts::{catalogue::NativeRange, disk::DiskReader};
+        use crate::experts::catalogue::NativeRange;
         let fp16_weights = d.info.arch.fp16_stored_half();
         let mut layers: Vec<_> = plan
             .slots
@@ -2174,8 +2583,7 @@ impl DenseStreaming {
             .max()
             .map(|index| index + 1)
             .context("dense streaming plan has no slot")?;
-        let ring = u32::try_from(slot_count)?;
-        let (disk, events, read_ahead) = if plan.disk_bytes > 0 {
+        let supply = if plan.disk_bytes > 0 {
             let disk_slot_bytes = layers
                 .iter()
                 .enumerate()
@@ -2183,14 +2591,42 @@ impl DenseStreaming {
                 .map(|(_, layer)| layer.source_bytes)
                 .max()
                 .context("dense disk plan has no disk layers")?;
-            let disk = DiskReader::open_ranges(&ranges, disk_slot_bytes, dir, ring)?;
-            let reader =
-                super::engine::Reader::new_ranges(d, disk, ranges, UPLOAD_CHUNK_BYTES as u64)?;
-            let events = super::engine::Events::new(&d.ctx, (ring as usize) * 4)?;
-            let read_ahead = super::engine::ReadAhead::new(ring, ring, 1)?;
-            (Some(reader), Some(events), read_ahead)
+            let supply_ranges = ranges
+                .into_iter()
+                .map(|mut layer_ranges| {
+                    layer_ranges.sort_by_key(|(_, native)| (native.shard.clone(), native.offset));
+                    layer_ranges
+                        .into_iter()
+                        .map(|(source_offset, native)| {
+                            Ok(SupplyRange {
+                                source_offset: usize::try_from(source_offset)
+                                    .context("dense supply source offset")?,
+                                shard: native.shard,
+                                offset: native.offset,
+                                len: native.len,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let source_bytes = layers
+                .iter()
+                .map(|layer| layer.source_bytes)
+                .collect::<Vec<_>>();
+            let manifest = input
+                .map(|(manifest, _)| manifest)
+                .context("dense supply needs a manifest")?;
+            let workers = super::engine::minimax_h3::dense_supply_workers(dir, manifest)?;
+            Some(LayerSupply::spawn(
+                workers,
+                supply_ranges,
+                source_bytes,
+                disk_slot_bytes,
+                dir,
+                &d.ctx,
+            )?)
         } else {
-            (None, None, super::engine::ReadAhead::new(ring, 0, 1)?)
+            None
         };
         #[cfg(test)]
         allocation_record("disk_reader_events", 0, 0)?;
@@ -2237,9 +2673,7 @@ impl DenseStreaming {
         Ok(Self {
             layers,
             slots,
-            disk,
-            events,
-            read_ahead,
+            supply,
             next_disk_read: first_disk,
             upload: d.upload.clone(),
             staging,
@@ -2248,8 +2682,6 @@ impl DenseStreaming {
             plan,
             fp16_weights,
             fp16_scratch: Vec::new(),
-            #[cfg(test)]
-            skip_reclaim: false,
         })
     }
 
@@ -2339,35 +2771,28 @@ impl DenseStreaming {
                 self.prefetch(first)?;
             }
         }
-        self.pump_disk()
+        self.pump_disk();
+        Ok(())
     }
 
-    fn pump_disk(&mut self) -> Result<()> {
-        if self.plan.disk_bytes == 0 {
-            return Ok(());
-        }
-        self.read_ahead.receive_reader(&mut self.disk, false)?;
-        if !self.read_ahead.is_pending() {
-            self.read_ahead.reclaim_reader(&mut self.disk, false)?;
-        }
-        while let Some(next_disk) = self.next_disk_read {
-            if !self.read_ahead.try_enqueue(next_disk as u32, 0)? {
-                break;
-            }
-            self.next_disk_read = self.layers[next_disk].next_disk;
-        }
-        self.read_ahead
-            .drive_reader(&mut self.disk, self.upload.context())
+    fn pump_disk(&mut self) {
+        let Some(supply) = self.supply.as_ref() else {
+            return;
+        };
+        let layers = &self.layers;
+        supply.pump(&mut self.next_disk_read, |index| layers[index].next_disk);
     }
 
+    /// Waits every outstanding supply layer; test counts of published and retired slots.
     #[cfg(test)]
     pub(crate) fn flush_ring_counts(&mut self) -> Result<(u64, u64)> {
         self.upload.synchronize()?;
-        self.read_ahead.receive_reader(&mut self.disk, true)?;
-        while self.read_ahead.reclaim_reader(&mut self.disk, true)? {}
-        let counts = (self.read_ahead.claims, self.read_ahead.reclaims);
-        self.pump_disk()?;
-        Ok(counts)
+        let (published, retired) = match self.supply.as_ref() {
+            Some(supply) => supply.flush_counts()?,
+            None => (0, 0),
+        };
+        self.pump_disk();
+        Ok((published, retired))
     }
 
     /// Test control: shift one layer entry's source offset by `delta` bytes.
@@ -2406,6 +2831,13 @@ impl DenseStreaming {
         })
     }
 
+    /// Worker count of the disk supply; 0 for a tier without disk layers.
+    pub(crate) fn supply_workers(&self) -> usize {
+        self.supply
+            .as_ref()
+            .map_or(0, |supply| supply.handles.len())
+    }
+
     pub(crate) fn pointer(&self, layer: usize, offset: usize, bytes: usize) -> Result<u64> {
         let binding = self.layers.get(layer).context("dense layer outside plan")?;
         ensure!(
@@ -2423,7 +2855,8 @@ impl DenseStreaming {
             return Ok(());
         };
         if self.slots[slot_index].loaded == Some(index) {
-            return self.pump_disk();
+            self.pump_disk();
+            return Ok(());
         }
         if self.slots[slot_index].retired_valid {
             self.upload.wait(&self.slots[slot_index].retired)?;
@@ -2450,23 +2883,14 @@ impl DenseStreaming {
                 super::copy::htod_async(source_pointer, source, &self.upload)?;
             }
         } else {
-            if self.next_disk_read == Some(index) {
-                self.next_disk_read = self.layers[index].next_disk;
-            }
-            let ring = self.read_ahead.demand_item(
-                &mut self.disk,
-                self.upload.context(),
-                index as u32,
-                0,
-            )?;
-            let reader = self
-                .disk
-                .as_mut()
-                .context("dense disk reader missing after demand")?;
-            let values = reader.disk.values(ring)?;
-            // SAFETY: the ring slot holds at least `source_bytes` initialized bytes for the lease's lifetime.
-            let raw =
-                unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, source_bytes) };
+            self.pump_disk();
+            let (base, slot) = self
+                .supply
+                .as_ref()
+                .context("dense disk supply missing after demand")?
+                .demand(index)?;
+            // SAFETY: the slot holds `source_bytes` initialized bytes until the retire.
+            let raw = unsafe { std::slice::from_raw_parts(base, source_bytes) };
             if check_source {
                 check_layer_source(&self.layers[index], raw)?;
             }
@@ -2498,29 +2922,10 @@ impl DenseStreaming {
             if fp16 {
                 self.fp16_scratch = scratch;
             }
-            #[cfg(test)]
-            if self.skip_reclaim {
-                drop(values);
-                self.read_ahead.release(ring)?;
-            } else {
-                let copied = self
-                    .events
-                    .as_mut()
-                    .context("dense disk events missing")?
-                    .record(&self.upload)?;
-                values.copied(copied.id)?;
-                reader.copied[ring as usize] = Some(copied);
-            }
-            #[cfg(not(test))]
-            {
-                let copied = self
-                    .events
-                    .as_mut()
-                    .context("dense disk events missing")?
-                    .record(&self.upload)?;
-                values.copied(copied.id)?;
-                reader.copied[ring as usize] = Some(copied);
-            }
+            self.supply
+                .as_ref()
+                .context("dense disk supply missing after demand")?
+                .retire(index, slot, &self.upload)?;
         }
         if check_source {
             self.layers[index].checked = true;
@@ -2570,7 +2975,8 @@ impl DenseStreaming {
         }
         self.slots[slot_index].ready.record(&self.upload)?;
         self.slots[slot_index].loaded = Some(index);
-        self.pump_disk()
+        self.pump_disk();
+        Ok(())
     }
 
     pub(crate) fn begin(&mut self, layer: usize, stream: &Arc<CudaStream>) -> Result<()> {
@@ -3519,6 +3925,75 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    fn demand_cursor_layer_is_admitted_under_capacity() {
+        let fresh = || SupplyState {
+            layer: vec![SupplyLayer::Waiting; 4],
+            reads: vec![0; 4],
+            pending: std::collections::VecDeque::new(),
+            free: vec![true; 1],
+            outstanding: 0,
+            failure: None,
+            published: 0,
+            retired: 0,
+        };
+        let chain = |index: usize| (index < 3).then_some(index + 1);
+        let sweep = |state: &mut SupplyState, cursor: &mut Option<usize>| {
+            while let Some(index) = *cursor {
+                if !state.admit(index, 1) {
+                    break;
+                }
+                *cursor = chain(index);
+            }
+        };
+        // Admission owns the cursor: every layer at or ahead of it is admitted or in flight
+        // before the cursor moves on.
+        let mut state = fresh();
+        let mut cursor = Some(0);
+        sweep(&mut state, &mut cursor);
+        assert!(
+            !matches!(state.layer[0], SupplyLayer::Waiting),
+            "layer 0 left waiting behind the demand cursor"
+        );
+        assert_eq!(state.pending.front(), Some(&0));
+        assert!(
+            state
+                .ready(0)
+                .expect("an admitted layer has a read in flight")
+                .is_none()
+        );
+        // Negative control: a cursor advanced past layer 0 before any admission strands it.
+        let mut stranded = fresh();
+        let mut skip = chain(0);
+        sweep(&mut stranded, &mut skip);
+        assert!(matches!(stranded.layer[0], SupplyLayer::Waiting));
+        assert_eq!(stranded.pending.front(), Some(&1));
+        // A demand for a layer with no read queued or in flight errors naming layer and visit.
+        let error = format!(
+            "{:#}",
+            stranded
+                .ready(0)
+                .expect_err("a layer behind the cursor has no read")
+        );
+        assert!(
+            error.contains("layer 0") && error.contains("visit 1"),
+            "{error}"
+        );
+        stranded.layer[1] = SupplyLayer::Consumed;
+        stranded.reads[1] = 1;
+        let error = format!(
+            "{:#}",
+            stranded
+                .ready(1)
+                .expect_err("a consumed layer behind the cursor has no read")
+        );
+        assert!(
+            error.contains("layer 1") && error.contains("visit 2"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
     fn classic_streamed_slots_bind_fused_order_per_layer() -> Result<()> {
         use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope, classic_layer_names};
         let h = 64usize;
@@ -3904,7 +4379,7 @@ mod tests {
                 resident_products.push(values);
             }
             println!("PASS dense_resident layers=4 layer_bytes={per_layer} byte_mismatches=0");
-            for host_layers in [0, 2, 4] {
+            for host_layers in [0, 2, 3, 4] {
                 let plan = crate::prefill::DensePlacement::new(
                     &[per_layer; 4],
                     None,
@@ -3918,7 +4393,7 @@ mod tests {
                 let mut dense = DenseStreaming::new(&root, &manifest, plan, &device, None)?;
                 if host_layers == 4 {
                     ensure!(
-                        dense.disk.is_none() && dense.events.is_none(),
+                        dense.supply.is_none(),
                         "host-only placement allocated disk ring resources"
                     );
                 }
@@ -3979,15 +4454,22 @@ mod tests {
                     }
                 }
                 let (claims, reclaims) = dense.flush_ring_counts()?;
+                let slot_count = dense
+                    .supply
+                    .as_ref()
+                    .map_or(0, |supply| supply.handles.len() as u64);
                 if host_layers == 4 {
                     ensure!(
                         claims == 0 && reclaims == 0,
                         "host-only placement claimed disk ring slots: claims={claims} reclaims={reclaims}"
                     );
                 } else {
+                    // The pump wraps after the last repeat and pre-reads into every free slot;
+                    // a pre-read publishes without a retire.
                     ensure!(
-                        claims == reclaims && claims >= (3 * (4 - host_layers)) as u64,
-                        "disk ring claim/reclaim mismatch: host_layers={host_layers} claims={claims} reclaims={reclaims}"
+                        reclaims == (3 * (4 - host_layers)) as u64
+                            && claims == reclaims + slot_count,
+                        "disk ring claim/reclaim mismatch: host_layers={host_layers} claims={claims} reclaims={reclaims} slots={slot_count}"
                     );
                 }
                 println!(
@@ -4007,38 +4489,27 @@ mod tests {
                 .iter()
                 .position(|layer| layer.slot.is_some() && layer.host.is_none())
                 .context("mixed dense test needs a disk layer")?;
+            let supply = dense
+                .supply
+                .as_ref()
+                .context("mixed dense test lost the supply")?;
             for _ in 0..2 {
-                let ring = dense.read_ahead.demand_item(
-                    &mut dense.disk,
-                    dense.upload.context(),
-                    layer as u32,
-                    0,
-                )?;
-                let reader = dense
-                    .disk
-                    .as_mut()
-                    .context("dense test lost the disk reader")?;
-                let values = reader.disk.values(ring)?;
-                let bytes =
-                    unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), per_layer) };
+                let mut cursor = Some(layer);
+                supply.pump(&mut cursor, |_| None);
+                let (base, slot) = supply.demand(layer)?;
+                let bytes = unsafe { std::slice::from_raw_parts(base, per_layer) };
                 ensure!(
                     bytes == expected[layer],
                     "repeated disk key read different bytes"
                 );
-                let copied = dense
-                    .events
-                    .as_mut()
-                    .context("dense test lost the ring events")?
-                    .record(&dense.upload)?;
-                values.copied(copied.id)?;
-                reader.copied[ring as usize] = Some(copied);
+                supply.retire(layer, slot, &dense.upload)?;
             }
             ensure!(
                 dense.flush_ring_counts()? == (2, 2),
                 "repeated disk key did not retire both copies"
             );
             drop(dense);
-            println!("PASS dense_repeated_disk_key claims=2 reclaims=2 byte_mismatches=0");
+            println!("PASS dense_repeated_disk_key published=2 retired=2 byte_mismatches=0");
 
             unsafe extern "C" fn wait_for_gate(user_data: *mut std::ffi::c_void) {
                 let gate = unsafe { &*(user_data as *const std::sync::atomic::AtomicU32) };
@@ -4046,43 +4517,71 @@ mod tests {
                     std::hint::spin_loop();
                 }
             }
-            for skip_reclaim in [false, true] {
-                let plan =
-                    crate::prefill::DensePlacement::new(&[per_layer; 4], None, 2 * per_layer, 0)?;
-                let mut dense = DenseStreaming::new(&root, &manifest, plan, &device, None)?;
-                populate(&mut dense)?;
-                dense.skip_reclaim = skip_reclaim;
+            {
+                let window = (per_layer / 2).min(4 << 20);
+                let data_start = manifest
+                    .entries
+                    .values()
+                    .next()
+                    .context("dense test entries")?
+                    .data_start;
+                let ranges = (0..3usize)
+                    .map(|layer| {
+                        vec![SupplyRange {
+                            source_offset: 0,
+                            shard: "model.safetensors".into(),
+                            offset: data_start + (layer as u64) * (per_layer as u64),
+                            len: window as u64,
+                        }]
+                    })
+                    .collect::<Vec<_>>();
+                let source_bytes = vec![window; 3];
+                let supply =
+                    LayerSupply::spawn(1, ranges, source_bytes, window, &root, &device.ctx)?;
+                let uploaded = device.upload.clone_htod(&vec![0u8; window])?;
                 let gate = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
                 unsafe {
                     super::super::launch_host_func(
-                        &dense.upload,
+                        &device.upload,
                         wait_for_gate,
                         std::sync::Arc::as_ptr(&gate) as *mut std::ffi::c_void,
                     )
                     .context("hold dense upload stream")?;
                 }
-                dense.prefetch(0)?;
-                dense.prefetch(1)?;
-                if skip_reclaim {
-                    dense.read_ahead.receive_reader(&mut dense.disk, true)?;
+                let chain = |index: usize| (index < 2).then_some(index + 1);
+                let mut cursor = Some(0);
+                supply.pump(&mut cursor, chain);
+                let (base, slot) = supply.demand(0)?;
+                unsafe {
+                    super::super::copy::htod_async(
+                        uploaded.device_ptr(&device.upload).0,
+                        std::slice::from_raw_parts(base, window),
+                        &device.upload,
+                    )?;
                 }
-                gate.store(1, std::sync::atomic::Ordering::Release);
-                dense.upload.synchronize()?;
-                let actual = dense.upload.clone_dtoh(&dense.slots[0].device)?;
-                if skip_reclaim {
-                    ensure!(
-                        actual == expected[2] && actual != expected[0],
-                        "reclaim mutant did not overwrite slot 0 with layer 2 while upload was held"
-                    );
-                } else {
-                    ensure!(
-                        actual == expected[0],
-                        "guarded ring slot 0 did not preserve layer 0 bytes"
-                    );
-                }
+                supply.retire(0, slot, &device.upload)?;
+                supply.pump(&mut cursor, chain);
+                let release = std::sync::Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    release.store(1, std::sync::atomic::Ordering::Release);
+                });
+                let (next, _) = supply.demand(1)?;
+                let overwritten = unsafe { std::slice::from_raw_parts(next, window) };
+                ensure!(
+                    overwritten == &expected[1][..window],
+                    "reused supply slot did not hold the next layer"
+                );
+                drop(supply);
+                device.upload.synchronize()?;
+                let actual = stream.clone_dtoh(&uploaded)?;
+                ensure!(
+                    actual == expected[0][..window].to_vec(),
+                    "retired supply slot was rewritten before its upload completed"
+                );
             }
             println!(
-                "PASS dense_reclaim_control host_only_no_staging=true guarded_exact=true skip_reclaim_overwritten_with_layer2=true"
+                "PASS dense_reclaim_control held_upload_preserved=true slot_reuse_after_event=true"
             );
             Ok(())
         })();

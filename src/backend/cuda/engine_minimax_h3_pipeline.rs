@@ -11,7 +11,7 @@ use super::vae::{
 use super::{
     AdalnTable, BlockContext, BlockKernels, Conditioner, ConditionerInput, ConditionerPrompt, Dit,
     ImageDit, Placement, Source, conditioner_embeds, conditioner_rope, embedding_rows,
-    image_block_spec, image_fill_rate, image_runs, stored_allocation_bytes,
+    image_block_spec, image_runs, seed_dense_supply_workers, stored_allocation_bytes,
     stored_allocation_granularity,
 };
 use crate::backend::cuda::{
@@ -107,6 +107,7 @@ fn condition(
     blas: &mut Blas,
     model: &Path,
     request: &H3Request,
+    runtime: &Path,
 ) -> Result<Vec<bf16>> {
     let encoder = model.join("text_encoder");
     let spec = crate::model_spec::ModelSpec::read(&encoder)?;
@@ -120,6 +121,7 @@ fn condition(
         blas,
         model,
         &video_conditioner_prompt(request, image_token),
+        runtime,
     )
 }
 
@@ -141,6 +143,7 @@ fn condition_prompt(
     blas: &mut Blas,
     model: &Path,
     prompt: &ConditionerPrompt,
+    runtime: &Path,
 ) -> Result<Vec<bf16>> {
     use crate::backend::cuda::ops::CommonOpsRef;
     let encoder = model.join("text_encoder");
@@ -152,6 +155,7 @@ fn condition_prompt(
         .image_token;
     let manifest = MappedCheckpoint::open_component(&encoder, "model")?
         .minimax_h3_conditioner_manifest(&spec, TEXT_ENCODER_LAYER)?;
+    seed_dense_supply_workers(&encoder, &manifest, runtime)?;
     let hidden = spec.hidden as usize;
     let fp16 = device.info.arch.fp16_stored_half();
     let table = conditioner_table(&encoder, &manifest, prompt, image_token, hidden, fp16)?;
@@ -725,7 +729,7 @@ fn run_mode<const SETUP_ONLY: bool>(
             (text, input.anchors.clone())
         }
         NoiseDraws::Seed(_) => (
-            condition(&device, &mut blas, model, request)?,
+            condition(&device, &mut blas, model, request, runtime)?,
             keyframes(&device, &blas, model, request, noise.posterior_eps.as_ref())?,
         ),
     };
@@ -1115,7 +1119,7 @@ pub(super) fn image_condition(
         &options.runtime_dir,
         Rc::new(Closure::new(true, "MiniMax-H3-Image conditioner".into())),
     )?;
-    condition_prompt(&device, &mut blas, model, prompt)
+    condition_prompt(&device, &mut blas, model, prompt, &options.runtime_dir)
 }
 
 fn image_noise(
@@ -1606,6 +1610,7 @@ impl DecoderVisitCost {
         mut stages: [crate::prefill::DenseStage<'_>; 3],
         (stage_and_work, budget, host, page): (usize, usize, usize, usize),
         rates: (f64, f64),
+        ring_workers: usize,
     ) -> Result<(
         usize,
         usize,
@@ -1641,6 +1646,7 @@ impl DecoderVisitCost {
                 (stage_limit, host, page),
                 rates,
                 self.streamed_block_seconds(),
+                ring_workers,
             )?
             else {
                 continue;
@@ -1925,7 +1931,8 @@ impl VideoSession {
             .context("video decoder lacks blocks")?;
         let fixed = stored_allocation_bytes(text_fixed, page)?
             + stored_allocation_bytes(decoder_fixed, page)?;
-        let (disk_probe_bytes, disk) = image_fill_rate(&text_dir, &text_manifest)?;
+        let (disk_probe_bytes, disk, ring_workers) =
+            seed_dense_supply_workers(&text_dir, &text_manifest, &options.runtime_dir)?;
         let pcie = crate::backend::cuda::calibrate::pinned_h2d_rate(&device)?;
         let visit = DecoderVisitCost::measure(
             &device,
@@ -1997,6 +2004,7 @@ impl VideoSession {
                     stages,
                     (stage_and_work, budget, host, page),
                     (pcie, disk),
+                    ring_workers,
                 )?;
                 let decoder_visits = decode_geometry.chunks * slots.div_ceil(batch);
                 let bytes = TileWork::charged_bytes(
@@ -2348,7 +2356,8 @@ impl ImageSession {
             .iter()
             .max()
             .context("image VAE has no decoder layers")?;
-        let (disk_probe_bytes, disk) = image_fill_rate(&dir, &text_manifest)?;
+        let (disk_probe_bytes, disk, ring_workers) =
+            seed_dense_supply_workers(&dir, &text_manifest, &options.runtime_dir)?;
         let pcie = crate::backend::cuda::calibrate::pinned_h2d_rate(&d)?;
         let mut decode_blas = blas("image VAE")?;
         let text_blas = blas("MiniMax-H3-Image conditioner")?;
@@ -2452,7 +2461,12 @@ impl ImageSession {
                     device_bytes,
                     decoder_resident_seconds,
                     decoder_streamed_seconds,
-                } = price_dense_stages(stages, (device, host, device_page), (pcie, disk))?;
+                } = price_dense_stages(
+                    stages,
+                    (device, host, device_page),
+                    (pcie, disk),
+                    ring_workers,
+                )?;
                 let device_after = device_fixed + temporary + device_bytes[0] + device_bytes[2];
                 eprintln!(
                     "{}",
@@ -2460,7 +2474,7 @@ impl ImageSession {
                         "canvas": shape.canvas, "packed_rows": layout.rows(),
                         "device_free_before_placement": free, "device_budget": device, "host_available_bytes": host_available, "host_budget": host,
                         "transient_device_bytes": temporary, "decoder_fixed_gpu_bytes": decoder_fixed,
-                        "pcie_bytes_per_second": pcie, "disk_bytes_per_second": disk, "disk_probe_bytes": disk_probe_bytes,
+                        "pcie_bytes_per_second": pcie, "disk_bytes_per_second": disk, "disk_probe_bytes": disk_probe_bytes, "disk_ring_workers": ring_workers,
                         "device_allocation_granularity": device_page,
                         "conditioner_charged_device_bytes": device_bytes[0],
                         "dit_charged_device_bytes": device_bytes[1],
@@ -3981,7 +3995,7 @@ fn hyperflow_composition_matches_frozen_references() -> Result<()> {
                     &runtime,
                     Rc::new(Closure::new(false, "HyperFlow producers".into())),
                 )?;
-                let conditioner = condition(&device, &mut blas, &model, &request)?;
+                let conditioner = condition(&device, &mut blas, &model, &request, &runtime)?;
                 gate.conditioner(case, &conditioner)?;
                 if case == "both" {
                     gate.conditioner_reading(&conditioner)?;
@@ -4012,7 +4026,7 @@ fn hyperflow_composition_matches_frozen_references() -> Result<()> {
                         control.pixel_values != request.pixel_values,
                         "Runner FAIL media-control input identical"
                     );
-                    let output = condition(&device, &mut blas, &model, &control)?;
+                    let output = condition(&device, &mut blas, &model, &control, &runtime)?;
                     let distance =
                         crate::verify::metrics("conditioner-media-control", &output, &conditioner)?;
                     let reached = !distance.exact;
@@ -4723,7 +4737,7 @@ fn hyperflow_conditioner_effect_gpu() -> Result<()> {
                 &runtime,
                 Rc::new(Closure::new(false, "conditioner effect producer".into())),
             )?;
-            Some(condition(&device, &mut blas, &model, &request)?)
+            Some(condition(&device, &mut blas, &model, &request, &runtime)?)
         } else {
             None
         };
@@ -5043,6 +5057,7 @@ fn video_placement_sizes_decoder_groups_from_remaining_memory() -> Result<()> {
             stages,
             (available, full, 1 << 30, page),
             (10e9, 1e9),
+            2,
         )
     };
     let (batch, _, _, alternatives) = select_priced(full + (180 << 20))?;

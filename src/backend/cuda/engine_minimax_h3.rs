@@ -433,7 +433,8 @@ pub(crate) fn fill_in_flight(shards: usize, tensors: usize) -> usize {
     (2 * shards).clamp(4, 8).min(tensors.max(1))
 }
 
-/// Runs one fill batch through a fresh reader on the calling thread.
+/// Runs one fill batch through a fresh reader on the calling thread, across the derived
+/// fill worker count.
 fn run_fill_batch(dir: &Path, requests: &[OwnedRead]) -> Result<()> {
     let mut reader = EntryReader::new(dir);
     let mut batch: Vec<DirectRead<'_>> = requests
@@ -446,7 +447,13 @@ fn run_fill_batch(dir: &Path, requests: &[OwnedRead]) -> Result<()> {
             cast: request.cast,
         })
         .collect();
-    reader.read_many_direct(&mut batch)
+    let shards = requests
+        .iter()
+        .map(|request| request.entry.shard.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let workers = fill_in_flight(shards, requests.len());
+    reader.read_many_direct(&mut batch, workers)
 }
 
 /// A fill batch running on its own thread; a failed read surfaces at [`FillThread::join`] with
@@ -490,12 +497,12 @@ impl Drop for FillThread {
 static LIVE_FILL_BOUNCE_BYTES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// The host reserve a dense tier keeps beside its pinned layer copies: `slot_count` device
-/// slots, the largest single tensor, and 4 GiB.
-fn pinned_host_reserve(slot_count: usize, slot_bytes: usize, largest: usize) -> Result<usize> {
-    slot_count
-        .checked_mul(slot_bytes)
-        .and_then(|slots| slots.checked_add(largest))
+/// The host reserve a dense tier keeps beside its pinned layer copies: per supply worker one
+/// slot and one largest-tensor bounce buffer, and 4 GiB.
+fn pinned_host_reserve(supply_workers: usize, slot_bytes: usize, largest: usize) -> Result<usize> {
+    slot_bytes
+        .checked_add(largest)
+        .and_then(|per_worker| supply_workers.checked_mul(per_worker))
         .and_then(|bytes| bytes.checked_add(4 << 30))
         .context("pinned host reserve overflow")
 }
@@ -696,7 +703,12 @@ impl DenseTier {
         checks: Vec<FillCheck>,
         (slot_count, slot_bytes, largest): (usize, usize, usize),
     ) -> Result<Self> {
-        let reserve = pinned_host_reserve(slot_count, slot_bytes, largest)?;
+        let workers = dense.supply_workers();
+        let reserve = pinned_host_reserve(
+            if workers > 0 { workers } else { slot_count },
+            slot_bytes,
+            largest,
+        )?;
         let (schedule, bounce) = schedule_fill(component, dir, requests, reserve)?;
         let fill = match schedule {
             FillSchedule::Background(thread) => Some(PendingFill {
@@ -850,7 +862,7 @@ impl EntryReader {
         Ok(&self.readers)
     }
 
-    fn read_many_direct(&mut self, requests: &mut [DirectRead<'_>]) -> Result<()> {
+    fn read_many_direct(&mut self, requests: &mut [DirectRead<'_>], workers: usize) -> Result<()> {
         let mut spans: Vec<(*mut u8, usize)> = requests
             .iter()
             .map(|request| (request.dest, request.dest_len))
@@ -865,12 +877,8 @@ impl EntryReader {
         let readers =
             self.open_shards(requests.iter().map(|request| request.entry.shard.as_str()))?;
         let order = claim_order(requests, |request| request.entry.shard.as_str());
-        let shards = requests
-            .iter()
-            .map(|request| request.entry.shard.as_str())
-            .collect::<std::collections::BTreeSet<_>>()
-            .len();
-        let in_flight = fill_in_flight(shards, order.len());
+        ensure!(workers > 0, "direct batch worker count is zero");
+        let in_flight = workers.min(order.len().max(1));
         let next = std::sync::atomic::AtomicUsize::new(0);
         let batch = DirectBatch(requests.as_mut_ptr().cast::<u8>());
         let batch = &batch;
@@ -4418,46 +4426,201 @@ fn upcast_from(
     finish_fp16_store_at(fp16_store, s, module, "upcast")
 }
 
-fn image_fill_rate(dir: &Path, manifest: &TensorManifest) -> Result<(usize, f64)> {
-    let mut shards = BTreeMap::<&str, (&str, &TensorEntry)>::new();
+/// Calibrated concurrent-reader candidates for one drive, ascending.
+const DISK_READ_WORKERS: [usize; 4] = [1, 2, 4, 8];
+const DISK_READ_SCHEMA: u32 = 1;
+
+/// Measured aggregate direct-read rate per candidate worker count, persisted per drive.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DiskReadWorkers {
+    schema: u32,
+    st_dev: u64,
+    probe_bytes: usize,
+    rates: [f64; 4],
+    workers: usize,
+}
+
+/// The smallest candidate whose rate reaches 90% of the best measured rate.
+fn pick_disk_workers(rates: &[f64; 4]) -> Result<usize> {
+    let best = rates.iter().copied().fold(f64::NAN, f64::max).max(0.0);
+    ensure!(
+        rates.iter().all(|rate| rate.is_finite() && *rate > 0.0) && best > 0.0,
+        "disk read rates {rates:?}"
+    );
+    let picked = rates
+        .iter()
+        .position(|rate| *rate >= 0.9 * best)
+        .context("disk read rates hold no candidate")?;
+    Ok(DISK_READ_WORKERS[picked])
+}
+
+/// Process-wide first calibration (probe bytes, rate at the picked count, count):
+/// seeded from the persisted per-drive calibration where a runtime dir is known,
+/// otherwise measured at first need.
+static DENSE_SUPPLY_WORKERS: std::sync::OnceLock<(usize, f64, usize)> = std::sync::OnceLock::new();
+
+/// Seeds [`dense_supply_workers`] from the persisted calibration of the drive hosting
+/// `dir`, measuring when no cache holds. Returns the probe bytes, the rate at the picked
+/// count, and the count.
+pub(super) fn seed_dense_supply_workers(
+    dir: &Path,
+    manifest: &TensorManifest,
+    runtime: &Path,
+) -> Result<(usize, f64, usize)> {
+    if let Some(picked) = DENSE_SUPPLY_WORKERS.get() {
+        return Ok(*picked);
+    }
+    let picked = disk_reader_calibration(dir, manifest, Some(runtime))?;
+    let _ = DENSE_SUPPLY_WORKERS.set(picked);
+    Ok(picked)
+}
+
+pub(in crate::backend::cuda) fn dense_supply_workers(
+    dir: &Path,
+    manifest: &TensorManifest,
+) -> Result<usize> {
+    if let Some(&(_, _, workers)) = DENSE_SUPPLY_WORKERS.get() {
+        return Ok(workers);
+    }
+    let picked = disk_reader_calibration(dir, manifest, None)?;
+    let _ = DENSE_SUPPLY_WORKERS.set(picked);
+    Ok(picked.2)
+}
+
+/// The dense-streaming worker count for the drive hosting `dir`'s text shards: each
+/// candidate's aggregate rate through the fill reader over the same samples, picked by
+/// [`pick_disk_workers`], persisted under `runtime` keyed by the directory's device.
+/// Returns the probe bytes, the rate at the picked count, and the count.
+fn disk_reader_calibration(
+    dir: &Path,
+    manifest: &TensorManifest,
+    runtime: Option<&Path>,
+) -> Result<(usize, f64, usize)> {
+    use std::os::unix::fs::MetadataExt;
+    let st_dev = std::fs::metadata(dir)?.dev();
+    let path = runtime.map(|runtime| {
+        runtime.join(format!(
+            "disk-read-workers-v{DISK_READ_SCHEMA}-{st_dev}.json"
+        ))
+    });
+    if let Some(path) = path.as_ref()
+        && let Ok(bytes) = std::fs::read(path)
+    {
+        let cache: DiskReadWorkers = serde_json::from_slice(&bytes)
+            .with_context(|| format!("read disk read calibration {}", path.display()))?;
+        ensure!(
+            cache.schema == DISK_READ_SCHEMA && cache.st_dev == st_dev,
+            "disk read calibration device mismatch {}",
+            path.display()
+        );
+        let workers = pick_disk_workers(&cache.rates)?;
+        ensure!(
+            workers == cache.workers,
+            "disk read calibration worker mismatch {}",
+            path.display()
+        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "{}",
+                serde_json::json!({"disk_read_calibration": {"st_dev": st_dev,
+                    "workers": cache.workers, "rates_bytes_per_second": cache.rates,
+                    "probe_bytes": cache.probe_bytes, "cached": true}})
+            );
+        }
+        let rate = cache.rates[DISK_READ_WORKERS
+            .iter()
+            .position(|&workers| workers == cache.workers)
+            .expect("persisted worker is a candidate")];
+        return Ok((cache.probe_bytes, rate, cache.workers));
+    }
+    let mut windows = BTreeMap::<&str, (&str, &TensorEntry)>::new();
+    let mut larges = BTreeMap::<&str, (&str, &TensorEntry)>::new();
+    let mut smalls = BTreeMap::<&str, (&str, &TensorEntry)>::new();
     for (name, entry) in &manifest.entries {
-        if entry.load && (4 << 20..=64 << 20).contains(&entry.bytes) {
-            let sample = shards.entry(entry.shard.as_str()).or_insert((name, entry));
+        if !entry.load || entry.bytes == 0 {
+            continue;
+        }
+        let shard = entry.shard.as_str();
+        if (4 << 20..=64 << 20).contains(&entry.bytes) {
+            let sample = windows.entry(shard).or_insert((name, entry));
+            if sample.1.bytes < entry.bytes {
+                *sample = (name, entry);
+            }
+        } else if entry.bytes <= (1 << 20) {
+            let sample = smalls.entry(shard).or_insert((name, entry));
+            if sample.1.bytes > entry.bytes {
+                *sample = (name, entry);
+            }
+        } else if entry.bytes <= (128 << 20) {
+            let sample = larges.entry(shard).or_insert((name, entry));
             if sample.1.bytes < entry.bytes {
                 *sample = (name, entry);
             }
         }
     }
-    let samples: Vec<_> = shards.into_values().take(4).collect();
-    ensure!(
-        !samples.is_empty(),
-        "resident disk rate needs a published conditioner read sample"
-    );
+    let samples: Vec<_> = if !windows.is_empty() {
+        windows.into_values().take(4).collect()
+    } else if !larges.is_empty() {
+        larges.into_values().take(4).collect()
+    } else if !smalls.is_empty() {
+        smalls.into_values().take(4).collect()
+    } else {
+        bail!("resident disk rate needs a published conditioner read sample")
+    };
     let mut bufs: Vec<_> = samples
         .iter()
         .map(|(_, entry)| vec![0u8; entry.bytes])
         .collect();
-    let bytes = bufs.iter().map(Vec::len).sum::<usize>();
-    let mut requests = samples
+    let probe_bytes = bufs.iter().map(Vec::len).sum::<usize>();
+    // The rate probe reads raw published bytes; the FP16 rewrite is a consumer-side
+    // transform after the slot fill, so it does not gate on fp16_weights here.
+    let mut source = Source::new(dir, manifest, false);
+    let mut rates = [0f64; 4];
+    for (index, &workers) in DISK_READ_WORKERS.iter().enumerate() {
+        let mut requests = samples
+            .iter()
+            .zip(&mut bufs)
+            .map(|(&(name, entry), buf)| DirectRead {
+                name,
+                entry,
+                dest: buf.as_mut_ptr(),
+                dest_len: buf.len(),
+                cast: FillCast::Raw,
+            })
+            .collect::<Vec<_>>();
+        let began = std::time::Instant::now();
+        source.reader.read_many_direct(&mut requests, workers)?;
+        let seconds = began.elapsed().as_secs_f64();
+        ensure!(
+            seconds.is_finite() && seconds > 0.0,
+            "invalid resident I1 fill duration"
+        );
+        rates[index] = probe_bytes as f64 / seconds;
+    }
+    let workers = pick_disk_workers(&rates)?;
+    let cache = DiskReadWorkers {
+        schema: DISK_READ_SCHEMA,
+        st_dev,
+        probe_bytes,
+        rates,
+        workers,
+    };
+    if let Some(path) = &path {
+        std::fs::write(path, serde_json::to_vec(&cache)?)?;
+    }
+    if crate::backend::diagnostics_enabled() {
+        eprintln!(
+            "{}",
+            serde_json::json!({"disk_read_calibration": {"st_dev": st_dev,
+                "workers": workers, "rates_bytes_per_second": rates,
+                "probe_bytes": probe_bytes, "cached": false}})
+        );
+    }
+    let rate = rates[DISK_READ_WORKERS
         .iter()
-        .zip(&mut bufs)
-        .map(|(&(name, entry), buf)| DirectRead {
-            name,
-            entry,
-            dest: buf.as_mut_ptr(),
-            dest_len: buf.len(),
-            cast: FillCast::Raw,
-        })
-        .collect::<Vec<_>>();
-    let mut reader = EntryReader::new(dir);
-    let began = std::time::Instant::now();
-    reader.read_many_direct(&mut requests)?;
-    let seconds = began.elapsed().as_secs_f64();
-    ensure!(
-        seconds.is_finite() && seconds > 0.0,
-        "invalid resident I1 fill duration"
-    );
-    Ok((bytes, bytes as f64 / seconds))
+        .position(|&candidate| candidate == workers)
+        .expect("picked worker is a candidate")];
+    Ok((probe_bytes, rate, workers))
 }
 
 /// manifest's dense linears.
@@ -4534,11 +4697,13 @@ struct PlacedLayers {
 
 /// Device budget and host budget for `layers`, then the `DensePlacement` those budgets produce. `host_available` is
 /// measured only when the layers do not all fit the device budget. Visit count 1 spends no host budget.
+/// `supply_workers` is the disk supply's worker count the host reserve is charged for.
 fn plan_dense_layers(
     (layers, source_layers, largest, owned, media): (&[usize], &[usize], usize, usize, usize),
     placement: Placement,
     (free, total, host_available): (usize, usize, Option<usize>),
     slot_count: usize,
+    supply_workers: usize,
     visits: usize,
 ) -> Result<(crate::prefill::DensePlacement, PlacementFacts)> {
     use crate::prefill::DensePlacement;
@@ -4563,7 +4728,7 @@ fn plan_dense_layers(
     )?;
     let (host_budget, host_available) = if probe.slot_bytes > 0 {
         let available = host_available.context("host tier without a measured host budget")?;
-        let reserved = pinned_host_reserve(slot_count, probe.slot_bytes, largest)?;
+        let reserved = pinned_host_reserve(supply_workers, probe.slot_bytes, largest)?;
         ensure!(
             available >= reserved,
             "dense pinned staging and host reserve exceed available RAM: need={reserved} available={available}"
@@ -4636,18 +4801,22 @@ fn place_layers(
         .iter()
         .try_fold(0usize, |sum, &bytes| sum.checked_add(bytes))
         .context("dense weight extent overflow")?;
-    let host_available = if extent > device_budget {
-        Some(usize::try_from(
-            crate::backend::cuda::calibrate::host_memory(Path::new("/"))?,
-        )?)
+    let (host_available, supply_workers) = if extent > device_budget {
+        (
+            Some(usize::try_from(
+                crate::backend::cuda::calibrate::host_memory(Path::new("/"))?,
+            )?),
+            dense_supply_workers(&base.reader.dir, base.manifest)?,
+        )
     } else {
-        None
+        (None, 0)
     };
     let (plan, facts) = plan_dense_layers(
         (layers, source_layers, largest, owned, media),
         placement,
         (free, total, host_available),
         2,
+        supply_workers,
         visits,
     )?;
     let used_slots = plan
@@ -5005,13 +5174,14 @@ fn low_rank_layer_tail(
 }
 
 /// `(plan, device budget, host budget, available host bytes)` for one charged table.
+/// `supply_workers` is the disk supply's worker count the host reserve is charged for.
 fn stored_compact(
     (placement, visits): (Placement, usize),
     charged_device: &[usize],
     charged_slots: &[usize],
     kept_source: &[usize],
     device_cap: usize,
-    largest: usize,
+    (largest, supply_workers): (usize, usize),
     granularity: usize,
 ) -> Result<(crate::prefill::DensePlacement, usize, usize, Option<usize>)> {
     use crate::prefill::DensePlacement;
@@ -5061,13 +5231,12 @@ fn stored_compact(
         None
     };
     let host_budget = if let Some(available) = host_available {
-        let reserve = 2usize
-            .checked_mul(probe.slot_bytes)
-            .and_then(|bytes| bytes.checked_add(largest))
-            .and_then(|bytes| bytes.checked_add(4 << 30))
-            .context("stored host reserve overflow")?;
         let budget = available
-            .checked_sub(reserve)
+            .checked_sub(pinned_host_reserve(
+                supply_workers,
+                probe.slot_bytes,
+                largest,
+            )?)
             .context("stored pinned staging and host reserve exceed available RAM")?;
         match placement {
             Placement::Derived => DensePlacement::host_budget_for_visits(budget, visits)?,
@@ -5220,13 +5389,14 @@ fn place_stored_layers(
             .collect::<Result<_>>()?;
         let (free, total) = d.ctx.mem_get_info()?;
         let device_cap = DensePlacement::device_budget(free, total, owned, 0, 0)?;
+        let supply_workers = dense_supply_workers(&base.reader.dir, base.manifest)?;
         let (before, ..) = stored_compact(
             (placement, visits),
             &charged_device,
             &charged_slots,
             &kept_source,
             device_cap,
-            sizing.largest,
+            (sizing.largest, supply_workers),
             granularity,
         )?;
         let (compact, device_budget, host_budget, host_available) = stored_compact(
@@ -5235,7 +5405,7 @@ fn place_stored_layers(
             &charged_slots_after,
             &kept_source,
             device_cap,
-            sizing.largest,
+            (sizing.largest, supply_workers),
             granularity,
         )?;
         let facts = PlacementFacts {
@@ -16328,6 +16498,7 @@ mod tests {
                             facts.host_available_bytes,
                         ),
                         slot_count,
+                        slot_count,
                         visits,
                     )?;
                     let resident = plan.slots.iter().filter(|slot| slot.is_none()).count();
@@ -17526,11 +17697,12 @@ mod tests {
         let fixed = 4;
         let later = 32;
         let free = total / 16 + fixed + later + 16;
-        let host = Some((4 << 30) + 16 + 8 + 8);
+        let host = Some((4 << 30) + 32 + 8);
         let (plan, facts) = super::plan_dense_layers(
             (&layers, &layers, 8, fixed, later),
             super::Placement::Derived,
             (free, total, host),
+            2,
             2,
             2,
         )?;
@@ -17543,6 +17715,7 @@ mod tests {
                 (&layers, &layers, 8, fixed, later),
                 super::Placement::Derived,
                 (free - 1, total, host),
+                2,
                 2,
                 2,
             )
@@ -19916,13 +20089,13 @@ mod h3_direct_batch_tests {
                 cast: FillCast::Raw,
             });
         }
-        reader.read_many_direct(&mut requests)?;
+        reader.read_many_direct(&mut requests, 1)?;
         for (index, entry) in entries.iter().enumerate() {
             let got = &arena.as_mut()[offsets[index]..offsets[index] + entry.bytes];
             let want = &file[entry.data_start as usize..entry.data_start as usize + entry.bytes];
             ensure!(got == want, "tensor {index}: batch bytes differ");
         }
-        reader.read_many_direct(&mut [])?;
+        reader.read_many_direct(&mut [], 1)?;
         let entry = &entries[0];
         let mut overlap = [
             DirectRead {
@@ -19941,7 +20114,7 @@ mod h3_direct_batch_tests {
             },
         ];
         ensure!(
-            reader.read_many_direct(&mut overlap).is_err(),
+            reader.read_many_direct(&mut overlap, 1).is_err(),
             "overlapping destination windows accepted"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -20446,6 +20619,19 @@ mod h3_direct_batch_tests {
             "overflow error lacks the tensor name: {error:#}"
         );
         std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn disk_worker_pick_takes_the_smallest_candidate_near_the_best_rate() -> Result<()> {
+        use super::{DISK_READ_WORKERS, pick_disk_workers};
+        assert_eq!(pick_disk_workers(&[1.0e9, 5.0e9, 8.0e9, 7.0e9])?, 4);
+        assert_eq!(pick_disk_workers(&[1.0e9, 7.6e9, 8.0e9, 7.9e9])?, 2);
+        assert_eq!(pick_disk_workers(&[6.0e9, 7.0e9, 8.0e9, 7.5e9])?, 4);
+        assert_eq!(pick_disk_workers(&[2.0e9, 2.0e9, 2.0e9, 2.0e9])?, 1);
+        assert!(pick_disk_workers(&[0.0, 1.0e9, 1.0e9, 1.0e9]).is_err());
+        assert!(pick_disk_workers(&[f64::NAN, 1.0e9, 1.0e9, 1.0e9]).is_err());
+        assert_eq!(DISK_READ_WORKERS, [1, 2, 4, 8]);
         Ok(())
     }
 }
