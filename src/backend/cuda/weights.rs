@@ -2228,10 +2228,8 @@ impl DenseStreaming {
             .then(|| QuantKernels::new(&d.ctx))
             .transpose()?;
         let narrow_f32 = if entries().any(|entry| entry.narrow_f32) {
-            Some(
-                super::cubin::module(&d.ctx, "vision_ops")?
-                    .load_function("vision_downcast_f32_to_bf16_checked")?,
-            )
+            let symbol = d.info.arch.decoder_f32_narrow_symbol();
+            Some(super::cubin::module(&d.ctx, "vision_ops")?.load_function(symbol)?)
         } else {
             None
         };

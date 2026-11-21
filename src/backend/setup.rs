@@ -36,7 +36,7 @@ pub struct DeviceInfo {
 impl DeviceInfo {
     pub fn require_cuda_tensor_ops(&self, operation: &str) -> Result<()> {
         ensure!(
-            matches!(self.arch, DeviceArchitecture::Cuda(sm) if sm >= 80) && self.warp == 32,
+            matches!(self.arch, DeviceArchitecture::Cuda(sm) if sm >= 75) && self.warp == 32,
             "{operation} requires implemented CUDA mma.sync/ldmatrix/cp.async; device architecture {} wave{}",
             self.arch,
             self.warp
@@ -513,7 +513,7 @@ mod long_tests {
         let mut warp64 = info89.clone();
         warp64.warp = 64;
 
-        assert!(info75.require_cuda_tensor_ops("gemm_skinny").is_err());
+        assert!(info75.require_cuda_tensor_ops("gemm_skinny").is_ok());
         assert!(info70.require_cuda_tensor_ops("gemm_skinny").is_err());
         assert!(warp64.require_cuda_tensor_ops("gemm_skinny").is_err());
         assert!(hip.require_cuda_tensor_ops("gemm_skinny").is_err());

@@ -302,6 +302,7 @@ pub(crate) struct OwnedRead {
 pub(crate) enum FillCast {
     Raw,
     F32ToBf16,
+    F32ToFp16,
     Bf16ToFp16,
 }
 
@@ -919,12 +920,17 @@ impl EntryReader {
                 );
                 entry.bytes
             }
-            FillCast::F32ToBf16 => {
+            FillCast::F32ToBf16 | FillCast::F32ToFp16 => {
+                let kind = if cast == FillCast::F32ToFp16 {
+                    "FP16"
+                } else {
+                    "BF16"
+                };
                 ensure!(
                     entry.dtype == Dtype::F32
                         && entry.quant.is_none()
                         && entry.bytes.is_multiple_of(4),
-                    "{name}: F32 to BF16 fill source"
+                    "{name}: F32 to {kind} fill source"
                 );
                 entry.bytes / 2
             }
@@ -948,8 +954,9 @@ impl EntryReader {
                 output.copy_from_slice(source);
                 crate::tensors::bf16_weight_to_fp16(name, output, true)?;
             }
-            FillCast::F32ToBf16 => {
+            FillCast::F32ToBf16 | FillCast::F32ToFp16 => {
                 let output = &mut destination[..filled];
+                let fp16 = cast == FillCast::F32ToFp16;
                 for (value, dst) in source
                     .as_chunks::<4>()
                     .0
@@ -958,9 +965,15 @@ impl EntryReader {
                 {
                     let value = f32::from_le_bytes(*value);
                     ensure!(value.is_finite(), "{name}: nonfinite value");
-                    let narrowed = bf16::from_f32(value);
-                    ensure!(narrowed.is_finite(), "BF16 overflow for {name}");
-                    *dst = narrowed.to_bits().to_le_bytes();
+                    if fp16 {
+                        let narrowed = half::f16::from_f32(value);
+                        ensure!(narrowed.is_finite(), "FP16 overflow for {name}");
+                        *dst = narrowed.to_bits().to_le_bytes();
+                    } else {
+                        let narrowed = bf16::from_f32(value);
+                        ensure!(narrowed.is_finite(), "BF16 overflow for {name}");
+                        *dst = narrowed.to_bits().to_le_bytes();
+                    }
                 }
             }
         }

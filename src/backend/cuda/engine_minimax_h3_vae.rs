@@ -14,7 +14,8 @@ use crate::backend::cuda::{
     weights::DenseStreaming,
 };
 use crate::backend::gpu::{
-    CudaFunction, CudaSlice, CudaStream, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg,
+    CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DeviceRepr, LaunchConfig,
+    PushKernelArg,
 };
 use crate::checkpoint::{MappedCheckpoint, TensorEntry, TensorManifest};
 use crate::minimax_h3::{DecodePlan, VAE_PIXEL_MEAN, VAE_PIXEL_STD, VAE_TILE, VaeSpec, VaeTiles};
@@ -92,7 +93,7 @@ impl ImageDecoder {
             bytes <= device.workspace_budget(free, free, total / 16)?,
             "image VAE decoder weights need {bytes} bytes"
         );
-        let mut loader = DecoderWeightLoad::new(component, manifest);
+        let mut loader = DecoderWeightLoad::new(component, manifest, device.info.arch.clone());
         loader.preload_resident(device, "image-vae")?;
         Self::from_weights(device, spec, loader)
     }
@@ -107,7 +108,6 @@ impl ImageDecoder {
             "image VAE requires three channels"
         );
         let s = &device.stream;
-        let vision = cubin::module(s.context(), "vision_ops")?;
         let bytes = decoder_weight_bytes(loader.manifest);
         let tensors = loader
             .manifest
@@ -116,6 +116,11 @@ impl ImageDecoder {
             .filter(|name| name.starts_with("decoder.") || name.starts_with("post_quant_conv."))
             .count();
         let core = VideoDecoder::from_weights(device, spec, loader)?;
+        let gather = core.kernels.vision.load_function("tile_rows_f32_to_bf16")?;
+        let pixels = core
+            .kernels
+            .vision
+            .load_function("planar_bf16_affine_rows_f32")?;
         if crate::backend::diagnostics_enabled() {
             eprintln!(
                 "{}",
@@ -132,8 +137,8 @@ impl ImageDecoder {
                 s.clone_htod(&VAE_PIXEL_STD.map(|x| x as f32))?,
                 s.clone_htod(&VAE_PIXEL_MEAN.map(|x| x as f32))?,
             ),
-            gather: vision.load_function("tile_rows_f32_to_bf16")?,
-            pixels: vision.load_function("planar_bf16_affine_rows_f32")?,
+            gather,
+            pixels,
         })
     }
 
@@ -290,27 +295,32 @@ impl ImageDecoder {
             "image VAE latent allocation differs from its canvas"
         );
         let tiles = w.tiles.count();
+        let vision = Arc::clone(&self.core.kernels.vision);
+        let sm = self.core.kernels.sm;
         for first in (0..tiles).step_by(w.core.batch) {
             let active = (tiles - first).min(w.core.batch);
-            unsafe {
-                s.launch_builder(&self.gather)
-                    .arg(&pointer(input, s))
-                    .arg(&pointer(&self.latent_affine.0, s))
-                    .arg(&pointer(&self.latent_affine.1, s))
-                    .arg(&pointer(&w.grid, s))
-                    .arg(&pointer(&w.core.latent, s))
-                    .arg(&(spec.latent_channels as u32))
-                    .arg(&(latent[0] as u32))
-                    .arg(&(latent[1] as u32))
-                    .arg(&(w.tiles.rows.0.len() as u32))
-                    .arg(&(w.tiles.cols.0.len() as u32))
-                    .arg(&(spec.spatial_ratio as u32))
-                    .arg(&(w.core.height as u32))
-                    .arg(&(w.core.width as u32))
-                    .arg(&(first as u32))
-                    .arg(&(active as u32))
-                    .launch(flat(active * w.core.patches * spec.latent_channels))?;
-            }
+            fp16_store(sm, s, &vision, "gather", || {
+                unsafe {
+                    s.launch_builder(&self.gather)
+                        .arg(&pointer(input, s))
+                        .arg(&pointer(&self.latent_affine.0, s))
+                        .arg(&pointer(&self.latent_affine.1, s))
+                        .arg(&pointer(&w.grid, s))
+                        .arg(&pointer(&w.core.latent, s))
+                        .arg(&(spec.latent_channels as u32))
+                        .arg(&(latent[0] as u32))
+                        .arg(&(latent[1] as u32))
+                        .arg(&(w.tiles.rows.0.len() as u32))
+                        .arg(&(w.tiles.cols.0.len() as u32))
+                        .arg(&(spec.spatial_ratio as u32))
+                        .arg(&(w.core.height as u32))
+                        .arg(&(w.core.width as u32))
+                        .arg(&(first as u32))
+                        .arg(&(active as u32))
+                        .launch(flat(active * w.core.patches * spec.latent_channels))?;
+                }
+                Ok(())
+            })?;
             self.core.project_tiles(
                 (s, blas),
                 &mut w.core,
@@ -320,19 +330,24 @@ impl ImageDecoder {
                 |role, rows| observe(role, first, active, rows),
             )?;
         }
+        fp16_store(sm, s, &vision, "stitch", || {
+            unsafe {
+                s.launch_builder(&self.core.kernels.stitch)
+                    .arg(&pointer(&w.raw, s))
+                    .arg(&pointer(&w.planar, s))
+                    .arg(&pointer(&w.grid, s))
+                    .arg(&(w.tiles.rows.0.len() as u32))
+                    .arg(&(w.tiles.cols.0.len() as u32))
+                    .arg(&(spec.out_channels as u32))
+                    .arg(&(w.tiles.height as u32))
+                    .arg(&(w.tiles.width as u32))
+                    .arg(&(height as u32))
+                    .arg(&(width as u32))
+                    .launch(flat(w.planar.len()))?;
+            }
+            Ok(())
+        })?;
         unsafe {
-            s.launch_builder(&self.core.kernels.stitch)
-                .arg(&pointer(&w.raw, s))
-                .arg(&pointer(&w.planar, s))
-                .arg(&pointer(&w.grid, s))
-                .arg(&(w.tiles.rows.0.len() as u32))
-                .arg(&(w.tiles.cols.0.len() as u32))
-                .arg(&(spec.out_channels as u32))
-                .arg(&(w.tiles.height as u32))
-                .arg(&(w.tiles.width as u32))
-                .arg(&(height as u32))
-                .arg(&(width as u32))
-                .launch(flat(w.planar.len()))?;
             s.launch_builder(&self.pixels)
                 .arg(&pointer(&w.planar, s))
                 .arg(&pointer(&self.pixel_affine.0, s))
@@ -849,6 +864,10 @@ struct VaeKernels {
     residual_rms: CudaFunction,
     patches: CudaFunction,
     swiglu: CudaFunction,
+    vision: Arc<CudaModule>,
+    common: Arc<CudaModule>,
+    act: Arc<CudaModule>,
+    sm: u32,
 }
 
 pub(crate) struct VideoDecoder {
@@ -889,14 +908,32 @@ impl Linear<bf16> {
 }
 
 fn decoder_weight_width(name: &str) -> usize {
-    if name
-        .split('.')
-        .any(|part| matches!(part, "norm1" | "norm2" | "norm_out" | "scale1" | "scale2"))
-    {
+    if crate::backend::setup::decoder_weight_is_raw_f32(name) {
         4
     } else {
         2
     }
+}
+
+fn decoder_cast(arch: &crate::backend::setup::DeviceArchitecture, name: &str) -> super::FillCast {
+    use crate::backend::setup::DecoderNarrow;
+    match arch.decoder_weight_narrow(name) {
+        DecoderNarrow::RawF32 => super::FillCast::Raw,
+        DecoderNarrow::F32ToBf16 => super::FillCast::F32ToBf16,
+        DecoderNarrow::F32ToFp16 => super::FillCast::F32ToFp16,
+    }
+}
+
+fn fp16_store(
+    sm: u32,
+    s: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    tensor: &str,
+    body: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    super::prepare_fp16_store_at(sm, s, module)?;
+    body()?;
+    super::finish_fp16_store_at(sm, s, module, tensor)
 }
 
 fn decoder_tensor_bytes(manifest: &TensorManifest, name: &str) -> usize {
@@ -918,6 +955,7 @@ fn read_decoder_weight_chunk(
     name: &str,
     destination_offset: usize,
     dst: &mut [u8],
+    arch: &crate::backend::setup::DeviceArchitecture,
 ) -> Result<()> {
     let width = decoder_weight_width(name);
     ensure!(
@@ -943,9 +981,22 @@ fn read_decoder_weight_chunk(
             .iter()
             .zip(dst.as_chunks_mut::<2>().0)
         {
-            let x = bf16::from_f32(f32::from_le_bytes(*src));
-            ensure!(x.is_finite(), "BF16 overflow for video weight {name}");
-            *dst = x.to_bits().to_le_bytes();
+            let value = f32::from_le_bytes(*src);
+            if matches!(
+                arch.decoder_weight_narrow(name),
+                crate::backend::setup::DecoderNarrow::F32ToFp16
+            ) {
+                let narrowed = half::f16::from_f32(value);
+                ensure!(narrowed.is_finite(), "FP16 overflow for {name}");
+                *dst = narrowed.to_bits().to_le_bytes();
+            } else {
+                let narrowed = bf16::from_f32(value);
+                ensure!(
+                    narrowed.is_finite(),
+                    "BF16 overflow for video weight {name}"
+                );
+                *dst = narrowed.to_bits().to_le_bytes();
+            }
         }
     }
     Ok(())
@@ -953,6 +1004,7 @@ fn read_decoder_weight_chunk(
 
 struct DecoderWeightLoad<'a> {
     manifest: &'a TensorManifest,
+    arch: crate::backend::setup::DeviceArchitecture,
     reader: EntryReader,
     dense: Option<DenseTier>,
     offsets: std::collections::BTreeMap<String, (usize, usize)>,
@@ -963,9 +1015,14 @@ struct DecoderWeightLoad<'a> {
 }
 
 impl<'a> DecoderWeightLoad<'a> {
-    fn new(dir: &Path, manifest: &'a TensorManifest) -> Self {
+    fn new(
+        dir: &Path,
+        manifest: &'a TensorManifest,
+        arch: crate::backend::setup::DeviceArchitecture,
+    ) -> Self {
         Self {
             manifest,
+            arch,
             reader: EntryReader::new(dir),
             dense: None,
             offsets: Default::default(),
@@ -1014,11 +1071,7 @@ impl<'a> DecoderWeightLoad<'a> {
                 super::resident_raw_finite(
                     name,
                     entry,
-                    if decoder_weight_width(name) == 2 {
-                        super::FillCast::F32ToBf16
-                    } else {
-                        super::FillCast::Raw
-                    },
+                    decoder_cast(&self.arch, name),
                     &hoist.arena[at..at + bytes],
                 )?;
                 let buffer = unsafe { d.upload.alloc::<u8>(bytes)? };
@@ -1058,11 +1111,7 @@ impl<'a> DecoderWeightLoad<'a> {
             .iter()
             .map(|(name, bytes)| {
                 let entry = &self.manifest.entries[name.as_str()];
-                let cast = if decoder_weight_width(name) == 2 {
-                    super::FillCast::F32ToBf16
-                } else {
-                    super::FillCast::Raw
-                };
+                let cast = decoder_cast(&self.arch, name);
                 // The device buffer is allocated now; the ring fills it below.
                 super::OwnedRead::new(name, entry, std::ptr::null_mut(), *bytes, cast)
             })
@@ -1295,7 +1344,7 @@ impl<'a> DecoderWeightLoad<'a> {
         manifest: &'a TensorManifest,
         plan: crate::prefill::DensePlacement,
     ) -> Result<Self> {
-        let mut loader = DecoderWeightLoad::new(dir, manifest);
+        let mut loader = DecoderWeightLoad::new(dir, manifest, device.info.arch.clone());
         if plan.slot_bytes > 0 {
             let order = decoder_layer_names(manifest, spec.layers);
             let slots = plan.slots.clone();
@@ -1395,7 +1444,14 @@ impl<'a> DecoderWeightLoad<'a> {
                 for offset in (0..bytes).step_by(chunk) {
                     let end = (offset + chunk).min(bytes);
                     let dst = &mut self.staging[..end - offset];
-                    read_decoder_weight_chunk(&mut self.reader, self.manifest, name, offset, dst)?;
+                    read_decoder_weight_chunk(
+                        &mut self.reader,
+                        self.manifest,
+                        name,
+                        offset,
+                        dst,
+                        &self.arch,
+                    )?;
                     unsafe {
                         super::super::copy::htod_async(ptr + offset as u64, dst, s)?;
                     }
@@ -1461,21 +1517,13 @@ impl Drop for VaeHoist {
 /// Validates one hoisted pinned window (the loader's finite checks) and copies it into the
 /// dense pinned tier.
 fn hoisted_pinned_window(
+    arch: &crate::backend::setup::DeviceArchitecture,
     name: &str,
     entry: &TensorEntry,
     hoisted: &[u8],
     pinned: &mut [u8],
 ) -> Result<()> {
-    super::resident_raw_finite(
-        name,
-        entry,
-        if decoder_weight_width(name) == 2 {
-            super::FillCast::F32ToBf16
-        } else {
-            super::FillCast::Raw
-        },
-        hoisted,
-    )?;
+    super::resident_raw_finite(name, entry, decoder_cast(arch, name), hoisted)?;
     ensure!(
         pinned.len() == hoisted.len(),
         "video hoist pinned window for {name}"
@@ -1520,6 +1568,7 @@ mod hoist_tests {
         hoisted[..4].copy_from_slice(&f32::NAN.to_le_bytes());
         let mut pinned = vec![0u8; 32];
         let error = hoisted_pinned_window(
+            &crate::backend::setup::DeviceArchitecture::Cuda(89),
             "decoder.transformer_blocks.0.norm2.weight",
             &entry,
             &hoisted,
@@ -1534,6 +1583,7 @@ mod hoist_tests {
         );
         let finite = vec![0u8; 32];
         hoisted_pinned_window(
+            &crate::backend::setup::DeviceArchitecture::Cuda(89),
             "decoder.transformer_blocks.0.norm2.weight",
             &entry,
             &finite,
@@ -1561,7 +1611,11 @@ mod hoist_tests {
     }
 }
 
-pub(super) fn hoist_video_vae(model: &Path, disk_tier: bool) -> Result<Option<VaeHoist>> {
+pub(super) fn hoist_video_vae(
+    model: &Path,
+    disk_tier: bool,
+    arch: &crate::backend::setup::DeviceArchitecture,
+) -> Result<Option<VaeHoist>> {
     let dir = model.join("vae");
     let spec = VaeSpec::read(model)?;
     let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
@@ -1580,11 +1634,7 @@ pub(super) fn hoist_video_vae(model: &Path, disk_tier: bool) -> Result<Option<Va
         let bytes = decoder_tensor_bytes(&manifest, name);
         ensure!(total.is_multiple_of(16), "video hoist weight alignment");
         windows.insert((*name).clone(), (total, bytes));
-        let cast = if decoder_weight_width(name) == 2 {
-            FillCast::F32ToBf16
-        } else {
-            FillCast::Raw
-        };
+        let cast = decoder_cast(arch, name);
         requests.push(OwnedRead::new(
             name,
             entry,
@@ -1720,7 +1770,7 @@ fn video_weight_load<'a>(
             }})
         );
     }
-    let mut loader = DecoderWeightLoad::new(dir, manifest);
+    let mut loader = DecoderWeightLoad::new(dir, manifest, d.info.arch.clone());
     if plan.slot_bytes > 0 {
         let slot_count = plan
             .slots
@@ -1742,11 +1792,7 @@ fn video_weight_load<'a>(
                     let entry = &manifest.entries[name.as_str()];
                     ensure!(offset % 16 == 0, "video pinned weight alignment");
                     loader.offsets.insert((*name).clone(), (layer, offset));
-                    let cast = if width == 2 {
-                        FillCast::F32ToBf16
-                    } else {
-                        FillCast::Raw
-                    };
+                    let cast = decoder_cast(&loader.arch, name);
                     requests.push(OwnedRead::new(
                         name,
                         entry,
@@ -1786,6 +1832,7 @@ fn video_weight_load<'a>(
                             "video hoist window for {name}"
                         );
                         hoisted_pinned_window(
+                            &loader.arch,
                             name,
                             &manifest.entries[name.as_str()],
                             &source.arena[at..at + bytes],
@@ -1843,6 +1890,14 @@ impl VideoDecoder {
     fn from_weights(d: &Device, spec: &VaeSpec, mut load: DecoderWeightLoad<'_>) -> Result<Self> {
         let vision = cubin::module(&d.ctx, "vision_ops")?;
         let common = cubin::module(&d.ctx, "q38_common")?;
+        let act = cubin::module(&d.ctx, "act")?;
+        #[cfg(feature = "cuda")]
+        let sm = cubin::capability(&d.ctx)?;
+        #[cfg(not(feature = "cuda"))]
+        let sm = 80u32;
+        let vision_mod = Arc::clone(&vision);
+        let common_mod = Arc::clone(&common);
+        let act_mod = Arc::clone(&act);
         let s = &d.stream;
         let manifest = load.manifest;
         ensure!(
@@ -1906,7 +1961,11 @@ impl VideoDecoder {
                 residual: vision.load_function("scaled_residual_f32")?,
                 residual_rms: vision.load_function("scaled_residual_rms_f32")?,
                 patches: vision.load_function("unpatchify_bf16")?,
-                swiglu: cubin::module(&d.ctx, "act")?.load_function("silu_mul")?,
+                swiglu: act.load_function("silu_mul")?,
+                vision: vision_mod,
+                common: common_mod,
+                act: act_mod,
+                sm,
             },
             #[cfg(test)]
             prefix_only: false,
@@ -2088,19 +2147,24 @@ impl VideoDecoder {
         let dim = spec.dim;
         let n = rows * dim;
         let mat = |buffer| rows_view(buffer, s, 0, rows, dim, dim);
+        let sm = self.kernels.sm;
+        let vision = Arc::clone(&self.kernels.vision);
+        let act = Arc::clone(&self.kernels.act);
         let norm = |weight: Tensor<f32, 1>| -> Result<()> {
-            unsafe {
-                s.launch_builder(&self.kernels.rms)
-                    .arg(&pointer(&w.x, s))
-                    .arg(&weight.ptr)
-                    .arg(&1u32)
-                    .arg(&0u64)
-                    .arg(&pointer(&w.norm, s))
-                    .arg(&(dim as u32))
-                    .arg(&spec.norm_eps)
-                    .launch(ops::grid(rows, 256))?;
-            }
-            Ok(())
+            fp16_store(sm, s, &vision, "rms", || {
+                unsafe {
+                    s.launch_builder(&self.kernels.rms)
+                        .arg(&pointer(&w.x, s))
+                        .arg(&weight.ptr)
+                        .arg(&1u32)
+                        .arg(&0u64)
+                        .arg(&pointer(&w.norm, s))
+                        .arg(&(dim as u32))
+                        .arg(&spec.norm_eps)
+                        .launch(ops::grid(rows, 256))?;
+                }
+                Ok(())
+            })
         };
         let residual = |scale: Tensor<f32, 1>| -> Result<()> {
             unsafe {
@@ -2115,19 +2179,21 @@ impl VideoDecoder {
             Ok(())
         };
         let residual_norm = |res_scale: Tensor<f32, 1>, norm_scale: Tensor<f32, 1>| -> Result<()> {
-            unsafe {
-                s.launch_builder(&self.kernels.residual_rms)
-                    .arg(&pointer(&w.x, s))
-                    .arg(&pointer(&w.o, s))
-                    .arg(&res_scale.ptr)
-                    .arg(&norm_scale.ptr)
-                    .arg(&0u64)
-                    .arg(&pointer(&w.norm, s))
-                    .arg(&(dim as u32))
-                    .arg(&spec.norm_eps)
-                    .launch(ops::grid(rows, 256))?;
-            }
-            Ok(())
+            fp16_store(sm, s, &vision, "residual_rms", || {
+                unsafe {
+                    s.launch_builder(&self.kernels.residual_rms)
+                        .arg(&pointer(&w.x, s))
+                        .arg(&pointer(&w.o, s))
+                        .arg(&res_scale.ptr)
+                        .arg(&norm_scale.ptr)
+                        .arg(&0u64)
+                        .arg(&pointer(&w.norm, s))
+                        .arg(&(dim as u32))
+                        .arg(&spec.norm_eps)
+                        .launch(ops::grid(rows, 256))?;
+                }
+                Ok(())
+            })
         };
         if layer == 0 {
             norm(b.norm1)?;
@@ -2144,21 +2210,24 @@ impl VideoDecoder {
             observe("q0", (DecoderRows::Bf16(&w.ff), 0, w.tokens, dim))?;
             observe("k0", (DecoderRows::Bf16(&w.ff), n, w.tokens, dim))?;
         }
-        unsafe {
-            s.launch_builder(&self.kernels.head_pack)
-                .arg(&pointer(&w.ff, s))
-                .arg(&pointer(&w.rope, s))
-                .arg(&pointer(&w.q, s))
-                .arg(&pointer(&w.k, s))
-                .arg(&pointer(&w.v, s))
-                .arg(&(rows as u32))
-                .arg(&(w.tokens as u32))
-                .arg(&(spec.heads as u32))
-                .arg(&(spec.head_dim as u32))
-                .arg(&(spec.rope_dims as u32))
-                .arg(&spec.norm_eps)
-                .launch(ops::grid((rows * spec.heads).div_ceil(8), 256))?;
-        }
+        fp16_store(sm, s, &vision, "head_pack", || {
+            unsafe {
+                s.launch_builder(&self.kernels.head_pack)
+                    .arg(&pointer(&w.ff, s))
+                    .arg(&pointer(&w.rope, s))
+                    .arg(&pointer(&w.q, s))
+                    .arg(&pointer(&w.k, s))
+                    .arg(&pointer(&w.v, s))
+                    .arg(&(rows as u32))
+                    .arg(&(w.tokens as u32))
+                    .arg(&(spec.heads as u32))
+                    .arg(&(spec.head_dim as u32))
+                    .arg(&(spec.rope_dims as u32))
+                    .arg(&spec.norm_eps)
+                    .launch(ops::grid((rows * spec.heads).div_ceil(8), 256))?;
+            }
+            Ok(())
+        })?;
         let (_, flash) = w
             .attention
             .iter_mut()
@@ -2190,15 +2259,18 @@ impl VideoDecoder {
             rows_view(&w.ff, s, 0, rows, 2 * f, 2 * f)?,
         )?;
         let (gu, y) = (pointer(&w.ff, s), pointer(&w.gated, s));
-        unsafe {
-            s.launch_builder(&self.kernels.swiglu)
-                .arg(&gu)
-                .arg(&y)
-                .arg(&(rows as i32))
-                .arg(&(f as i32))
-                .arg(&3i32)
-                .launch(ops::silu_mul_grid(rows, f, gu, y)?)?;
-        }
+        fp16_store(sm, s, &act, "swiglu", || {
+            unsafe {
+                s.launch_builder(&self.kernels.swiglu)
+                    .arg(&gu)
+                    .arg(&y)
+                    .arg(&(rows as i32))
+                    .arg(&(f as i32))
+                    .arg(&3i32)
+                    .launch(ops::silu_mul_grid(rows, f, gu, y)?)?;
+            }
+            Ok(())
+        })?;
         b.ff_out
             .apply(blas, rows_view(&w.gated, s, 0, rows, f, f)?, mat(&w.o)?)?;
         if let Some(next) = self.blocks.get(layer + 1) {
@@ -2326,17 +2398,21 @@ impl VideoDecoder {
                 tier.borrow_mut().ready()?.end(layer, s)?;
             }
         }
-        unsafe {
-            s.launch_builder(&self.kernels.norm_out)
-                .arg(&pointer(&w.x, s))
-                .arg(&self.norm_out.0.ptr)
-                .arg(&self.norm_out.1.ptr)
-                .arg(&pointer(&w.norm, s))
-                .arg(&(rows as u32))
-                .arg(&(spec.dim as u32))
-                .arg(&spec.norm_eps)
-                .launch(ops::grid(rows, 256))?;
-        }
+        let common = Arc::clone(&self.kernels.common);
+        fp16_store(self.kernels.sm, s, &common, "norm_out", || {
+            unsafe {
+                s.launch_builder(&self.kernels.norm_out)
+                    .arg(&pointer(&w.x, s))
+                    .arg(&self.norm_out.0.ptr)
+                    .arg(&self.norm_out.1.ptr)
+                    .arg(&pointer(&w.norm, s))
+                    .arg(&(rows as u32))
+                    .arg(&(spec.dim as u32))
+                    .arg(&spec.norm_eps)
+                    .launch(ops::grid(rows, 256))?;
+            }
+            Ok(())
+        })?;
         let width = spec.patch_width();
         self.proj_out.apply(
             blas,
@@ -2482,20 +2558,24 @@ impl VideoDecoder {
             }
             observe("raw", i, &raw)?;
             let planes = channels * clip_frames;
-            unsafe {
-                s.launch_builder(&self.kernels.stitch)
-                    .arg(&pointer(&raw, s))
-                    .arg(&pointer(&canvas, s))
-                    .arg(&pointer(&grid, s))
-                    .arg(&(rows.0.len() as u32))
-                    .arg(&(cols.0.len() as u32))
-                    .arg(&(planes as u32))
-                    .arg(&(tiles.height as u32))
-                    .arg(&(tiles.width as u32))
-                    .arg(&(height as u32))
-                    .arg(&(width as u32))
-                    .launch(flat(planes * plane))?;
-            }
+            let vision = Arc::clone(&self.kernels.vision);
+            fp16_store(self.kernels.sm, s, &vision, "stitch", || {
+                unsafe {
+                    s.launch_builder(&self.kernels.stitch)
+                        .arg(&pointer(&raw, s))
+                        .arg(&pointer(&canvas, s))
+                        .arg(&pointer(&grid, s))
+                        .arg(&(rows.0.len() as u32))
+                        .arg(&(cols.0.len() as u32))
+                        .arg(&(planes as u32))
+                        .arg(&(tiles.height as u32))
+                        .arg(&(tiles.width as u32))
+                        .arg(&(height as u32))
+                        .arg(&(width as u32))
+                        .launch(flat(planes * plane))?;
+                }
+                Ok(())
+            })?;
             observe("canvas", i, &canvas)?;
             let dst = i * kept;
             if i > 0 && fade > 0 {

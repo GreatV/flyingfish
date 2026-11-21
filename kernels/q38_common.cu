@@ -1,6 +1,9 @@
 // Common norm/gate kernels. BF16-visible operations round explicitly.
 #include "q38_contract.cuh"
 #include "gpu_compat.cuh"
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+#include "ff_sm75_f16.cuh"
+#endif
 #include <math.h>
 template<typename T>
 __device__ __forceinline__ void copy_finite(const T* source, T* destination, uint64_t count) {
@@ -722,11 +725,44 @@ extern "C" __global__ void q38_layer_norm_f32(
     uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,float eps) {
     q38_layer_norm_f32_impl<float, float>(x,weight,bias,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,eps);
 }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+__device__ __forceinline__ void layer_norm_f32_to_f16_bits(
+    const float* x, const float* weight, const float* bias, __nv_bfloat16* y,
+    uint32_t rows, uint32_t width, float eps) {
+    if(blockDim.x!=256 || blockDim.y!=1 || blockDim.z!=1 || gridDim.y!=1 || gridDim.z!=1 ||
+       !rows || !width || uint64_t(gridDim.x)!=uint64_t(rows) ||
+       !x || bool(weight)!=bool(bias) || !y || !(eps>0)) {__trap();return;}
+    x+=uint64_t(blockIdx.x)*width;
+    y+=uint64_t(blockIdx.x)*width;
+    __shared__ float tmp[8];
+    float sum=0;
+    for(uint32_t d=threadIdx.x;d<width;d+=256) sum=__fadd_rn(sum,x[d]);
+    float mean=block_sum(sum,tmp)/float(width);
+    __syncthreads();
+    float variance=0;
+    for(uint32_t d=threadIdx.x;d<width;d+=256) {
+        float delta=__fsub_rn(x[d],mean);
+        variance=__fadd_rn(variance,__fmul_rn(delta,delta));
+    }
+    float inv=__fdiv_rn(1.0f,__fsqrt_rn(__fadd_rn(block_sum(variance,tmp)/float(width),eps)));
+    for(uint32_t d=threadIdx.x;d<width;d+=256) {
+        float centered=__fsub_rn(x[d],mean);
+        float normalized=__fmul_rn(centered,inv);
+        float out=normalized;
+        if(weight) out=__fadd_rn(__fmul_rn(normalized,weight[d]),bias[d]);
+        y[d]=ff_f16_from_f32<__nv_bfloat16>(out);
+    }
+}
+#endif
 extern "C" __global__ void layer_norm_f32_to_bf16(
     const float* x, const float* weight, const float* bias, __nv_bfloat16* y,
     uint32_t rows, uint32_t width, float eps) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+    layer_norm_f32_to_f16_bits(x, weight, bias, y, rows, width, eps);
+#else
     q38_layer_norm_f32_impl<float, __nv_bfloat16>(x, weight, bias, y, rows, 1, width,
         width, 0, 1, width, 0, 1, eps);
+#endif
 }
 extern "C" __global__ void q38_layer_norm_f16(
     const __half* x,const float* weight,const float* bias,__half* y,

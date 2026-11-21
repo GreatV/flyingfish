@@ -782,7 +782,7 @@ fn run_mode<const SETUP_ONLY: bool>(
         let text = s.clone_htod(&text)?;
         let hoist = {
             let disk_tier = !dit.hoist_ready()?;
-            super::vae::hoist_video_vae(model, disk_tier)?
+            super::vae::hoist_video_vae(model, disk_tier, &device.info.arch)?
         };
         dit.sample(
             &context,
