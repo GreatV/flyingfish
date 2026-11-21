@@ -1878,7 +1878,6 @@ pub(crate) fn quant_source_finite(name: &str, entry: &TensorEntry, bytes: &[u8])
 }
 
 /// Rewrites BF16 entries in a disk-tier layer. F32, I8, U8, and quantized entries stay.
-#[cfg(feature = "cuda")]
 fn rewrite_fp16_weights(layer: &DenseLayer, bytes: &mut [u8], report: bool) -> Result<()> {
     for entry in &layer.entries {
         if entry.narrow_f32 || entry.entry.quant.is_some() || entry.entry.dtype != Dtype::BF16 {
@@ -2013,7 +2012,7 @@ impl DenseStreaming {
         narrow: Option<fn(&str) -> bool>,
     ) -> Result<Self> {
         use crate::experts::{catalogue::NativeRange, disk::DiskReader};
-        let fp16_weights = super::cubin::capability(&d.ctx)? < 80;
+        let fp16_weights = d.info.arch.published_bf16_lt() == crate::backend::setup::LtOperand::F16;
         let mut layers: Vec<_> = plan
             .slots
             .iter()
