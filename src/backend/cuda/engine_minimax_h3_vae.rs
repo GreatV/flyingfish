@@ -228,7 +228,7 @@ impl ImageDecoder {
             tiles.width / spec.spatial_ratio,
         );
         let work = ImageWork {
-            core: TileWork::with_rope_axes(s, spec, tile, (batch, tiles.count()), 2)?,
+            core: TileWork::with_output(s, spec, tile, (batch, tiles.count()), (2, 0))?,
             grid: s.clone_htod(&grid)?,
             raw: unsafe { s.alloc(raw)? },
             planar: unsafe { s.alloc(pixels)? },
@@ -349,7 +349,7 @@ impl ImageDecoder {
 // Kept fixed outside streamed block slots so fused scale2 -> next.norm1 reads blocks[L+1].norm1 before begin(L+1).
 const DECODER_RESIDENT_BLOCK_WEIGHT: &str = "norm1.weight";
 
-fn image_decoder_layer_names(manifest: &TensorManifest, depth: usize) -> Vec<Vec<String>> {
+fn decoder_layer_names(manifest: &TensorManifest, depth: usize) -> Vec<Vec<String>> {
     (0..depth)
         .map(|layer| {
             let prefix = format!("decoder.transformer_blocks.{layer}.");
@@ -366,11 +366,11 @@ fn image_decoder_layer_names(manifest: &TensorManifest, depth: usize) -> Vec<Vec
         .collect()
 }
 
-pub(super) fn image_decoder_sizes(
+pub(super) fn decoder_layer_sizes(
     manifest: &TensorManifest,
     depth: usize,
 ) -> ([Vec<usize>; 2], usize, usize) {
-    let order = image_decoder_layer_names(manifest, depth);
+    let order = decoder_layer_names(manifest, depth);
     let device: Vec<_> = order
         .iter()
         .map(|names| {
@@ -430,65 +430,7 @@ impl ImageDecodeStage {
         work: ImageWork,
         plan: crate::prefill::DensePlacement,
     ) -> Result<Self> {
-        let mut loader = DecoderWeightLoad::new(dir, manifest);
-        if plan.slot_bytes > 0 {
-            let order = image_decoder_layer_names(manifest, spec.layers);
-            let slots = plan.slots.clone();
-            let mut dense =
-                DenseStreaming::with_f32_cast(dir, manifest, plan, device, &order, |name| {
-                    decoder_weight_width(name) == 2
-                })?;
-            let mut requests = Vec::new();
-            let mut checks = Vec::new();
-            let mut largest = 0usize;
-            for (layer, names) in order
-                .iter()
-                .enumerate()
-                .filter(|(layer, _)| slots[*layer].is_some())
-            {
-                let mut pinned = dense.host_layer(layer)?;
-                let (mut source, mut runtime) = (0, 0);
-                for name in names {
-                    let entry = &manifest.entries[name.as_str()];
-                    let end = source + entry.bytes;
-                    if let Some(bytes) = &mut pinned {
-                        requests.push(OwnedRead::new(
-                            name,
-                            entry,
-                            unsafe { bytes.as_mut_ptr().add(source) },
-                            entry.bytes,
-                            FillCast::Raw,
-                        ));
-                        checks.push(FillCheck::finite(
-                            layer,
-                            name,
-                            entry.dtype,
-                            source,
-                            entry.bytes,
-                        ));
-                        largest = largest.max(entry.bytes);
-                    }
-                    loader.offsets.insert(name.clone(), (layer, runtime));
-                    source = end;
-                    runtime += decoder_tensor_bytes(manifest, name);
-                }
-                ensure!(
-                    pinned.is_none_or(|pinned| pinned.len() == source),
-                    "image VAE pinned layer byte count"
-                );
-            }
-            let slot_bytes = dense.plan.slot_bytes;
-            let slot_count = slots.iter().flatten().copied().max().map_or(0, |i| i + 1);
-            loader.dense = Some(DenseTier::schedule(
-                "image-vae",
-                dense,
-                dir,
-                requests,
-                checks,
-                (slot_count, slot_bytes, largest),
-            )?);
-        }
-        loader.preload_resident(device, "image-vae")?;
+        let loader = DecoderWeightLoad::with_plan("image-vae", device, spec, dir, manifest, plan)?;
         let decoder = ImageDecoder::from_weights(device, spec, loader)?;
         decoder.core.bind(blas, &work.core)?;
         Ok(Self { decoder, work })
@@ -1345,6 +1287,76 @@ impl<'a> DecoderWeightLoad<'a> {
         Ok(())
     }
 
+    fn with_plan(
+        component: &'static str,
+        device: &Device,
+        spec: &VaeSpec,
+        dir: &Path,
+        manifest: &'a TensorManifest,
+        plan: crate::prefill::DensePlacement,
+    ) -> Result<Self> {
+        let mut loader = DecoderWeightLoad::new(dir, manifest);
+        if plan.slot_bytes > 0 {
+            let order = decoder_layer_names(manifest, spec.layers);
+            let slots = plan.slots.clone();
+            let mut dense =
+                DenseStreaming::with_f32_cast(dir, manifest, plan, device, &order, |name| {
+                    decoder_weight_width(name) == 2
+                })?;
+            let mut requests = Vec::new();
+            let mut checks = Vec::new();
+            let mut largest = 0usize;
+            for (layer, names) in order
+                .iter()
+                .enumerate()
+                .filter(|(layer, _)| slots[*layer].is_some())
+            {
+                let mut pinned = dense.host_layer(layer)?;
+                let (mut source, mut runtime) = (0, 0);
+                for name in names {
+                    let entry = &manifest.entries[name.as_str()];
+                    let end = source + entry.bytes;
+                    if let Some(bytes) = &mut pinned {
+                        requests.push(OwnedRead::new(
+                            name,
+                            entry,
+                            unsafe { bytes.as_mut_ptr().add(source) },
+                            entry.bytes,
+                            FillCast::Raw,
+                        ));
+                        checks.push(FillCheck::finite(
+                            layer,
+                            name,
+                            entry.dtype,
+                            source,
+                            entry.bytes,
+                        ));
+                        largest = largest.max(entry.bytes);
+                    }
+                    loader.offsets.insert(name.clone(), (layer, runtime));
+                    source = end;
+                    runtime += decoder_tensor_bytes(manifest, name);
+                }
+                ensure!(
+                    pinned.is_none_or(|pinned| pinned.len() == source),
+                    "{component} pinned layer byte count"
+                );
+            }
+            let slot_bytes = dense.plan.slot_bytes;
+            let slot_count = slots.iter().flatten().copied().max().map_or(0, |i| i + 1);
+            loader.dense = Some(DenseTier::schedule(
+                component,
+                dense,
+                dir,
+                requests,
+                checks,
+                (slot_count, slot_bytes, largest),
+            )?);
+        }
+        loader.preload_resident(device, component)?;
+        Ok(loader)
+    }
+
     fn tensor<T: Element + Copy>(
         &mut self,
         s: &Arc<CudaStream>,
@@ -1818,6 +1830,16 @@ impl VideoDecoder {
         )
     }
 
+    #[cfg(feature = "cuda")]
+    pub(super) fn with_plan(
+        device: &Device,
+        (spec, dir, manifest): (&VaeSpec, &Path, &TensorManifest),
+        plan: crate::prefill::DensePlacement,
+    ) -> Result<Self> {
+        let weights = DecoderWeightLoad::with_plan("video-vae", device, spec, dir, manifest, plan)?;
+        Self::from_weights(device, spec, weights)
+    }
+
     fn from_weights(d: &Device, spec: &VaeSpec, mut load: DecoderWeightLoad<'_>) -> Result<Self> {
         let vision = cubin::module(&d.ctx, "vision_ops")?;
         let common = cubin::module(&d.ctx, "q38_common")?;
@@ -1908,18 +1930,28 @@ impl VideoDecoder {
             "RGB output exceeds memory budget"
         );
         let output = unsafe { d.stream.alloc::<u8>(count)? };
+        self.rgb_into(d, decoded, &output, shape)?;
+        Ok(output)
+    }
+
+    pub(super) fn rgb_into(
+        &self,
+        d: &Device,
+        decoded: &CudaSlice<bf16>,
+        output: &impl DevicePtr<u8>,
+        shape: (usize, usize, usize),
+    ) -> Result<()> {
         planar_f32_to_rgb_u8(
             d,
             &self.kernels.rgb,
             decoded,
-            &output,
+            output,
             shape,
             (
                 VAE_PIXEL_MEAN.map(|v| v as f32),
                 VAE_PIXEL_STD.map(|v| v as f32),
             ),
-        )?;
-        Ok(output)
+        )
     }
 
     pub(crate) fn work(
@@ -1946,23 +1978,8 @@ impl VideoDecoder {
             + 2 * spec.latent_channels * shape.0 * shape.1 * shape.2;
         let (free, total) = d.ctx.mem_get_info()?;
         let budget = crate::prefill::DensePlacement::device_budget(free, total, mandatory, 0, 0)?;
-        let tokens = tile.0 * tile.1 * tile.2 + spec.registers + 1;
-        let [grid_x, _, grid_z] = crate::backend::cuda::max_grid_dim(&d.ctx)?;
-        let (grid_x, grid_z) = (grid_x as usize, grid_z as usize);
-        let cap = tiles
-            .count()
-            .min(grid_z)
-            .min(grid_x / (2 * tokens * spec.heads))
-            .min(i32::MAX as usize / (tokens * spec.ffn));
-        let mut work = None;
-        for batch in (1..=cap).rev() {
-            let bytes = TileWork::batch_bytes(spec, tile, batch, tiles.count())?;
-            if bytes <= budget {
-                work = Some((batch, bytes));
-                break;
-            }
-        }
-        let (batch, bytes) = work.context("video BF16 decoder cannot fit one tile")?;
+        let cap = Self::work_batch_cap(d, spec, tile, tiles.count())?;
+        let (batch, bytes) = Self::work_batch(spec, tile, tiles.count(), cap, budget)?;
         if crate::backend::diagnostics_enabled() {
             eprintln!(
                 "{}",
@@ -1973,15 +1990,65 @@ impl VideoDecoder {
         TileWork::new(&d.stream, spec, tile, (batch, tiles.count()))
     }
 
+    pub(super) fn work_batch(
+        spec: &VaeSpec,
+        tile: (usize, usize, usize),
+        slots: usize,
+        cap: usize,
+        budget: usize,
+    ) -> Result<(usize, usize)> {
+        ensure!(cap > 0, "video BF16 decoder launch limits exclude one tile");
+        for batch in (1..=cap).rev() {
+            let bytes = TileWork::batch_bytes(spec, tile, batch, slots)?;
+            if bytes <= budget {
+                return Ok((batch, bytes));
+            }
+        }
+        anyhow::bail!(
+            "video BF16 decoder needs {} bytes for one tile; budget {budget}",
+            TileWork::batch_bytes(spec, tile, 1, slots)?
+        )
+    }
+
+    pub(super) fn work_batch_cap(
+        d: &Device,
+        spec: &VaeSpec,
+        tile: (usize, usize, usize),
+        slots: usize,
+    ) -> Result<usize> {
+        let tokens = tile.0 * tile.1 * tile.2 + spec.registers + 1;
+        let [grid_x, _, grid_z] = crate::backend::cuda::max_grid_dim(&d.ctx)?;
+        let (grid_x, grid_z) = (grid_x as usize, grid_z as usize);
+        Ok(slots
+            .min(grid_z)
+            .min(grid_x / (2 * tokens * spec.heads))
+            .min(i32::MAX as usize / (tokens * spec.ffn)))
+    }
+
     pub(crate) fn bind(&self, blas: &mut Blas, work: &TileWork) -> Result<()> {
+        self.bind_groups(blas, work, work.batch)
+    }
+
+    pub(super) fn bind_groups(&self, blas: &mut Blas, work: &TileWork, cap: usize) -> Result<()> {
+        debug_assert!(work.batch <= cap);
         for &(active, _) in &work.attention {
-            self.post_quant.bind(blas, active * work.patches)?;
-            self.proj_in.bind(blas, active * work.patches)?;
-            let rows = active * work.tokens;
-            self.proj_out.bind(blas, rows)?;
+            let mut bind = |linear: &Linear<bf16>, stride| {
+                #[cfg(feature = "cuda")]
+                if work.batch != cap {
+                    return blas.prepare_biased_group(
+                        (active * stride, cap * stride),
+                        linear.weight.shape,
+                        linear.bias,
+                    );
+                }
+                linear.bind(blas, active * stride)
+            };
+            bind(&self.post_quant, work.patches)?;
+            bind(&self.proj_in, work.patches)?;
+            bind(&self.proj_out, work.tokens)?;
             for b in &self.blocks {
                 for linear in [&b.q, &b.k, &b.v, &b.out, &b.ff_in, &b.ff_out] {
-                    linear.bind(blas, rows)?;
+                    bind(linear, work.tokens)?;
                 }
             }
         }
@@ -2538,6 +2605,18 @@ impl TileWork {
         batch: usize,
         slots: usize,
     ) -> Result<usize> {
+        Self::charged_bytes(spec, shape, batch, slots, 1, 0)
+    }
+
+    pub(super) fn charged_bytes(
+        spec: &VaeSpec,
+        shape: (usize, usize, usize),
+        batch: usize,
+        slots: usize,
+        page: usize,
+        rgb_bytes: usize,
+    ) -> Result<usize> {
+        ensure!(page > 0, "invalid video allocation page");
         ensure!(batch > 0 && batch <= slots, "invalid video tile batch");
         let (f, h, w) = shape;
         ensure!(f > 0 && h > 0 && w > 0, "empty video tile");
@@ -2550,16 +2629,25 @@ impl TileWork {
             "video patch count exceeds layout capacity"
         );
         let t = p + spec.registers as u128 + 1;
-        let per = 2 * t * (8 * spec.dim + 3 * spec.ffn + spec.patch_width()) as u128
-            + 4 * p * spec.latent_channels as u128;
-        let tail = slots % batch;
-        let attention = [batch, tail]
+        let rows = batch as u128 * t;
+        let dim = rows * spec.dim as u128;
+        let ffn = rows * spec.ffn as u128;
+        let latent = 2 * batch as u128 * p * spec.latent_channels as u128;
+        let charge = |n: u128| n.div_ceil(page as u128) * page as u128;
+        let attention = [batch, slots % batch]
             .into_iter()
             .filter(|&n| n != 0)
-            .map(|n| 4 * (n as u128 * t * spec.heads as u128 + n as u128 + 1))
+            .map(|n| charge(4 * n as u128 * t * spec.heads as u128) + charge(4 * (n as u128 + 1)))
             .sum::<u128>();
         Ok(usize::try_from(
-            batch as u128 * per + attention + 4 * (t * spec.rope_dims as u128),
+            charge(4 * t * spec.rope_dims as u128)
+                + charge(4 * dim)
+                + 6 * charge(2 * dim)
+                + charge((4 * ffn).max(2 * rgb_bytes.div_ceil(2) as u128))
+                + charge(2 * ffn)
+                + 2 * charge(latent)
+                + charge(2 * rows * spec.patch_width() as u128)
+                + attention,
         )?)
     }
 
@@ -2573,17 +2661,17 @@ impl TileWork {
         shape: (usize, usize, usize),
         (batch, slots): (usize, usize),
     ) -> Result<Self> {
-        Self::with_rope_axes(s, spec, shape, (batch, slots), 3)
+        Self::with_output(s, spec, shape, (batch, slots), (3, 0))
     }
 
-    fn with_rope_axes(
+    pub(super) fn with_output(
         s: &Arc<CudaStream>,
         spec: &VaeSpec,
         shape: (usize, usize, usize),
         (batch, slots): (usize, usize),
-        axes: usize,
+        (axes, rgb_bytes): (usize, usize),
     ) -> Result<Self> {
-        let bytes = Self::batch_bytes(spec, shape, batch, slots)?;
+        let bytes = Self::charged_bytes(spec, shape, batch, slots, 1, rgb_bytes)?;
         let (frames, height, width) = shape;
         let patches = frames * height * width;
         let tokens = patches + spec.registers + 1;
@@ -2619,7 +2707,7 @@ impl TileWork {
             k: alloc(n)?,
             v: alloc(n)?,
             attn: alloc(n)?,
-            ff: alloc(rows * 2 * spec.ffn)?,
+            ff: alloc((rows * 2 * spec.ffn).max(rgb_bytes.div_ceil(2)))?,
             gated: alloc(rows * spec.ffn)?,
             latent: alloc(latent)?,
             latent_q: alloc(latent)?,
@@ -2638,6 +2726,15 @@ impl TileWork {
             "video work differs from counted plan"
         );
         Ok(work)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(super) fn rgb_output(
+        &mut self,
+        bytes: usize,
+    ) -> Result<cudarc::driver::CudaViewMut<'_, u8>> {
+        // The final projection and all previous FFN reads precede RGB conversion on this stream.
+        unsafe { self.ff.transmute_mut(bytes) }.context("decoder FFN storage is too small for RGB")
     }
 
     fn allocated_bytes(&self) -> usize {
@@ -4154,7 +4251,7 @@ pub(crate) mod image_tests {
         let resident = s.clone_dtoh(&work.rgb)?;
         drop(work);
         drop(decoder);
-        let ([device_layers, source_layers], _, _) = image_decoder_sizes(&manifest, spec.layers);
+        let ([device_layers, source_layers], _, _) = decoder_layer_sizes(&manifest, spec.layers);
         let slots = 2 * device_layers
             .iter()
             .max()

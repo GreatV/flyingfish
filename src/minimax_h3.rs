@@ -8,6 +8,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(feature = "cuda")]
+pub use crate::backend::cuda::engine::minimax_h3::VideoSession;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub use crate::backend::cuda::engine::minimax_h3::{
     ImageSession, generate, image_decode, image_encode, image_latents, image_sample,
@@ -1812,7 +1814,7 @@ pub struct H3Request {
 
 impl H3Request {
     #[cfg(any(feature = "cuda", feature = "rocm"))]
-    pub(crate) fn layout(&self, spec: &H3Spec) -> Result<(Geometry, PackedLayout)> {
+    pub(crate) fn geometry(&self, spec: &H3Spec) -> Result<Geometry> {
         let frame_bytes = self
             .height
             .checked_mul(self.width)
@@ -1834,7 +1836,12 @@ impl H3Request {
             !self.keyframes.is_empty() || self.pixel_values.is_empty(),
             "video without keyframes has image pixels"
         );
-        let geometry = Geometry::resolve(spec, self.height, self.width, self.frames)?;
+        Geometry::resolve(spec, self.height, self.width, self.frames)
+    }
+
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    pub(crate) fn layout(&self, spec: &H3Spec) -> Result<(Geometry, PackedLayout)> {
+        let geometry = self.geometry(spec)?;
         let anchors = self
             .keyframes
             .iter()
@@ -2130,24 +2137,35 @@ pub fn is_hyperflow_model(model: &Path) -> Result<bool> {
 }
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
+fn read_video_keyframe(path: &Path) -> Result<crate::serve::image::RgbImage> {
+    crate::serve::image::decode_image(
+        &fs::read(path).with_context(|| format!("read keyframe {}", path.display()))?,
+        None,
+    )
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+impl MiniMaxH3I2vaRequest {
+    pub fn prepare(&self) -> Result<H3Request> {
+        H3Spec::read(&self.model)?;
+        let keyframe = read_video_keyframe(&self.keyframe)?;
+        prepare_i2va(
+            &self.model,
+            &self.prompt,
+            &keyframe,
+            (self.frames, self.seed),
+            (8, (6.0, 3.0)),
+        )
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub fn run_minimax_h3_i2va(
     request: &MiniMaxH3I2vaRequest,
     options: crate::RunOptions,
 ) -> Result<H3Output> {
-    H3Spec::read(&request.model)?;
-    let keyframe = crate::serve::image::decode_image(
-        &fs::read(&request.keyframe)
-            .with_context(|| format!("read keyframe {}", request.keyframe.display()))?,
-        None,
-    )?;
     crate::backend::with_verbose(options.verbose, || {
-        let prepared = prepare_i2va(
-            &request.model,
-            &request.prompt,
-            &keyframe,
-            (request.frames, request.seed),
-            (8, (6.0, 3.0)),
-        )?;
+        let prepared = request.prepare()?;
         generate(
             &request.model,
             &request.lora,
@@ -2156,6 +2174,40 @@ pub fn run_minimax_h3_i2va(
             request.gguf.as_deref(),
         )
     })
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+impl HyperFlowH3Request {
+    #[cfg(feature = "cuda")]
+    pub fn prepare(&self) -> Result<H3Request> {
+        let (_, spec) = load_hyperflow_component(&self.model, "fl2va_int8_convrot", true)?
+            .with_context(|| {
+                format!(
+                    "CUDA HyperFlow requires fl2va_int8_convrot/config.json in {}",
+                    self.model.display()
+                )
+            })?;
+        self.prepare_with_spec(&spec)
+    }
+
+    fn prepare_with_spec(&self, spec: &H3Spec) -> Result<H3Request> {
+        let image = |path: &Option<PathBuf>| path.as_deref().map(read_video_keyframe).transpose();
+        let (first, last) = (image(&self.first_frame)?, image(&self.last_frame)?);
+        let anchors: Vec<_> = [
+            (KeyframeAnchor::First, &first),
+            (KeyframeAnchor::Last, &last),
+        ]
+        .into_iter()
+        .filter_map(|(anchor, image)| image.as_ref().map(|image| (anchor, image)))
+        .collect();
+        prepare_video(
+            &self.base_model,
+            spec,
+            &self.prompt,
+            &anchors,
+            ((self.frames, self.seed), (6, (12.0, 3.0))),
+        )
+    }
 }
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -2244,32 +2296,7 @@ pub fn run_hyperflow_h3_video(
                     )
                 })?
         };
-        let image = |path: &Option<PathBuf>| {
-            path.as_ref()
-                .map(|path| {
-                    crate::serve::image::decode_image(
-                        &fs::read(path)
-                            .with_context(|| format!("read keyframe {}", path.display()))?,
-                        None,
-                    )
-                })
-                .transpose()
-        };
-        let (first, last) = (image(&request.first_frame)?, image(&request.last_frame)?);
-        let anchors: Vec<_> = [
-            (KeyframeAnchor::First, &first),
-            (KeyframeAnchor::Last, &last),
-        ]
-        .into_iter()
-        .filter_map(|(anchor, image)| image.as_ref().map(|image| (anchor, image)))
-        .collect();
-        let prepared = prepare_video(
-            &request.base_model,
-            spec,
-            &request.prompt,
-            &anchors,
-            ((request.frames, request.seed), (6, (12.0, 3.0))),
-        )?;
+        let prepared = request.prepare_with_spec(spec)?;
         let component = select_hyperflow_component(
             &request.model,
             bf16.as_ref(),

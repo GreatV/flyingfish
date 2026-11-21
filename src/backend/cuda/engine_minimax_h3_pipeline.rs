@@ -5,7 +5,7 @@ use super::super::vision_runtime::LayerNormTower;
 use super::audio::AudioDecoder;
 use super::vae::{
     EncodeWork, ImageDecodeStage, ImageEncodeSetup, ImageEncodeStage, KeyframeEncoder, LatentVideo,
-    TileWork, VideoDecoder, decode_bytes, decoder_weight_bytes, image_decoder_sizes,
+    TileWork, VideoDecoder, decode_bytes, decoder_layer_sizes, decoder_weight_bytes,
     image_vae_manifest,
 };
 use super::{
@@ -36,6 +36,10 @@ use std::{
 /// audio decoder output) that the splice gate scores.
 pub(crate) struct Generated {
     pub output: H3Output,
+    #[cfg(all(test, feature = "cuda"))]
+    conditioner: Vec<bf16>,
+    #[cfg(all(test, feature = "cuda"))]
+    anchors: Vec<Vec<f32>>,
     #[cfg(test)]
     pub video_latents: (Vec<usize>, Vec<f32>),
     #[cfg(test)]
@@ -115,17 +119,21 @@ fn condition(
         device,
         blas,
         model,
-        &ConditionerPrompt {
-            modality: request
-                .token_ids
-                .iter()
-                .map(|&id| u8::from(id == image_token))
-                .collect(),
-            tokens: request.token_ids.clone(),
-            grids: request.grids.clone(),
-            pixels: request.pixel_values.clone(),
-        },
+        &video_conditioner_prompt(request, image_token),
     )
+}
+
+fn video_conditioner_prompt(request: &H3Request, image_token: u32) -> ConditionerPrompt {
+    ConditionerPrompt {
+        modality: request
+            .token_ids
+            .iter()
+            .map(|&id| u8::from(id == image_token))
+            .collect(),
+        tokens: request.token_ids.clone(),
+        grids: request.grids.clone(),
+        pixels: request.pixel_values.clone(),
+    }
 }
 
 fn condition_prompt(
@@ -282,27 +290,64 @@ fn keyframes(
         return Ok(Vec::new());
     }
     let eps = eps.context("keyframes require posterior noise")?;
-    let s = &device.stream;
     let spec = VaeSpec::read(model)?;
     let vae_dir = model.join("vae");
     let manifest = MappedCheckpoint::open_component(&vae_dir, "diffusion_pytorch_model")?
         .minimax_h3_vae_manifest(&spec)?;
-    let encoder = KeyframeEncoder::new(device, &spec, &vae_dir, &manifest)?;
-    let tiles = VaeTiles::released(&spec, request.height, request.width)?;
-    let mut work = EncodeWork::new(s, &encoder, (tiles.height, tiles.width))?;
-    let mut anchors = Vec::with_capacity(request.keyframes.len());
-    for (_, pixels) in &request.keyframes {
-        let frame = s.clone_htod(pixels)?;
-        let [_, _, latents] = encoder.encode(
-            (s, blas),
-            &mut work,
-            &tiles,
-            (&frame, request.height, request.width),
-            eps,
-        )?;
-        anchors.push(s.clone_dtoh(&latents)?);
+    let mut stage = VideoEncodeStage::new(
+        device,
+        (&spec, &vae_dir, &manifest),
+        [request.height, request.width],
+    )?;
+    stage.run(device, blas, request, eps)
+}
+
+struct VideoEncodeStage {
+    encoder: KeyframeEncoder,
+    tiles: VaeTiles,
+    work: EncodeWork,
+}
+
+impl VideoEncodeStage {
+    fn new(
+        device: &Device,
+        (spec, dir, manifest): (&VaeSpec, &Path, &TensorManifest),
+        [height, width]: [usize; 2],
+    ) -> Result<Self> {
+        let encoder = KeyframeEncoder::new(device, spec, dir, manifest)?;
+        let tiles = VaeTiles::released(spec, height, width)?;
+        let work = EncodeWork::new(&device.stream, &encoder, (tiles.height, tiles.width))?;
+        Ok(Self {
+            encoder,
+            tiles,
+            work,
+        })
     }
-    Ok(anchors)
+
+    fn run(
+        &mut self,
+        device: &Device,
+        blas: &Blas,
+        request: &H3Request,
+        eps: &CudaSlice<f32>,
+    ) -> Result<Vec<Vec<f32>>> {
+        let s = &device.stream;
+        let mut anchors = Vec::with_capacity(request.keyframes.len());
+        for (_, pixels) in &request.keyframes {
+            let frame = s.clone_htod(pixels)?;
+            let [_, _, latents] = self.encoder.encode(
+                (s, blas),
+                &mut self.work,
+                &self.tiles,
+                (&frame, request.height, request.width),
+                eps,
+            )?;
+            #[cfg(test)]
+            println!("H3_VIDEO_KEYFRAME_ENCODER_CALL calls=1");
+            anchors.push(s.clone_dtoh(&latents)?);
+        }
+        Ok(anchors)
+    }
 }
 
 /// Resident BF16 and F32 video weights plus the published F32 audio weights.
@@ -413,11 +458,22 @@ pub(crate) fn decoder_setup(
     )
 }
 
+struct VideoTransformer {
+    dit: Dit,
+    table: AdalnTable,
+    adaln: AdalnPlan,
+    video_grid: Schedule,
+    audio_grid: Schedule,
+    scale: f32,
+}
+
 fn prepare_transformer(
     (device, blas): (&Device, &mut Blas),
     (transformer, lora, gguf): (&Path, Option<&Path>, Option<&Path>),
-    (spec, layout, request): (&H3Spec, &PackedLayout, &H3Request),
-) -> Result<(Dit, AdalnTable, AdalnPlan, Schedule, Schedule, f32)> {
+    (spec, layout): (&H3Spec, &PackedLayout),
+    (evaluations, shifts): (usize, (f64, f64)),
+    choose: Option<&mut super::VideoPlacementChooser<'_>>,
+) -> Result<VideoTransformer> {
     let hyperflow = spec.is_hyperflow()?;
     #[cfg(feature = "cuda")]
     ensure!(
@@ -454,18 +510,18 @@ fn prepare_transformer(
         .map_or((0, 0.0), |(_, _, a)| (a.rank, a.scale));
     let (video_grid, audio_grid) = if hyperflow {
         ensure!(
-            request.shifts == (12.0, 3.0),
+            shifts == (12.0, 3.0),
             "HyperFlow requires video/audio shifts12/3"
         );
-        hyperflow_schedules(request.evaluations)?
+        hyperflow_schedules(evaluations)?
     } else {
         (
-            Schedule::new(request.evaluations + 1, request.shifts.0)?,
-            Schedule::new(request.evaluations + 1, request.shifts.1)?,
+            Schedule::new(evaluations + 1, shifts.0)?,
+            Schedule::new(evaluations + 1, shifts.1)?,
         )
     };
     let plan = if hyperflow {
-        hyperflow_steps(request.evaluations)?
+        hyperflow_steps(evaluations)?
             .into_iter()
             .map(|step| RowTimesteps::hyperflow(layout, &step))
             .collect()
@@ -474,21 +530,144 @@ fn prepare_transformer(
     };
     let adaln_plan = AdalnPlan::build(layout, &plan)?;
     let table = AdalnTable::build(device, blas, &source_dir, &manifest, spec, &adaln_plan)?;
-    let dit = Dit::new(
+    let base = Source::new(&source_dir, &manifest);
+    let lora = adapter
+        .as_ref()
+        .map(|(dir, manifest, _)| Source::new(dir, manifest));
+    let dit = Dit::with_placement(
         device,
         blas,
         spec,
         (rank, layout),
-        Source::new(&source_dir, &manifest),
-        adapter
-            .as_ref()
-            .map(|(dir, manifest, _)| Source::new(dir, manifest)),
+        base,
+        lora,
         (
             Placement::Derived,
             crate::prefill::placement_visits(plan.len(), 1)?,
+            choose,
         ),
     )?;
-    Ok((dit, table, adaln_plan, video_grid, audio_grid, scale))
+    Ok(VideoTransformer {
+        dit,
+        table,
+        adaln: adaln_plan,
+        video_grid,
+        audio_grid,
+        scale,
+    })
+}
+
+struct VideoNoise {
+    posterior_eps: Option<CudaSlice<f32>>,
+    anchor: Vec<f32>,
+    video: Vec<f32>,
+    audio: CudaSlice<f32>,
+}
+
+fn video_noise(
+    (device, normal): (&Device, &crate::backend::gpu::CudaFunction),
+    (spec, vae): (&H3Spec, &VaeSpec),
+    (geometry, layout): (&Geometry, &PackedLayout),
+    request: &H3Request,
+    draws: &NoiseDraws,
+) -> Result<VideoNoise> {
+    let s = &device.stream;
+    let (r, lc) = (vae.spatial_ratio, vae.latent_channels);
+    let (lh, lw) = (request.height / r, request.width / r);
+    let plane = lh * lw;
+    let latent_frames = geometry.latent_frames;
+    let (anchor_count, video_count) = (lc * plane, lc * latent_frames * plane);
+    let audio_count = layout.audio_indices.len() * spec.audio_in_channels;
+
+    let condition_count = anchor_count
+        .checked_mul(request.keyframes.len())
+        .context("conditioning noise extent overflow")?;
+    let posterior_eps = if request.keyframes.is_empty() {
+        None
+    } else {
+        Some(draws.draw(device, normal, 0, anchor_count)?)
+    };
+    let anchor_noise = if condition_count == 0 {
+        Vec::new()
+    } else {
+        let draw = draws.draw(device, normal, 1, condition_count)?;
+        s.clone_dtoh(&draw)?
+    };
+    let video_noise = {
+        let draw = draws.draw(device, normal, 2, video_count)?;
+        s.clone_dtoh(&draw)?
+    };
+    let audio = draws.draw(device, normal, 3, audio_count)?;
+
+    Ok(VideoNoise {
+        posterior_eps,
+        anchor: anchor_noise,
+        video: video_noise,
+        audio,
+    })
+}
+
+fn video_rows(
+    (spec, vae): (&H3Spec, &VaeSpec),
+    (geometry, layout): (&Geometry, &PackedLayout),
+    request: &H3Request,
+    noise: &VideoNoise,
+    (anchors, text): (&[Vec<f32>], &[bf16]),
+) -> Result<Vec<f32>> {
+    let (r, lc) = (vae.spatial_ratio, vae.latent_channels);
+    let (lh, lw) = (request.height / r, request.width / r);
+    let plane = lh * lw;
+    let latent_frames = geometry.latent_frames;
+    let (anchor_count, video_count) = (lc * plane, lc * latent_frames * plane);
+    let audio_count = layout.audio_indices.len() * spec.audio_in_channels;
+
+    let VideoNoise {
+        anchor: anchor_noise,
+        video: video_noise,
+        audio,
+        ..
+    } = noise;
+    let condition_count = anchor_count
+        .checked_mul(request.keyframes.len())
+        .context("conditioning noise extent overflow")?;
+    let patch = spec.patch;
+    let condition_rows = {
+        let t = KEYFRAME_NOISE_AUG as f32;
+        let mixed: Vec<f32> = anchors
+            .iter()
+            .flatten()
+            .zip(anchor_noise)
+            .map(|(&x, &n)| t * x + (1.0 - t) * n)
+            .collect();
+        let mut rows = Vec::with_capacity(condition_count);
+        for anchor in mixed.chunks_exact(anchor_count) {
+            patchify_latents_into(anchor, (lc, 1, lh, lw), [1, patch[1], patch[2]], &mut rows);
+        }
+        rows
+    };
+    let width = spec.video_row_width();
+    ensure!(
+        anchors.len() == request.keyframes.len()
+            && anchors.iter().all(|anchor| anchor.len() == anchor_count)
+            && condition_rows.len() == layout.condition_video_rows * width
+            && video_noise.len() == video_count
+            && (layout.video_indices.len() - layout.condition_video_rows) * width == video_count
+            && audio.len() == audio_count
+            && request.text_tags.len() == text.len() / spec.text_dim,
+        "native draws do not match the packed layout: anchor {}, video {}, audio {}, text rows {}",
+        anchor_noise.len(),
+        video_noise.len(),
+        audio.len(),
+        request.text_tags.len()
+    );
+    let mut video_rows = condition_rows;
+    patchify_latents_into(
+        video_noise,
+        (lc, latent_frames, lh, lw),
+        patch,
+        &mut video_rows,
+    );
+    Ok(video_rows)
 }
 
 fn run_mode<const SETUP_ONLY: bool>(
@@ -525,45 +704,20 @@ fn run_mode<const SETUP_ONLY: bool>(
     let vae = VaeSpec::read(model)?;
     let audio_spec = AudioVaeSpec::read(model)?;
     let (geometry, layout) = request.layout(&spec)?;
-    let (r, lc) = (vae.spatial_ratio, vae.latent_channels);
-    let (lh, lw) = (request.height / r, request.width / r);
-    let plane = lh * lw;
-    let latent_frames = geometry.latent_frames;
-    let (anchor_count, video_count) = (lc * plane, lc * latent_frames * plane);
-    let audio_count = layout.audio_indices.len() * spec.audio_in_channels;
-
     let normal = cubin::module(&device.ctx, "sample")?.load_function("philox_normal_f32")?;
-    let condition_count = anchor_count
-        .checked_mul(request.keyframes.len())
-        .context("conditioning noise extent overflow")?;
-    let posterior_eps = if request.keyframes.is_empty() {
-        None
-    } else {
-        Some(draws.draw(&device, &normal, 0, anchor_count)?)
-    };
-    let anchor_noise = if condition_count == 0 {
-        Vec::new()
-    } else {
-        let draw = draws.draw(&device, &normal, 1, condition_count)?;
-        s.clone_dtoh(&draw)?
-    };
-    let video_noise = {
-        let draw = draws.draw(&device, &normal, 2, video_count)?;
-        s.clone_dtoh(&draw)?
-    };
-    let audio = draws.draw(&device, &normal, 3, audio_count)?;
-
-    #[cfg(not(test))]
-    let (text, anchors) = (
-        condition(&device, &mut blas, model, request)?,
-        keyframes(&device, &blas, model, request, posterior_eps.as_ref())?,
-    );
-    #[cfg(test)]
+    let noise = video_noise(
+        (&device, &normal),
+        (&spec, &vae),
+        (&geometry, &layout),
+        request,
+        &draws,
+    )?;
     let (text, anchors) = match &draws {
+        #[cfg(test)]
         NoiseDraws::Recorded(input) => (input.conditioner.clone(), input.anchors.clone()),
         NoiseDraws::Seed(_) => (
             condition(&device, &mut blas, model, request)?,
-            keyframes(&device, &blas, model, request, posterior_eps.as_ref())?,
+            keyframes(&device, &blas, model, request, noise.posterior_eps.as_ref())?,
         ),
     };
     #[cfg(test)]
@@ -577,53 +731,33 @@ fn run_mode<const SETUP_ONLY: bool>(
         NoiseDraws::Seed(_) => None,
     };
 
-    let patch = spec.patch;
-    let condition_rows = {
-        let t = KEYFRAME_NOISE_AUG as f32;
-        let mixed: Vec<f32> = anchors
-            .iter()
-            .flatten()
-            .zip(&anchor_noise)
-            .map(|(&x, &n)| t * x + (1.0 - t) * n)
-            .collect();
-        let mut rows = Vec::with_capacity(condition_count);
-        for anchor in mixed.chunks_exact(anchor_count) {
-            patchify_latents_into(anchor, (lc, 1, lh, lw), [1, patch[1], patch[2]], &mut rows);
-        }
-        rows
-    };
-    let width = spec.video_row_width();
-    ensure!(
-        anchors.len() == request.keyframes.len()
-            && anchors.iter().all(|anchor| anchor.len() == anchor_count)
-            && condition_rows.len() == layout.condition_video_rows * width
-            && video_noise.len() == video_count
-            && (layout.video_indices.len() - layout.condition_video_rows) * width == video_count
-            && audio.len() == audio_count
-            && request.text_tags.len() == text.len() / spec.text_dim,
-        "native draws do not match the packed layout: anchor {}, video {}, audio {}, text rows {}",
-        anchor_noise.len(),
-        video_noise.len(),
-        audio.len(),
-        request.text_tags.len()
-    );
-    let mut video_rows = condition_rows;
-    patchify_latents_into(
-        &video_noise,
-        (lc, latent_frames, lh, lw),
-        patch,
-        &mut video_rows,
-    );
+    let video_rows = video_rows(
+        (&spec, &vae),
+        (&geometry, &layout),
+        request,
+        &noise,
+        (&anchors, &text),
+    )?;
+    let audio = &noise.audio;
     #[cfg(test)]
     if let Some(replay) = &mut replay {
-        replay.initial = (video_rows.clone(), s.clone_dtoh(&audio)?);
+        replay.initial = (video_rows.clone(), s.clone_dtoh(audio)?);
     }
 
     let (video, audio, free_before, mut hoist) = {
-        let (mut dit, table, adaln_plan, video_grid, audio_grid, scale) = prepare_transformer(
+        let VideoTransformer {
+            mut dit,
+            table,
+            adaln: adaln_plan,
+            video_grid,
+            audio_grid,
+            scale,
+        } = prepare_transformer(
             (&device, &mut blas),
             (transformer, lora, gguf),
-            (&spec, &layout, request),
+            (&spec, &layout),
+            (request.evaluations, request.shifts),
+            None,
         )?;
         #[cfg(test)]
         if let Some(replay) = &mut replay {
@@ -651,7 +785,7 @@ fn run_mode<const SETUP_ONLY: bool>(
             &context,
             (&table, &adaln_plan),
             (&video_grid, &audio_grid),
-            (&video, &audio),
+            (&video, audio),
             &text,
         )?;
         #[cfg(test)]
@@ -665,7 +799,7 @@ fn run_mode<const SETUP_ONLY: bool>(
                 .take()
                 .context("RUNNER_FAIL refiner trace missing")?;
         }
-        let (video, audio) = (s.clone_dtoh(&video)?, s.clone_dtoh(&audio)?);
+        let (video, audio) = (s.clone_dtoh(&video)?, s.clone_dtoh(audio)?);
         (video, audio, device.ctx.mem_get_info()?.0, hoist)
     };
     s.synchronize()?;
@@ -689,10 +823,52 @@ fn run_mode<const SETUP_ONLY: bool>(
     )?;
     #[cfg(test)]
     let generated = Generated {
+        #[cfg(feature = "cuda")]
+        conditioner: text,
+        #[cfg(feature = "cuda")]
+        anchors,
         replay,
         ..generated
     };
     Ok(generated)
+}
+
+fn video_decode_device(
+    (device, blas): (&Device, &Blas),
+    (decoder, work, tiles): (&VideoDecoder, &mut TileWork, &VaeTiles),
+    (geometry, vae, total_frames): (&Geometry, &VaeSpec, usize),
+    video_latents: &[f32],
+) -> Result<CudaSlice<bf16>> {
+    let s = &device.stream;
+    let mut decoded =
+        s.alloc_zeros::<bf16>(vae.out_channels * total_frames * geometry.height * geometry.width)?;
+    let rounded: Vec<_> = video_latents.iter().copied().map(bf16::from_f32).collect();
+    ensure!(
+        rounded.iter().all(|x| x.is_finite()),
+        "video latent input is nonfinite after BF16 entry cast"
+    );
+    let latents = s.clone_htod(&rounded)?;
+    drop(rounded);
+    let plan = decoder.decode(
+        s,
+        blas,
+        work,
+        tiles,
+        LatentVideo {
+            data: &latents,
+            frames: geometry.latent_frames,
+            height: geometry.height / vae.spatial_ratio,
+            width: geometry.width / vae.spatial_ratio,
+        },
+        &mut decoded,
+    )?;
+    ensure!(
+        plan.frames == geometry.frames,
+        "decoded {} frames, resolved geometry has {}",
+        plan.frames,
+        geometry.frames
+    );
+    Ok(decoded)
 }
 
 fn decode<const SETUP_ONLY: bool, const SERIAL: bool>(
@@ -769,34 +945,14 @@ fn decode<const SETUP_ONLY: bool, const SERIAL: bool>(
         work = TileWork::new(s, vae, tile, (1, tiles.count()))?;
     }
     decoder.bind(blas, &work)?;
-    let mut decoded = s.alloc_zeros::<bf16>(vae.out_channels * total_frames * pixels)?;
-    let rounded: Vec<_> = video_latents.iter().copied().map(bf16::from_f32).collect();
-    ensure!(
-        rounded.iter().all(|x| x.is_finite()),
-        "video latent input is nonfinite after BF16 entry cast"
-    );
-    let latents_device = s.clone_htod(&rounded)?;
-    drop(rounded);
-    let decode_plan = decoder.decode(
-        s,
-        blas,
-        &mut work,
-        &tiles,
-        LatentVideo {
-            data: &latents_device,
-            frames: latent_frames,
-            height: lh,
-            width: lw,
-        },
-        &mut decoded,
+    let decoded = video_decode_device(
+        (device, blas),
+        (&decoder, &mut work, &tiles),
+        (geometry, vae, total_frames),
+        &video_latents,
     )?;
-    let frames = decode_plan.frames;
-    ensure!(
-        frames == geometry.frames,
-        "decoded {frames} frames, resolved geometry has {}",
-        geometry.frames
-    );
-    drop((work, latents_device));
+    let frames = geometry.frames;
+    drop(work);
     #[cfg(test)]
     let video_decoded = s
         .clone_dtoh(&decoded)?
@@ -820,6 +976,10 @@ fn decode<const SETUP_ONLY: bool, const SERIAL: bool>(
             sampling_rate: audio_spec.sampling_rate,
             audio: pcm,
         },
+        #[cfg(all(test, feature = "cuda"))]
+        conditioner: Vec::new(),
+        #[cfg(all(test, feature = "cuda"))]
+        anchors: Vec::new(),
         #[cfg(test)]
         video_latents: (vec![1, lc, latent_frames, lh, lw], video_latents),
         #[cfg(test)]
@@ -1181,7 +1341,7 @@ impl ImageInput {
     }
 }
 
-struct ImageTextStage {
+struct ConditionerStage {
     dir: PathBuf,
     spec: crate::model_spec::ModelSpec,
     manifest: TensorManifest,
@@ -1191,7 +1351,9 @@ struct ImageTextStage {
     image_token: u32,
 }
 
-fn image_vision_input(prompt: &ConditionerPrompt) -> crate::vision_input::MultimodalInput<'_> {
+fn conditioner_vision_input(
+    prompt: &ConditionerPrompt,
+) -> crate::vision_input::MultimodalInput<'_> {
     crate::vision_input::MultimodalInput {
         input_ids: &prompt.tokens,
         modality_ids: &prompt.modality,
@@ -1201,12 +1363,12 @@ fn image_vision_input(prompt: &ConditionerPrompt) -> crate::vision_input::Multim
     }
 }
 
-impl ImageTextStage {
+impl ConditionerStage {
     fn run(&mut self, device: &Device, prompt: &ConditionerPrompt) -> Result<Vec<bf16>> {
         let runs = image_runs(&prompt.tokens, self.image_token);
         ensure!(
             runs.is_empty() == self.vision.is_none(),
-            "resident image vision input changed"
+            "resident vision input changed"
         );
         let table = conditioner_table(
             &self.dir,
@@ -1219,7 +1381,7 @@ impl ImageTextStage {
             .vision
             .as_ref()
             .map(|tower| -> Result<_> {
-                let input = image_vision_input(prompt);
+                let input = conditioner_vision_input(prompt);
                 let prepared =
                     tower.prepare(device, &mut self.blas, &input, prompt.tokens.len(), 0)?;
                 let encoded = tower.encode(&device.stream, &self.blas, prepared, None)?;
@@ -1249,6 +1411,797 @@ impl ImageTextStage {
     }
 }
 
+#[cfg(feature = "cuda")]
+struct VideoShape {
+    geometry: Geometry,
+    tags: Vec<u8>,
+    grids: Vec<crate::vision_input::ImageGrid>,
+    anchors: Vec<crate::minimax_h3::KeyframeAnchor>,
+    shifts: (f64, f64),
+    evaluations: usize,
+    pixels: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl VideoShape {
+    fn new(geometry: Geometry, request: &H3Request) -> Self {
+        Self {
+            geometry,
+            tags: request.text_tags.clone(),
+            grids: request.grids.clone(),
+            anchors: request
+                .keyframes
+                .iter()
+                .map(|(anchor, _)| *anchor)
+                .collect(),
+            shifts: request.shifts,
+            evaluations: request.evaluations,
+            pixels: request.pixel_values.len(),
+        }
+    }
+
+    fn check(&self, spec: &H3Spec, request: &H3Request) -> Result<()> {
+        ensure!(
+            request.geometry(spec)? == self.geometry
+                && request.text_tags == self.tags
+                && request.grids == self.grids
+                && request
+                    .keyframes
+                    .iter()
+                    .map(|(anchor, _)| *anchor)
+                    .eq(self.anchors.iter().copied())
+                && request.shifts == self.shifts
+                && request.evaluations == self.evaluations
+                && request.pixel_values.len() == self.pixels,
+            "video request differs from the resident canvas, packed layout, or schedule"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct VideoDecodeGeometry {
+    tiles: VaeTiles,
+    tile: (usize, usize, usize),
+    total_frames: usize,
+    chunks: usize,
+    transient: usize,
+    rgb_bytes: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl VideoDecodeGeometry {
+    fn new(spec: &VaeSpec, geometry: &Geometry) -> Result<Self> {
+        let (h, w) = (geometry.height, geometry.width);
+        let tiles = VaeTiles::released(spec, h, w)?;
+        let clip = spec.chunk_latents() + spec.overlap_latents();
+        let r = spec.spatial_ratio;
+        let tile = (clip, tiles.height / r, tiles.width / r);
+        let plan = crate::minimax_h3::DecodePlan::new(spec, geometry.latent_frames)?;
+        let (lead, pre) = (
+            spec.chunk_latents() * spec.temporal_ratio,
+            spec.frame_pre_padding(),
+        );
+        let total_frames = plan.chunks * (lead - pre) + clip * spec.temporal_ratio - lead - pre;
+        let pixels = h * w;
+        let decoded = 2 * spec.out_channels * total_frames * pixels;
+        let latent = 2 * spec.latent_channels * geometry.latent_frames * (h / r) * (w / r);
+        let grid = 4 * (2 * (tiles.rows.0.len() + tiles.cols.0.len()) - 2);
+        let tile_scratch = decode_bytes(spec, &tiles, (h, w)) + latent + grid;
+        let rgb_bytes = plan
+            .frames
+            .checked_mul(pixels)
+            .and_then(|n| n.checked_mul(3))
+            .context("resident video RGB extent overflow")?;
+        Ok(Self {
+            tiles,
+            tile,
+            total_frames,
+            chunks: plan.chunks,
+            transient: decoded + tile_scratch,
+            rgb_bytes,
+        })
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct DecoderVisitCost {
+    weight_bytes: usize,
+    weight_seconds: f64,
+    launches: usize,
+    launch_seconds: f64,
+    handoff_seconds: f64,
+}
+
+#[cfg(feature = "cuda")]
+impl DecoderVisitCost {
+    fn measure(
+        device: &Device,
+        normal: &crate::backend::gpu::CudaFunction,
+        layers: usize,
+        weight_bytes: usize,
+    ) -> Result<Self> {
+        use cudarc::driver::PushKernelArg;
+        use std::time::Instant;
+        let stream = &device.stream;
+        let out = stream.alloc_zeros::<f32>(1)?;
+        let ready = device.ctx.new_event(None)?;
+        let retired = device.ctx.new_event(None)?;
+        let mut launches = [0.0; 5];
+        let mut handoffs = [0.0; 5];
+        for trial in 0..=launches.len() {
+            stream.synchronize()?;
+            let start = Instant::now();
+            for _ in 0..128 {
+                unsafe {
+                    stream
+                        .launch_builder(normal)
+                        .arg(&0u64)
+                        .arg(&0u64)
+                        .arg(&out)
+                        .arg(&0i64)
+                        .launch(crate::backend::cuda::ops::grid(1, 1))?;
+                }
+            }
+            stream.synchronize()?;
+            let launch = start.elapsed().as_secs_f64() / 128.0;
+            let start = Instant::now();
+            for _ in 0..128 {
+                ready.record(&device.upload)?;
+                stream.wait(&ready)?;
+                retired.record(stream)?;
+                device.upload.wait(&retired)?;
+            }
+            device.upload.synchronize()?;
+            if trial > 0 {
+                launches[trial - 1] = launch;
+                handoffs[trial - 1] = start.elapsed().as_secs_f64() / 256.0;
+            }
+        }
+        launches.sort_by(f64::total_cmp);
+        handoffs.sort_by(f64::total_cmp);
+        Ok(Self {
+            weight_bytes,
+            weight_seconds: weight_bytes as f64 / device.info.memory_bytes_per_second,
+            // Six outer submissions and six GEMMs plus five kernels per decoder block.
+            launches: 6 + 11 * layers,
+            launch_seconds: launches[2],
+            handoff_seconds: handoffs[2],
+        })
+    }
+
+    fn price_groups(
+        &self,
+        (vae, geometry, cap): (&VaeSpec, &VideoDecodeGeometry, usize),
+        mut stages: [crate::prefill::DenseStage<'_>; 3],
+        (stage_and_work, budget, host, page): (usize, usize, usize, usize),
+        rates: (f64, f64),
+    ) -> Result<(
+        usize,
+        usize,
+        crate::prefill::PricedDense,
+        Vec<serde_json::Value>,
+    )> {
+        use crate::prefill::{PricedDense, try_price_dense_stages};
+        let slots = geometry.tiles.count();
+        let mut best = None;
+        let mut alternatives = Vec::new();
+        for batch in (1..=cap).rev() {
+            let groups = slots.div_ceil(batch);
+            // Within a visit count the smallest workspace leaves the most space for weights.
+            if batch < cap.saturating_sub(1) && batch > slots.div_ceil(groups) {
+                continue;
+            }
+            let charged = TileWork::charged_bytes(
+                vae,
+                geometry.tile,
+                batch,
+                slots,
+                page,
+                geometry.rgb_bytes,
+            )?;
+            if charged > budget {
+                continue;
+            }
+            let visits = geometry.chunks * groups;
+            stages[2].visits = visits;
+            let stage_limit = stage_and_work - charged;
+            let Some(priced) = try_price_dense_stages(
+                stages,
+                (stage_limit, host, page),
+                rates,
+                self.streamed_block_seconds(),
+            )?
+            else {
+                continue;
+            };
+            let tier_seconds = priced
+                .decoder_streamed_seconds
+                .into_iter()
+                .chain(priced.decoder_resident_seconds)
+                .min_by(f64::total_cmp)
+                .context("decoder placement lacks a price")?;
+            let seconds = tier_seconds + visits as f64 * self.group_seconds();
+            let streamed = priced.plans[2].slots.iter().flatten().count();
+            let demand = |disk_only| {
+                priced
+                    .plans
+                    .iter()
+                    .zip(stages)
+                    .map(|(plan, stage)| {
+                        stage.visits
+                            * (plan.disk_bytes + if disk_only { 0 } else { plan.host_bytes })
+                    })
+                    .sum::<usize>()
+            };
+            alternatives.push(serde_json::json!({
+                "batch": batch, "visits": visits, "work_charge": charged, "stage_limit": stage_limit,
+                "source_bytes": demand(false), "disk_bytes": demand(true),
+                "decoder_weight_bytes": visits * self.weight_bytes,
+                "decoder_launches": visits * (self.launches + 12 * streamed),
+                "decoder_stream_handoffs": visits * 2 * streamed, "seconds": seconds,
+            }));
+            if best
+                .as_ref()
+                .is_none_or(|(previous, ..): &(f64, usize, usize, PricedDense)| seconds < *previous)
+            {
+                best = Some((seconds, batch, stage_limit, priced));
+            }
+        }
+        let (_, batch, device_budget, priced) = best.with_context(|| format!(
+            "resident video has no decoder group and dense placement within device={stage_and_work} host={host} bytes"
+        ))?;
+        Ok((batch, device_budget, priced, alternatives))
+    }
+
+    fn group_seconds(&self) -> f64 {
+        self.weight_seconds + self.launches as f64 * self.launch_seconds
+    }
+
+    fn streamed_block_seconds(&self) -> f64 {
+        // Six BF16 projections narrow one weight and bias each. Ready and retired cross streams.
+        12.0 * self.launch_seconds + 2.0 * self.handoff_seconds
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct VideoDecodeStage {
+    geometry: VideoDecodeGeometry,
+    video: VideoDecoder,
+    audio: AudioDecoder,
+    work: TileWork,
+}
+
+#[cfg(feature = "cuda")]
+impl VideoDecodeStage {
+    fn render(
+        &mut self,
+        (device, blas): (&Device, &Blas),
+        (geometry, vae, audio_spec): (&Geometry, &VaeSpec, &AudioVaeSpec),
+        (video, audio): (&[f32], &[f32]),
+    ) -> Result<H3Output> {
+        let decoded = video_decode_device(
+            (device, blas),
+            (&self.video, &mut self.work, &self.geometry.tiles),
+            (geometry, vae, self.geometry.total_frames),
+            video,
+        )?;
+        let s = &device.stream;
+        let rgb = self.work.rgb_output(self.geometry.rgb_bytes)?;
+        self.video.rgb_into(
+            device,
+            &decoded,
+            &rgb,
+            (
+                geometry.frames,
+                self.geometry.total_frames,
+                geometry.height * geometry.width,
+            ),
+        )?;
+        let video = s.clone_dtoh(&rgb)?;
+        drop(decoded);
+        let input = s.clone_htod(audio)?;
+        let audio = s.clone_dtoh(&self.audio.decode(
+            (s, blas),
+            &input,
+            (2, geometry.audio_latents),
+        )?)?;
+        Ok(H3Output {
+            frames: geometry.frames,
+            height: geometry.height,
+            width: geometry.width,
+            video,
+            samples: audio.len() / 2,
+            sampling_rate: audio_spec.sampling_rate,
+            audio,
+        })
+    }
+}
+
+#[cfg(feature = "cuda")]
+/// Video requests sharing one packed geometry, schedule and set of loaded weights.
+pub struct VideoSession {
+    device: Device,
+    shape: VideoShape,
+    layout: PackedLayout,
+    spec: H3Spec,
+    vae: VaeSpec,
+    audio: AudioVaeSpec,
+    normal: crate::backend::gpu::CudaFunction,
+    text: ConditionerStage,
+    encode: Option<(VideoEncodeStage, Blas)>,
+    transform: VideoTransformer,
+    sample_blas: Blas,
+    kernels: BlockKernels,
+    decode: VideoDecodeStage,
+}
+
+#[cfg(feature = "cuda")]
+impl VideoSession {
+    pub fn open(
+        (model, companion): (&Path, Option<&Path>),
+        (lora, gguf): (Option<&Path>, Option<&Path>),
+        options: &crate::RunOptions,
+        requests: impl IntoIterator<Item = Result<H3Request>>,
+    ) -> Result<Self> {
+        use crate::backend::cuda::ops::CommonOpsRef;
+        use crate::prefill::{DensePlacement, DenseStage, PricedDense};
+        let companion_model = companion.unwrap_or(model);
+        let transformer = model.join(if companion.is_some() {
+            "fl2va_int8_convrot"
+        } else {
+            "transformer"
+        });
+        let config = transformer.join("config.json");
+        let spec = H3Spec::parse(&serde_json::from_slice(
+            &std::fs::read(&config).with_context(|| format!("read {}", config.display()))?,
+        )?)?;
+        let hyperflow = spec.is_hyperflow()?;
+        ensure!(
+            hyperflow == companion.is_some()
+                && hyperflow == lora.is_none()
+                && (!hyperflow || gguf.is_none()),
+            "HyperFlow requires its companion model and stored fl2va weights; MiniMax-H3 requires LoRA"
+        );
+        let vae = VaeSpec::read(companion_model)?;
+        let audio = AudioVaeSpec::read(companion_model)?;
+        let text_dir = companion_model.join("text_encoder");
+        let text_spec = crate::model_spec::ModelSpec::read(&text_dir)?;
+        let image_token = text_spec
+            .vision
+            .as_ref()
+            .context("text encoder without vision")?
+            .image_token;
+        let mut requests = requests.into_iter();
+        let first = requests
+            .next()
+            .context("resident video workload is empty")??;
+        let (geometry, layout) = first.layout(&spec)?;
+        let shape = VideoShape::new(geometry, &first);
+        let evaluations = first.evaluations;
+        let shifts = first.shifts;
+        let count = first.token_ids.len();
+        let vision_bytes = if shape.anchors.is_empty() {
+            0
+        } else {
+            let prompt = video_conditioner_prompt(&first, image_token);
+            LayerNormTower::request_bytes(&text_spec, &conditioner_vision_input(&prompt), count)?
+        };
+        drop(first);
+        let mut request_count = 1;
+        for request in requests {
+            shape.check(&spec, &request?)?;
+            request_count += 1;
+        }
+        let device = Device::new(options.device)?;
+        let page = stored_allocation_granularity(&device)?;
+        let ops = Ops::new(&device.ctx)?;
+        let blas = |name: &str| {
+            Blas::new(
+                &device,
+                &ops,
+                &options.runtime_dir,
+                Rc::new(Closure::new(false, name.into())),
+            )
+        };
+        let normal = cubin::module(&device.ctx, "sample")?.load_function("philox_normal_f32")?;
+        let text_manifest = MappedCheckpoint::open_component(&text_dir, "model")?
+            .minimax_h3_conditioner_manifest(&text_spec, TEXT_ENCODER_LAYER)?;
+        let vision = if shape.anchors.is_empty() {
+            None
+        } else {
+            let mut catalog = WeightCatalog::load_with_policy(
+                &text_dir,
+                &text_spec,
+                &device,
+                LoadPolicy::VisionOnly,
+            )?;
+            let tower = LayerNormTower::from_catalog(
+                &text_spec,
+                &mut catalog,
+                &device,
+                CommonOpsRef::new(&device.ctx)?,
+            )?;
+            ensure!(
+                catalog.tensors.is_empty(),
+                "vision binding left unloaded owners"
+            );
+            device.finish_upload()?;
+            Some(tower)
+        };
+        let vae_dir = companion_model.join("vae");
+        let vae_manifest = MappedCheckpoint::open_component(&vae_dir, "diffusion_pytorch_model")?
+            .minimax_h3_vae_manifest(&vae)?;
+        let encode = if shape.anchors.is_empty() {
+            None
+        } else {
+            Some((
+                VideoEncodeStage::new(
+                    &device,
+                    (&vae, &vae_dir, &vae_manifest),
+                    [geometry.height, geometry.width],
+                )?,
+                blas("H3 keyframe encoder")?,
+            ))
+        };
+        let audio_dir = companion_model.join("audio_vae");
+        let audio_manifest =
+            MappedCheckpoint::open_component(&audio_dir, "diffusion_pytorch_model")?
+                .minimax_h3_audio_vae_manifest(&audio)?;
+        let audio_decoder = AudioDecoder::new(&device, &audio, &audio_dir, &audio_manifest)?;
+        let decode_geometry = VideoDecodeGeometry::new(&vae, &geometry)?;
+        let slots = decode_geometry.tiles.count();
+        let cap = VideoDecoder::work_batch_cap(&device, &vae, decode_geometry.tile, slots)?;
+        let one_tile = TileWork::charged_bytes(
+            &vae,
+            decode_geometry.tile,
+            1,
+            slots,
+            page,
+            decode_geometry.rgb_bytes,
+        )?;
+        let audio_input = 4 * layout.audio_indices.len() * spec.audio_in_channels;
+        let posterior = 4 * vae.latent_channels * geometry.latent_height * geometry.latent_width;
+        let anchor = encode.as_ref().map_or(0, |(stage, _)| {
+            let tiles = &stage.tiles;
+            let grid = 4 * (2 * (tiles.rows.0.len() + tiles.cols.0.len()) - 2);
+            3 * geometry.height * geometry.width
+                + 8 * vae.latent_channels
+                    * tiles.count()
+                    * (tiles.height / vae.spatial_ratio)
+                    * (tiles.width / vae.spatial_ratio)
+                + 5 * posterior
+                + grid
+        });
+        let noise = audio_input + if encode.is_some() { posterior } else { 0 };
+        let samples = 4 * layout.video_indices.len() * spec.video_row_width()
+            + 2 * layout.text_indices.len() * spec.text_dim
+            + 8 * layout.token_tags.len();
+        let transient = stored_allocation_bytes(
+            (noise + samples.max(vision_bytes).max(anchor))
+                .max(decode_geometry.transient)
+                .max(audio_input + AudioDecoder::work_bytes(&audio, (2, geometry.audio_latents))?),
+            page,
+        )?;
+        let (text_layers, text_largest) =
+            Conditioner::layer_sizes(&text_manifest, TEXT_ENCODER_LAYER)?;
+        let text_fixed =
+            Conditioner::resident_fixed_bytes(&device, &text_spec, (TEXT_ENCODER_LAYER, count))?;
+        let ([decoder_layers, decoder_source], decoder_fixed, decoder_largest) =
+            decoder_layer_sizes(&vae_manifest, vae.layers);
+        let decoder_staging = *decoder_source
+            .iter()
+            .max()
+            .context("video decoder lacks blocks")?;
+        let fixed = stored_allocation_bytes(text_fixed, page)?
+            + stored_allocation_bytes(decoder_fixed, page)?;
+        let (disk_probe_bytes, disk) = image_fill_rate(&text_dir, &text_manifest)?;
+        let pcie = crate::backend::cuda::calibrate::pinned_h2d_rate(&device)?;
+        let visit = DecoderVisitCost::measure(
+            &device,
+            &normal,
+            vae.layers,
+            decoder_weight_bytes(&vae_manifest),
+        )?;
+        let text_blas = blas("H3 conditioner")?;
+        let mut sample_blas = blas("MiniMax-H3 generate")?;
+        let mut later = None;
+        let transform = prepare_transformer(
+            (&device, &mut sample_blas),
+            (&transformer, lora, gguf),
+            (&spec, &layout),
+            (evaluations, shifts),
+            Some(&mut |sizing, charged, owned, bind_ffn| {
+                let (dit_layers, dit_source): (Vec<_>, Vec<_>) = charged
+                    .iter()
+                    .copied()
+                    .zip(sizing.source_layers.iter().copied())
+                    .filter(|&(_, source)| source != 0)
+                    .unzip();
+                let fixed = fixed + stored_allocation_bytes(owned, page)?;
+                let stages = [
+                    DenseStage {
+                        device: &text_layers,
+                        source: &text_layers,
+                        visits: 1,
+                        load_scratch: text_largest,
+                        device_staging: 0,
+                    },
+                    DenseStage {
+                        device: &dit_layers,
+                        source: &dit_source,
+                        visits: evaluations,
+                        load_scratch: sizing.largest,
+                        device_staging: 0,
+                    },
+                    DenseStage {
+                        device: &decoder_layers,
+                        source: &decoder_source,
+                        visits: decode_geometry.chunks,
+                        load_scratch: decoder_largest,
+                        device_staging: decoder_staging,
+                    },
+                ];
+                let floors = stages.iter().try_fold(fixed + transient, |sum, stage| {
+                    Ok::<_, anyhow::Error>(sum + stage.minimum_device_bytes(page)?)
+                })?;
+                bind_ffn(floors + stored_allocation_bytes(one_tile, page)?).with_context(|| {
+                    format!(
+                        "resident video FFN with {one_tile} bytes reserved for one decoder tile"
+                    )
+                })?;
+                device.ctx.synchronize()?;
+                let (free, total) = device.ctx.mem_get_info()?;
+                let remaining = DensePlacement::device_budget(free, total, floors, 0, 0)?;
+                let budget = remaining - remaining % page;
+                let stage_and_work =
+                    DensePlacement::device_budget(free, total, fixed, 0, transient)?;
+                let available = usize::try_from(crate::backend::cuda::calibrate::host_memory(
+                    Path::new("/"),
+                )?)?;
+                let host = available
+                    .checked_sub(4 << 30)
+                    .context("resident video host reserve")?;
+                let (batch, device_budget, priced, alternatives) = visit.price_groups(
+                    (&vae, &decode_geometry, cap),
+                    stages,
+                    (stage_and_work, budget, host, page),
+                    (pcie, disk),
+                )?;
+                let decoder_visits = decode_geometry.chunks * slots.div_ceil(batch);
+                let bytes = TileWork::charged_bytes(
+                    &vae,
+                    decode_geometry.tile,
+                    batch,
+                    slots,
+                    1,
+                    decode_geometry.rgb_bytes,
+                )?;
+                let work = TileWork::with_output(
+                    &device.stream,
+                    &vae,
+                    decode_geometry.tile,
+                    (batch, slots),
+                    (3, decode_geometry.rgb_bytes),
+                )?;
+                device.ctx.synchronize()?;
+                let (free, total) = device.ctx.mem_get_info()?;
+                let live_budget = DensePlacement::device_budget(free, total, fixed, 0, transient)?;
+                ensure!(
+                    priced.device_bytes.iter().sum::<usize>() <= live_budget,
+                    "resident video stage placement exceeds the live budget {live_budget} after allocating {batch} tiles"
+                );
+                let PricedDense {
+                    plans: [text, dit, decoder],
+                    device_bytes,
+                    decoder_resident_seconds,
+                    decoder_streamed_seconds,
+                } = priced;
+                let demand = |plan: &DensePlacement, visits: usize| {
+                    serde_json::json!({
+                        "source_bytes": visits * (plan.host_bytes + plan.disk_bytes),
+                        "disk_bytes": visits * plan.disk_bytes,
+                    })
+                };
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"h3_video_resident_plan": {
+                        "device_budget": device_budget, "host_budget": host, "transient_bytes": transient,
+                        "shared_ffn_rgb_bytes": decode_geometry.rgb_bytes, "decoder_group_prices": alternatives,
+                        "decoder_launch_seconds": visit.launch_seconds, "decoder_handoff_seconds": visit.handoff_seconds,
+                        "device_memory_bytes_per_second": device.info.memory_bytes_per_second,
+                        "pcie_bytes_per_second": pcie, "disk_bytes_per_second": disk, "disk_probe_bytes": disk_probe_bytes,
+                        "device_allocation_granularity": page, "per_stage_device_bytes": device_bytes,
+                        "conditioner": &text, "dit": &dit, "decoder": &decoder,
+                        "request_demand": {
+                            "conditioner": demand(&text, 1), "dit": demand(&dit, evaluations),
+                            "decoder": demand(&decoder, decoder_visits),
+                        },
+                        "decoder_tile_batch": batch, "decoder_tile_cap": cap, "decoder_work_budget": budget, "decoder_work_bytes": bytes,
+                        "decoder_resident_seconds": decoder_resident_seconds, "decoder_streamed_seconds": decoder_streamed_seconds,
+                        "dit_visits": evaluations, "decoder_visits": decoder_visits,
+                    }})
+                );
+                later = Some((text, decoder, work));
+                Ok(dit)
+            }),
+        )?;
+        let (text_plan, decode_plan, work) =
+            later.context("resident video placement was not bound")?;
+        let conditioner = Conditioner::with_plan(
+            &device,
+            &text_spec,
+            (TEXT_ENCODER_LAYER, count, transient),
+            Source::new(&text_dir, &text_manifest),
+            (Placement::Derived, Some(text_plan)),
+            request_count,
+        )?;
+        conditioner.prepare(&text_blas, count)?;
+        let video = VideoDecoder::with_plan(&device, (&vae, &vae_dir, &vae_manifest), decode_plan)?;
+        video.bind_groups(&mut sample_blas, &work, cap)?;
+        let kernels = BlockKernels::new(&device.ctx)?;
+        device.finish_upload()?;
+        let (free, total) = device.ctx.mem_get_info()?;
+        ensure!(
+            free >= total / 16 + transient,
+            "resident video needs {} free bytes for transient work and reserve, found {free}",
+            total / 16 + transient
+        );
+        Ok(Self {
+            device,
+            shape,
+            layout,
+            spec,
+            vae,
+            audio,
+            normal,
+            transform,
+            sample_blas,
+            kernels,
+            encode,
+            text: ConditionerStage {
+                dir: text_dir,
+                spec: text_spec,
+                manifest: text_manifest,
+                vision,
+                conditioner,
+                blas: text_blas,
+                image_token,
+            },
+            decode: VideoDecodeStage {
+                geometry: decode_geometry,
+                video,
+                audio: audio_decoder,
+                work,
+            },
+        })
+    }
+
+    pub fn render(&mut self, request: &H3Request) -> Result<H3Output> {
+        self.render_request(
+            request,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn render_with_reference(
+        &mut self,
+        request: &H3Request,
+        reference: &Generated,
+    ) -> Result<H3Output> {
+        self.render_request(request, Some(reference))
+    }
+
+    fn render_request(
+        &mut self,
+        request: &H3Request,
+        #[cfg(test)] reference: Option<&Generated>,
+    ) -> Result<H3Output> {
+        self.shape.check(&self.spec, request)?;
+        let geometry = &self.shape.geometry;
+        let (video, audio) = {
+            let s = &self.device.stream;
+            let draws = NoiseDraws::Seed(crate::minimax_h3::noise_draws(request.seed));
+            let noise = video_noise(
+                (&self.device, &self.normal),
+                (&self.spec, &self.vae),
+                (geometry, &self.layout),
+                request,
+                &draws,
+            )?;
+            let prompt = video_conditioner_prompt(request, self.text.image_token);
+            let text = self.text.run(&self.device, &prompt)?;
+            let anchors = self
+                .encode
+                .as_mut()
+                .map(|(stage, blas)| {
+                    stage.run(
+                        &self.device,
+                        blas,
+                        request,
+                        noise
+                            .posterior_eps
+                            .as_ref()
+                            .context("keyframes require posterior noise")?,
+                    )
+                })
+                .transpose()?
+                .unwrap_or_default();
+            #[cfg(test)]
+            if let Some(reference) = reference {
+                let text_exact = text
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .eq(reference.conditioner.iter().map(|x| x.to_bits()));
+                let anchors_exact = anchors.len() == reference.anchors.len()
+                    && anchors
+                        .iter()
+                        .zip(&reference.anchors)
+                        .all(|(a, b)| same_f32_bits(a, b));
+                println!(
+                    "H3_VIDEO_RESIDENT_INPUT conditioner={text_exact} anchors={anchors_exact}"
+                );
+            }
+            let rows = video_rows(
+                (&self.spec, &self.vae),
+                (geometry, &self.layout),
+                request,
+                &noise,
+                (&anchors, &text),
+            )?;
+            let video = s.clone_htod(&rows)?;
+            let text = s.clone_htod(&text)?;
+            let transform = &mut self.transform;
+            let c = BlockContext {
+                s,
+                blas: &self.sample_blas,
+                kernels: &self.kernels,
+                spec: &self.spec,
+                lora_scale: transform.scale,
+            };
+            transform.dit.sample(
+                &c,
+                (&transform.table, &transform.adaln),
+                (&transform.video_grid, &transform.audio_grid),
+                (&video, &noise.audio),
+                &text,
+            )?;
+            (s.clone_dtoh(&video)?, s.clone_dtoh(&noise.audio)?)
+        };
+        ensure!(
+            video.iter().chain(&audio).all(|v| v.is_finite()),
+            "non-finite final latents"
+        );
+        let (video, audio) = decoder_latents(
+            (&self.spec, &self.vae, &self.audio),
+            (geometry, &self.layout),
+            (&video, &audio),
+        )?;
+        #[cfg(test)]
+        if let Some(reference) = reference {
+            println!(
+                "H3_VIDEO_RESIDENT_LATENTS video={} audio={}",
+                same_f32_bits(&video, &reference.video_latents.1),
+                same_f32_bits(&audio, &reference.audio_latents.1)
+            );
+        }
+        self.decode.render(
+            (&self.device, &self.sample_blas),
+            (geometry, &self.vae, &self.audio),
+            (&video, &audio),
+        )
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+pub(super) fn same_f32_bits(a: &[f32], b: &[f32]) -> bool {
+    a.iter()
+        .map(|x| x.to_bits())
+        .eq(b.iter().map(|x| x.to_bits()))
+}
+
 /// Image requests sharing one packed geometry and one set of loaded weights.
 pub struct ImageSession {
     model: PathBuf,
@@ -1258,7 +2211,7 @@ pub struct ImageSession {
     layout: ImageLayout,
     d: Device,
     normal: crate::backend::gpu::CudaFunction,
-    text: ImageTextStage,
+    text: ConditionerStage,
     dit: ImageDit,
     table: AdalnTable,
     adaln: AdalnPlan,
@@ -1293,7 +2246,11 @@ impl ImageSession {
             let ImageInput { shape, prompt } = ImageInput::read(model, &image, &first)?;
             let count = prompt.tokens.len();
             let media = if shape.reference.is_some() {
-                LayerNormTower::request_bytes(&text_spec, &image_vision_input(&prompt), count)?
+                LayerNormTower::request_bytes(
+                    &text_spec,
+                    &conditioner_vision_input(&prompt),
+                    count,
+                )?
             } else {
                 0
             };
@@ -1352,7 +2309,7 @@ impl ImageSession {
         let (vae_dir, vae_spec, vae_manifest) = image_vae_manifest(model)?;
         let vae = vae_spec.single_frame();
         let ([decoder_layers, decoder_source], decoder_fixed, decoder_largest) =
-            image_decoder_sizes(&vae_manifest, vae.layers);
+            decoder_layer_sizes(&vae_manifest, vae.layers);
         let decoder_staging = *decoder_source
             .iter()
             .max()
@@ -1511,7 +2468,7 @@ impl ImageSession {
             free >= required,
             "resident image setup needs {required} free bytes for transient work and reserve, found {free}"
         );
-        let text = ImageTextStage {
+        let text = ConditionerStage {
             dir,
             spec: text_spec,
             manifest: text_manifest,
@@ -3047,10 +4004,18 @@ fn hyperflow_composition_matches_frozen_references() -> Result<()> {
                 Rc::new(Closure::new(false, "HyperFlow teacher".into())),
             )?;
             let (_, layout) = request.layout(&spec)?;
-            let (mut dit, table, plan, _, _, scale) = prepare_transformer(
+            let VideoTransformer {
+                mut dit,
+                table,
+                adaln: plan,
+                scale,
+                ..
+            } = prepare_transformer(
                 (&device, &mut blas),
                 (&component, None, None),
-                (&spec, &layout, request),
+                (&spec, &layout),
+                (request.evaluations, request.shifts),
+                None,
             )?;
             ensure!(
                 input.teacher_inputs.len() == plan.row_pairs.len(),
@@ -3683,10 +4648,18 @@ fn hyperflow_conditioner_effect_gpu() -> Result<()> {
             }
             conditioning.push(("native", values));
         }
-        let (mut dit, table, plan, _, _, scale) = prepare_transformer(
+        let VideoTransformer {
+            mut dit,
+            table,
+            adaln: plan,
+            scale,
+            ..
+        } = prepare_transformer(
             (&device, &mut blas),
             (&component, None, None),
-            (&spec, &layout, &request),
+            (&spec, &layout),
+            (request.evaluations, request.shifts),
+            None,
         )?;
         let s = &device.stream;
         let kernels = BlockKernels::new(&device.ctx)?;
@@ -3847,6 +4820,98 @@ fn hyperflow_conditioner_effect_gpu() -> Result<()> {
         },
         composition_stamp()?
     );
+    Ok(())
+}
+
+#[cfg(all(test, feature = "cuda"))]
+#[test]
+fn video_placement_sizes_decoder_groups_from_remaining_memory() -> Result<()> {
+    let spec = H3Spec::parse(&serde_json::from_str(include_str!(
+        "../../../tests/data/minimax-h3-transformer-config.json"
+    ))?)?;
+    let vae = VaeSpec::parse(&serde_json::from_str(include_str!(
+        "../../../tests/data/minimax-h3-vae-config.json"
+    ))?)?;
+    let geometry = Geometry::resolve(&spec, 768, 1344, 124)?;
+    let decoder = VideoDecodeGeometry::new(&vae, &geometry)?;
+    let slots = decoder.tiles.count();
+    assert_eq!(slots, 28);
+    assert_eq!(decoder.chunks, 7);
+    assert_eq!(decoder.rgb_bytes, 383_975_424);
+    let bytes = TileWork::batch_bytes(&vae, decoder.tile, slots, slots)?;
+    assert_eq!(bytes, 4_442_630_708);
+    let work = stored_allocation_bytes(bytes, 2 << 20)?;
+    let select = |budget| VideoDecoder::work_batch(&vae, decoder.tile, slots, slots, budget);
+    assert_eq!(select(work)?, (slots, bytes));
+    let remaining = work - (11_013_382_144 - 10_806_362_112);
+    let (batch, chosen) = select(remaining - remaining % (2 << 20))?;
+    assert_eq!(batch, 26);
+    assert!(stored_allocation_bytes(chosen, 2 << 20)? <= remaining);
+    assert!(TileWork::batch_bytes(&vae, decoder.tile, batch + 1, slots)? > remaining);
+    let one = TileWork::batch_bytes(&vae, decoder.tile, 1, slots)?;
+    assert_eq!(select(one)?, (1, one));
+    assert!(select(one - 1).is_err());
+    let page = 2 << 20;
+    let full = TileWork::charged_bytes(&vae, decoder.tile, slots, slots, page, decoder.rgb_bytes)?;
+    assert_eq!(
+        full,
+        TileWork::charged_bytes(&vae, decoder.tile, slots, slots, page, 0)?
+    );
+    let ffn_bytes =
+        4 * (decoder.tile.0 * decoder.tile.1 * decoder.tile.2 + vae.registers + 1) * vae.ffn;
+    let odd_rgb = decoder.rgb_bytes + 1;
+    assert_eq!(
+        TileWork::charged_bytes(&vae, decoder.tile, 1, slots, 1, odd_rgb)? - one,
+        2 * odd_rgb.div_ceil(2) - ffn_bytes
+    );
+    let visit = DecoderVisitCost {
+        weight_bytes: 1 << 30,
+        weight_seconds: 0.001,
+        launches: 6 + 11 * vae.layers,
+        launch_seconds: 0.000002,
+        handoff_seconds: 0.000001,
+    };
+    let small = crate::prefill::DenseStage {
+        device: &[16 << 20],
+        source: &[16 << 20],
+        visits: 1,
+        load_scratch: 0,
+        device_staging: 0,
+    };
+    let stages = [
+        small,
+        crate::prefill::DenseStage {
+            device: &[64 << 20; 6],
+            source: &[64 << 20; 6],
+            visits: 6,
+            ..small
+        },
+        small,
+    ];
+    let select_priced = |available| {
+        visit.price_groups(
+            (&vae, &decoder, slots),
+            stages,
+            (available, full, 1 << 30, page),
+            (10e9, 1e9),
+        )
+    };
+    let (batch, _, _, alternatives) = select_priced(full + (180 << 20))?;
+    let price = |tiles| {
+        alternatives
+            .iter()
+            .find(|p| p["batch"].as_u64() == Some(tiles))
+            .and_then(|p| p["seconds"].as_f64())
+            .context("missing decoder comparison")
+    };
+    assert!(price(27)? < price(28)?);
+    assert!(price(batch as u64)? <= price(27)?);
+    assert_eq!(select_priced(full + (1 << 30))?.0, 28);
+    let total = 25_252_724_736;
+    let budget = crate::prefill::DensePlacement::device_budget;
+    let minimum = total / 16 + work + decoder.transient;
+    assert_eq!(budget(minimum, total, 0, work, decoder.transient)?, 0);
+    assert!(budget(minimum - 1, total, 0, work, decoder.transient).is_err());
     Ok(())
 }
 

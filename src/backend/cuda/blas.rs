@@ -2152,6 +2152,52 @@ impl Blas {
         Ok(())
     }
 
+    pub(crate) fn prepare_biased_group(
+        &mut self,
+        (rows, canonical_rows): (usize, usize),
+        [output, input]: [u32; 2],
+        bias: super::contracts::Tensor<bf16, 1>,
+    ) -> Result<()> {
+        let mode = super::linear::LinearBiasMode::BeforeOutputRound;
+        self.prepare_biased(u32::try_from(canonical_rows)?, output, input, bias, mode)?;
+        let shape = LinearShape {
+            rows,
+            output: output as usize,
+            input: input as usize,
+        };
+        checked_dims(rows, shape.output, shape.input)?;
+        let canonical = LinearShape {
+            rows: canonical_rows,
+            ..shape
+        };
+        let mut plans = self.biased_plans.borrow_mut();
+        let algo = plans[&(canonical, bias.ptr, mode)]
+            .algo
+            .context("canonical biased Lt algorithm missing")?;
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            plans.entry((shape, bias.ptr, mode))
+        {
+            let workspace = self.workspace.borrow().len();
+            let dtype = sys::cudaDataType_t::CUDA_R_16BF;
+            let plan = Plan::build(
+                self.handle,
+                (rows, shape.output, shape.input, shape.input),
+                workspace,
+                Some(bias.ptr),
+                dtype,
+                dtype,
+                PlanAlgo::Fixed(algo),
+            )?;
+            ensure!(
+                plan.workspace <= workspace,
+                "grouped biased Lt plan exceeds workspace"
+            );
+            plan.describe(rows, shape.output, shape.input)?;
+            entry.insert(plan);
+        }
+        Ok(())
+    }
+
     /// Biased Lt plan bound at heuristic rank 0 under a 1 MiB workspace
     /// preference.
     pub(crate) fn prepare_biased_reference(
