@@ -336,7 +336,7 @@ The result is a hole-filled, simplified and normalized mesh, and same-seed rerun
 
 ### Idol
 
-Idol (a preprocessed 1024 px image to a Gaussian splat and a camera) is not selected by `to-3d`. Its `flyingfish::backend::IdolPipelineRuntime` is exported but cannot yet be opened from outside the crate; see [library.md](library.md).
+Idol (a preprocessed 1024 px image to a Gaussian splat and a camera) is not selected by `to-3d`. Use the CUDA [Idol library API](library.md#idol) to generate a splat and camera.
 
 ## Inspection, verification and profiling commands
 

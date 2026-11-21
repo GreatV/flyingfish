@@ -4832,10 +4832,12 @@ impl<T: DinoScalar> DinoEncoder<T> {
         } else {
             "dinov3"
         };
-        println!(
-            "I1_LOAD component={component} tensors={} elems={} weight_bytes={} ws_bytes={}",
-            loader.loaded_tensors, loader.loaded_elements, loader.runtime_bytes, ws_bytes
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "I1_LOAD component={component} tensors={} elems={} weight_bytes={} ws_bytes={}",
+                loader.loaded_tensors, loader.loaded_elements, loader.runtime_bytes, ws_bytes
+            );
+        }
         Ok((
             Self {
                 cfg,
@@ -5732,16 +5734,18 @@ impl Flux2VaeEncoder {
         let q38_mod = cubin::module(&device.ctx, "q38_common")?;
         let im2col_bytes = (strip_pixels as usize) * mcu * 9 * size_of::<bf16>();
         let ws_bytes = base_ws + im2col_bytes;
-        println!(
-            "I1_LOAD component=flux2_vae tensors={} elems={} weight_bytes={} base_ws={} im2col_bytes={} ws_bytes={} strip_pixels={}",
-            loader.loaded_tensors,
-            loader.loaded_elements,
-            loader.runtime_bytes,
-            base_ws,
-            im2col_bytes,
-            ws_bytes,
-            strip_pixels
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "I1_LOAD component=flux2_vae tensors={} elems={} weight_bytes={} base_ws={} im2col_bytes={} ws_bytes={} strip_pixels={}",
+                loader.loaded_tensors,
+                loader.loaded_elements,
+                loader.runtime_bytes,
+                base_ws,
+                im2col_bytes,
+                ws_bytes,
+                strip_pixels
+            );
+        }
         Ok((
             Self {
                 cfg,
@@ -8671,18 +8675,20 @@ impl IdolDenoiser {
                 Score::from_tokens((d as f32).sqrt().recip(), None)?,
             )?,
         };
-        println!(
-            "I1_LOAD component=denoiser tensors={} elems={} f16_tensors={} f16_bytes={} f32_tensors={} f32_bytes={} weight_bytes={} cfg_batch={} ws_bytes={}",
-            loader.loaded_tensors,
-            loader.loaded_elements,
-            loader.f16_tensors,
-            loader.f16_bytes,
-            loader.f32_tensors,
-            loader.f32_bytes,
-            loader.runtime_bytes,
-            cfg_batch,
-            ws_bytes
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "I1_LOAD component=denoiser tensors={} elems={} f16_tensors={} f16_bytes={} f32_tensors={} f32_bytes={} weight_bytes={} cfg_batch={} ws_bytes={}",
+                loader.loaded_tensors,
+                loader.loaded_elements,
+                loader.f16_tensors,
+                loader.f16_bytes,
+                loader.f32_tensors,
+                loader.f32_bytes,
+                loader.runtime_bytes,
+                cfg_batch,
+                ws_bytes
+            );
+        }
         Ok((
             Self {
                 args,
@@ -9735,17 +9741,19 @@ impl IdolOctreeDecoder {
                 Score::from_tokens((d as f32).sqrt().recip(), None)?,
             )?,
         };
-        println!(
-            "I1_LOAD component=decoder tensors={} elems={} f16_tensors={} f16_bytes={} f32_tensors={} f32_bytes={} weight_bytes={} ws_bytes={}",
-            loader.loaded_tensors,
-            loader.loaded_elements,
-            loader.f16_tensors,
-            loader.f16_bytes,
-            loader.f32_tensors,
-            loader.f32_bytes,
-            loader.runtime_bytes,
-            ws_bytes
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "I1_LOAD component=decoder tensors={} elems={} f16_tensors={} f16_bytes={} f32_tensors={} f32_bytes={} weight_bytes={} ws_bytes={}",
+                loader.loaded_tensors,
+                loader.loaded_elements,
+                loader.f16_tensors,
+                loader.f16_bytes,
+                loader.f32_tensors,
+                loader.f32_bytes,
+                loader.runtime_bytes,
+                ws_bytes
+            );
+        }
         Ok((
             Self {
                 args,
@@ -10549,17 +10557,19 @@ impl IdolGaussianDecoder {
                 Score::from_tokens((d as f32).sqrt().recip(), None)?,
             )?,
         };
-        println!(
-            "I1_LOAD component=decoder_gs tensors={} elems={} f16_tensors={} f16_bytes={} f32_tensors={} f32_bytes={} weight_bytes={} ws_bytes={}",
-            loader.loaded_tensors,
-            loader.loaded_elements,
-            loader.f16_tensors,
-            loader.f16_bytes,
-            loader.f32_tensors,
-            loader.f32_bytes,
-            loader.runtime_bytes,
-            ws_bytes
-        );
+        if crate::backend::diagnostics_enabled() {
+            eprintln!(
+                "I1_LOAD component=decoder_gs tensors={} elems={} f16_tensors={} f16_bytes={} f32_tensors={} f32_bytes={} weight_bytes={} ws_bytes={}",
+                loader.loaded_tensors,
+                loader.loaded_elements,
+                loader.f16_tensors,
+                loader.f16_bytes,
+                loader.f32_tensors,
+                loader.f32_bytes,
+                loader.runtime_bytes,
+                ws_bytes
+            );
+        }
         Ok((
             Self {
                 args,
@@ -11033,6 +11043,10 @@ fn idol_resident_bytes(checkpoint: &[u8]) -> Result<usize> {
 
 #[cfg(feature = "cuda")]
 pub struct IdolPipelineRuntime {
+    blas: Blas,
+    verbose: bool,
+    #[cfg(test)]
+    closure: std::rc::Rc<crate::backend::cuda::closure::Closure>,
     pub cfg: IdolConfig,
     pub vision: IdolVisionEncoderRuntime,
     pub denoiser: IdolDenoiser,
@@ -11046,131 +11060,162 @@ pub struct IdolPipelineRuntime {
 #[cfg(feature = "cuda")]
 impl IdolPipelineRuntime {
     pub fn open(
-        device: &Device,
-        blas: &mut Blas,
-        common: CommonOpsRef,
         idol_dir: &std::path::Path,
         dinov3_dir: &std::path::Path,
         vae_dir: &std::path::Path,
+        options: &crate::RunOptions,
     ) -> Result<Self> {
-        let cfg = IdolConfig::from_dir(idol_dir)?;
-        let (free_vram, total_vram) = device.ctx.mem_get_info()?;
-        let driver_headroom = total_vram / 16;
-        let map = |file: &str| -> Result<memmap2::Mmap> {
-            let file = std::fs::File::open(idol_dir.join(file))?;
-            Ok(unsafe { memmap2::MmapOptions::new().map(&file)? })
-        };
-        let (den_mmap, oct_mmap, gs_mmap) = (
-            map("denoiser.safetensors")?,
-            map("decoder.safetensors")?,
-            map("decoder_gs.safetensors")?,
-        );
-        let m3_weight_bytes = idol_resident_bytes(&den_mmap)?
-            + idol_resident_bytes(&oct_mmap)?
-            + idol_resident_bytes(&gs_mmap)?;
-        let oct_ws_bytes = IdolOctreeWorkspace::byte_size();
-        let gs_ws_bytes = IdolGaussianWorkspace::byte_size();
-        let den_ws_b2 = IdolDenoiserWorkspace::byte_size(2);
-        let den_ws_b1 = IdolDenoiserWorkspace::byte_size(1);
-        let min_m2_bytes = IdolVisionEncoderRuntime::min_resident_bytes(dinov3_dir, vae_dir)?;
-        let needed_b2 = driver_headroom
-            + min_m2_bytes
-            + m3_weight_bytes
-            + den_ws_b2
-            + oct_ws_bytes
-            + gs_ws_bytes;
-        let cfg_batch = if free_vram >= needed_b2 { 2 } else { 1 };
-        let den_ws_bytes = if cfg_batch == 2 { den_ws_b2 } else { den_ws_b1 };
-        let m3_ws_bytes = den_ws_bytes + oct_ws_bytes + gs_ws_bytes;
-        let vae_reserve_bytes = driver_headroom + m3_weight_bytes + m3_ws_bytes;
-        println!(
-            "I1_LOAD component=pipeline total_vram={total_vram} driver_headroom={driver_headroom} m3_weight_bytes={m3_weight_bytes} m3_ws_bytes={m3_ws_bytes} vae_reserve_bytes={vae_reserve_bytes} min_m2_bytes={min_m2_bytes} cfg_batch={cfg_batch}"
-        );
+        crate::backend::with_verbose(options.verbose, || {
+            use crate::backend::cuda::{
+                closure::{Closure, runtime_dir},
+                ops::Ops,
+            };
+            let started = std::time::Instant::now();
+            let device = Device::new(options.device)?;
+            let common = CommonOpsRef::new(&device.ctx)?;
+            let ops = Ops::new(&device.ctx)?;
+            let closure = std::rc::Rc::new(Closure::new(false, "Idol".into()));
+            for model in [dinov3_dir, vae_dir] {
+                runtime_dir(&options.runtime_dir, model, false)?;
+            }
+            let runtime = runtime_dir(&options.runtime_dir, idol_dir, true)?;
+            let mut blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
+            let cfg = IdolConfig::from_dir(idol_dir)?;
+            let (free_vram, total_vram) = device.ctx.mem_get_info()?;
+            let driver_headroom = total_vram / 16;
+            let map = |file: &str| -> Result<memmap2::Mmap> {
+                let file = std::fs::File::open(idol_dir.join(file))?;
+                Ok(unsafe { memmap2::MmapOptions::new().map(&file)? })
+            };
+            let (den_mmap, oct_mmap, gs_mmap) = (
+                map("denoiser.safetensors")?,
+                map("decoder.safetensors")?,
+                map("decoder_gs.safetensors")?,
+            );
+            let m3_weight_bytes = idol_resident_bytes(&den_mmap)?
+                + idol_resident_bytes(&oct_mmap)?
+                + idol_resident_bytes(&gs_mmap)?;
+            let oct_ws_bytes = IdolOctreeWorkspace::byte_size();
+            let gs_ws_bytes = IdolGaussianWorkspace::byte_size();
+            let den_ws_b2 = IdolDenoiserWorkspace::byte_size(2);
+            let den_ws_b1 = IdolDenoiserWorkspace::byte_size(1);
+            let min_m2_bytes = IdolVisionEncoderRuntime::min_resident_bytes(dinov3_dir, vae_dir)?;
+            let needed_b2 = driver_headroom
+                + min_m2_bytes
+                + m3_weight_bytes
+                + den_ws_b2
+                + oct_ws_bytes
+                + gs_ws_bytes;
+            let cfg_batch = if free_vram >= needed_b2 { 2 } else { 1 };
+            let den_ws_bytes = if cfg_batch == 2 { den_ws_b2 } else { den_ws_b1 };
+            let m3_ws_bytes = den_ws_bytes + oct_ws_bytes + gs_ws_bytes;
+            let vae_reserve_bytes = driver_headroom + m3_weight_bytes + m3_ws_bytes;
+            if crate::backend::diagnostics_enabled() {
+                eprintln!(
+                    "I1_LOAD component=pipeline total_vram={total_vram} driver_headroom={driver_headroom} m3_weight_bytes={m3_weight_bytes} m3_ws_bytes={m3_ws_bytes} vae_reserve_bytes={vae_reserve_bytes} min_m2_bytes={min_m2_bytes} cfg_batch={cfg_batch}"
+                );
+            }
 
-        let vision = IdolVisionEncoderRuntime::load(
-            device,
-            blas,
-            common,
-            dinov3_dir,
-            vae_dir,
-            vae_reserve_bytes,
-        )?;
-        let (denoiser, denoiser_ws) =
-            IdolDenoiser::load(device, cfg.denoiser.args.clone(), &den_mmap, cfg_batch)?;
+            let vision = IdolVisionEncoderRuntime::load(
+                &device,
+                &mut blas,
+                common,
+                dinov3_dir,
+                vae_dir,
+                vae_reserve_bytes,
+            )?;
+            let (denoiser, denoiser_ws) =
+                IdolDenoiser::load(&device, cfg.denoiser.args.clone(), &den_mmap, cfg_batch)?;
 
-        let (octree, octree_ws) =
-            IdolOctreeDecoder::load(device, cfg.decoder.args.clone(), &oct_mmap)?;
+            let (octree, octree_ws) =
+                IdolOctreeDecoder::load(&device, cfg.decoder.args.clone(), &oct_mmap)?;
 
-        let (gaussian, gaussian_ws) =
-            IdolGaussianDecoder::load(device, cfg.decoder_gs.args.clone(), &gs_mmap)?;
-        ensure!(
-            denoiser.weight_bytes + octree.weight_bytes + gaussian.weight_bytes == m3_weight_bytes,
-            "derived M3 weight bytes {m3_weight_bytes} differ from the loaded {}",
-            denoiser.weight_bytes + octree.weight_bytes + gaussian.weight_bytes
-        );
+            let (gaussian, gaussian_ws) =
+                IdolGaussianDecoder::load(&device, cfg.decoder_gs.args.clone(), &gs_mmap)?;
+            ensure!(
+                denoiser.weight_bytes + octree.weight_bytes + gaussian.weight_bytes
+                    == m3_weight_bytes,
+                "derived M3 weight bytes {m3_weight_bytes} differ from the loaded {}",
+                denoiser.weight_bytes + octree.weight_bytes + gaussian.weight_bytes
+            );
 
-        Ok(Self {
-            cfg,
-            vision,
-            denoiser,
-            denoiser_ws,
-            octree,
-            octree_ws,
-            gaussian,
-            gaussian_ws,
+            closure.freeze_fixed()?;
+            closure.ready(started)?;
+            Ok(Self {
+                blas,
+                verbose: options.verbose,
+                #[cfg(test)]
+                closure,
+                cfg,
+                vision,
+                denoiser,
+                denoiser_ws,
+                octree,
+                octree_ws,
+                gaussian,
+                gaussian_ws,
+            })
         })
     }
 
     pub fn generate_from_rgb(
         &mut self,
-        s: &Arc<CudaStream>,
-        blas: &Blas,
         chw_f32: &[f32],
         seed: u64,
     ) -> Result<(IdolGaussianSplat, IdolCamera)> {
-        let vae_cnt = 32u32 * 128 * 128;
-        let lat_cnt = 8192u32 * 16;
-        let cam_cnt = 5u32;
-        unsafe {
-            s.launch_builder(&self.denoiser.kernels.philox_normal_bf16)
-                .arg(&seed)
-                .arg(&0u64)
-                .arg(&self.vision.vae_ws.noise_nchw)
-                .arg(&i64::from(vae_cnt))
-                .launch(grid((vae_cnt as usize).div_ceil(1024), 256))?;
-            s.launch_builder(&self.denoiser.kernels.philox_normal_f32)
-                .arg(&seed)
-                .arg(&u64::from(vae_cnt.div_ceil(4)))
-                .arg(&self.denoiser_ws.latent_in_f32)
-                .arg(&i64::from(lat_cnt))
-                .launch(grid((lat_cnt as usize).div_ceil(1024), 256))?;
-            s.launch_builder(&self.denoiser.kernels.philox_normal_f32)
-                .arg(&seed)
-                .arg(&u64::from(vae_cnt.div_ceil(4) + lat_cnt.div_ceil(4)))
-                .arg(&self.denoiser_ws.camera_in_f32)
-                .arg(&i64::from(cam_cnt))
-                .launch(grid(1, 256))?;
-        }
-        let vae_eps = s.clone_dtoh(&self.vision.vae_ws.noise_nchw)?;
-        let init_lat = s.clone_dtoh(&self.denoiser_ws.latent_in_f32.slice(0..8192 * 16))?;
-        let init_cam = s.clone_dtoh(&self.denoiser_ws.camera_in_f32.slice(0..5))?;
-        self.generate_with_initial_draws(
-            s,
-            blas,
-            chw_f32,
-            (&vae_eps, &init_lat, &init_cam),
-            (seed, self.denoiser_ws.cfg_batch == 2),
-        )
+        crate::backend::with_verbose(self.verbose, || {
+            let side = self.vision.vae.cfg.sample_size as usize;
+            ensure!(
+                chw_f32.len() == 3 * side * side,
+                "Idol expects three {side} x {side} RGB planes"
+            );
+            ensure!(
+                chw_f32.iter().all(|v| (0.0..=1.0).contains(v)),
+                "Idol RGB values must be finite and in [0, 1]"
+            );
+            let s = self.blas.stream();
+            let vae_cnt = 32u32 * 128 * 128;
+            let lat_cnt = 8192u32 * 16;
+            let cam_cnt = 5u32;
+            unsafe {
+                s.launch_builder(&self.denoiser.kernels.philox_normal_bf16)
+                    .arg(&seed)
+                    .arg(&0u64)
+                    .arg(&self.vision.vae_ws.noise_nchw)
+                    .arg(&i64::from(vae_cnt))
+                    .launch(grid((vae_cnt as usize).div_ceil(1024), 256))?;
+                s.launch_builder(&self.denoiser.kernels.philox_normal_f32)
+                    .arg(&seed)
+                    .arg(&u64::from(vae_cnt.div_ceil(4)))
+                    .arg(&self.denoiser_ws.latent_in_f32)
+                    .arg(&i64::from(lat_cnt))
+                    .launch(grid((lat_cnt as usize).div_ceil(1024), 256))?;
+                s.launch_builder(&self.denoiser.kernels.philox_normal_f32)
+                    .arg(&seed)
+                    .arg(&u64::from(vae_cnt.div_ceil(4) + lat_cnt.div_ceil(4)))
+                    .arg(&self.denoiser_ws.camera_in_f32)
+                    .arg(&i64::from(cam_cnt))
+                    .launch(grid(1, 256))?;
+            }
+            let vae_eps = s.clone_dtoh(&self.vision.vae_ws.noise_nchw)?;
+            let init_lat = s.clone_dtoh(&self.denoiser_ws.latent_in_f32.slice(0..8192 * 16))?;
+            let init_cam = s.clone_dtoh(&self.denoiser_ws.camera_in_f32.slice(0..5))?;
+            self.generate_with_initial_draws(
+                chw_f32,
+                (&vae_eps, &init_lat, &init_cam),
+                (seed, self.denoiser_ws.cfg_batch == 2),
+            )
+        })
     }
 
     fn generate_with_initial_draws(
         &mut self,
-        s: &Arc<CudaStream>,
-        blas: &Blas,
         chw_f32: &[f32],
         (vae_eps_bf16, init_latent_f32, init_camera_f32): (&[bf16], &[f32], &[f32]),
         (octree_seed, batch_cfg): (u64, bool),
     ) -> Result<(IdolGaussianSplat, IdolCamera)> {
+        let blas = &self.blas;
+        let s = blas.stream();
         let (d_out, v_out) = self
             .vision
             .encode_image(s, blas, chw_f32, vae_eps_bf16, false)?;
@@ -15393,8 +15438,7 @@ mod tests {
     #[test]
     #[ignore = "requires local GPU window and FF_IDOL_MODEL, FF_DINOV3_MODEL, FF_FLUX2_VAE_MODEL, FF_IDOL_FIXTURE_DIR, FF_IDOL_THRESHOLDS"]
     fn idol_m3_gates_and_e2e_match_definition_gpu() -> Result<()> {
-        use crate::backend::cuda::closure::Closure;
-        use std::{path::PathBuf, rc::Rc, time::Instant};
+        use std::path::PathBuf;
 
         let idol_dir =
             PathBuf::from(std::env::var_os("FF_IDOL_MODEL").context("FF_IDOL_MODEL missing")?);
@@ -15437,21 +15481,15 @@ mod tests {
             ))
         };
 
-        let device = Device::new(0)?;
-        let s = &device.stream;
-        let common = CommonOpsRef::new(&device.ctx)?;
-        let closure = Rc::new(Closure::new(false, "I1-M3 IDOL full pipeline".into()));
-        let mut blas = test_blas(&device, &runtime_dir, closure.clone())?;
-        let mut pipe = IdolPipelineRuntime::open(
-            &device,
-            &mut blas,
-            common,
-            &idol_dir,
-            &dinov3_dir,
-            &vae_dir,
-        )?;
-        closure.freeze_fixed()?;
-        closure.ready(Instant::now())?;
+        let options = crate::RunOptions {
+            device: 0,
+            runtime_dir: runtime_dir.clone(),
+            verbose: true,
+        };
+        let mut pipe =
+            crate::backend::IdolPipelineRuntime::open(&idol_dir, &dinov3_dir, &vae_dir, &options)?;
+        let stream = pipe.blas.stream().clone();
+        let s = &stream;
         ensure!(
             pipe.denoiser_ws.cfg_batch == 2,
             "expected derived cfg_batch=2 on 24 GB GPU, got {}",
@@ -15493,9 +15531,48 @@ mod tests {
         let mut ply_bytes_by_case: std::collections::BTreeMap<String, Vec<u8>> =
             std::collections::BTreeMap::new();
 
+        let mut first_seeded_ply = None;
+        let camera_values = |c: &IdolCamera| [c.yaw, c.pitch, c.radius, c.fov];
         for case in ["armchair", "avocado"] {
             let chw =
                 decode_rgb_png_chw_f32(&fixture_dir.join(format!("{case}_1024.png")), sample_size)?;
+            let (seeded, camera) = pipe.generate_from_rgb(&chw, 42)?;
+            ensure!(
+                !seeded.xyz.is_empty() && camera_values(&camera).into_iter().all(f64::is_finite),
+                "{case} seeded Idol output is empty or has a nonfinite camera"
+            );
+            let path = runtime_dir.join(format!("{case}_seeded.ply"));
+            seeded.save_ply(&path)?;
+            let ply = std::fs::read(path)?;
+            if let Some(first) = &first_seeded_ply {
+                ensure!(
+                    *first != ply,
+                    "seeded Idol splats are identical across images"
+                );
+            } else {
+                let (again, again_camera) = pipe.generate_from_rgb(&chw, 42)?;
+                for (left, right) in [
+                    (&seeded.xyz, &again.xyz),
+                    (&seeded.features_dc, &again.features_dc),
+                    (&seeded.scaling, &again.scaling),
+                    (&seeded.rotation, &again.rotation),
+                    (&seeded.opacity, &again.opacity),
+                    (&seeded.ply_mat, &again.ply_mat),
+                ] {
+                    ensure!(
+                        left.iter()
+                            .map(|v| v.to_bits())
+                            .eq(right.iter().map(|v| v.to_bits())),
+                        "same-image, same-seed Idol splats differ"
+                    );
+                }
+                ensure!(
+                    camera_values(&camera).map(f64::to_bits)
+                        == camera_values(&again_camera).map(f64::to_bits),
+                    "same-image, same-seed Idol cameras differ"
+                );
+                first_seeded_ply = Some(ply);
+            }
             let ref_file =
                 std::fs::File::open(fixture_dir.join(case).join("reference.safetensors"))?;
             let ref_mmap = unsafe { memmap2::MmapOptions::new().map(&ref_file)? };
@@ -15547,7 +15624,7 @@ mod tests {
                         )?;
                         let (b0_lat, b0_cam) = pipe.denoiser.forward_batch(
                             s,
-                            &blas,
+                            &pipe.blas,
                             &mut pipe.denoiser_ws,
                             2,
                             1000.0f32,
@@ -15574,7 +15651,7 @@ mod tests {
                         )?;
                         let (b25_lat, b25_cam) = pipe.denoiser.forward_batch(
                             s,
-                            &blas,
+                            &pipe.blas,
                             &mut pipe.denoiser_ws,
                             2,
                             t25,
@@ -15593,7 +15670,7 @@ mod tests {
                     } else {
                         let (vc0_l, vc0_c) = pipe.denoiser.eval_single(
                             s,
-                            &blas,
+                            &pipe.blas,
                             &mut pipe.denoiser_ws,
                             (&init_lat, &init_cam),
                             (&ref_f1, &ref_f2),
@@ -15601,7 +15678,7 @@ mod tests {
                         )?;
                         let (vu0_l, vu0_c) = pipe.denoiser.eval_single(
                             s,
-                            &blas,
+                            &pipe.blas,
                             &mut pipe.denoiser_ws,
                             (&init_lat, &init_cam),
                             (&zero_f1, &zero_f2),
@@ -15609,7 +15686,7 @@ mod tests {
                         )?;
                         let (vc25_l, vc25_c) = pipe.denoiser.eval_single(
                             s,
-                            &blas,
+                            &pipe.blas,
                             &mut pipe.denoiser_ws,
                             (&step25_in_lat, &step25_in_cam),
                             (&ref_f1, &ref_f2),
@@ -15617,7 +15694,7 @@ mod tests {
                         )?;
                         let (vu25_l, vu25_c) = pipe.denoiser.eval_single(
                             s,
-                            &blas,
+                            &pipe.blas,
                             &mut pipe.denoiser_ws,
                             (&step25_in_lat, &step25_in_cam),
                             (&zero_f1, &zero_f2),
@@ -15665,7 +15742,7 @@ mod tests {
 
                 let traj = pipe.denoiser.sample_flow(
                     s,
-                    &blas,
+                    &pipe.blas,
                     &mut pipe.denoiser_ws,
                     (&init_lat, &init_cam),
                     (&ref_f1, &ref_f2),
@@ -15686,7 +15763,7 @@ mod tests {
             if case == "armchair" {
                 let (neg_vc0_lat, neg_vc0_cam) = pipe.denoiser.eval_single(
                     s,
-                    &blas,
+                    &pipe.blas,
                     &mut pipe.denoiser_ws,
                     (&init_lat, &init_cam),
                     (&ref_f1, &ref_f2),
@@ -15728,7 +15805,7 @@ mod tests {
                     .collect();
                 let (logits, probs) = pipe.octree.forward_level(
                     s,
-                    &blas,
+                    &pipe.blas,
                     &mut pipe.octree_ws,
                     &p_norm,
                     &tf_latent,
@@ -15801,7 +15878,7 @@ mod tests {
                     .collect();
                 let (neg_l4_logits, neg_l4_probs) = pipe.octree.forward_level(
                     s,
-                    &blas,
+                    &pipe.blas,
                     &mut pipe.octree_ws,
                     &p_norm_l4,
                     &tf_latent,
@@ -15828,9 +15905,13 @@ mod tests {
             }
 
             let tf_anchors = read_f32_tensor(&ref_st, "anchors")?;
-            let tf_gs_features =
-                pipe.gaussian
-                    .forward(s, &blas, &mut pipe.gaussian_ws, &tf_anchors, &tf_latent)?;
+            let tf_gs_features = pipe.gaussian.forward(
+                s,
+                &pipe.blas,
+                &mut pipe.gaussian_ws,
+                &tf_anchors,
+                &tf_latent,
+            )?;
             let tf_splat = pipe
                 .gaussian
                 .to_representation(&tf_anchors, &tf_gs_features, None)?;
@@ -15867,8 +15948,6 @@ mod tests {
 
             let vae_eps = read_bf16_tensor(&ref_st, "vae_eps")?;
             let (e2e_splat, e2e_cam) = pipe.generate_with_initial_draws(
-                s,
-                &blas,
                 &chw,
                 (&vae_eps, &init_lat, &init_cam),
                 (42, true),
@@ -15948,14 +16027,17 @@ mod tests {
         for bad in [0, -1, capacity + 1] {
             ensure!(
                 pipe.octree
-                    .sample_octree(s, &blas, &mut pipe.octree_ws, &[], (bad, 1, 0))
+                    .sample_octree(s, &pipe.blas, &mut pipe.octree_ws, &[], (bad, 1, 0))
                     .is_err(),
                 "sample_octree accepted num_points {bad} with capacity {capacity}"
             );
         }
         println!("I1_M3_SAMPLE_OCTREE_BOUNDS PASS capacity={capacity} rejected=3");
 
-        closure.assert_ready()?;
+        pipe.closure.assert_ready()?;
+        println!(
+            "I1_M3_PUBLIC_API PASS images=2 seed=42 requests=3 repeat_splat_bits=exact repeat_camera_bits=exact cross_image_ply=distinct"
+        );
         let _ = std::fs::remove_dir_all(&runtime_dir);
         let defects = defects.into_inner();
         ensure!(
