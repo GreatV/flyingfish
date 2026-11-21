@@ -33,7 +33,7 @@ Items by feature gate:
 |---|---|
 | Always compiled | `RunOptions`; `model::{Model, GenerationOutput, generate_plain, generate_multimodal, embed_text, embedding_json, check_generation_capacity}`; `serve::{run, run_mtp}`; `spec::{Options, generate}`; `tokenizer::{encode, decode}`; `media` readers and writers; `sparse::SparseMesh`; the request and spec types of `minimax_h3` and `music3` (`MiniMaxH3I2vaRequest`, `HyperFlowH3Request`, `H3Output`, `ImageRunOptions`, `ImageRequest`, `ImageReference`, `ImageLatents`, `Music3Request`, `Music3Output`, `music3::prompt_ids`, `music3::SynSpec`) |
 | `cuda` or `rocm` | `backend::{BackendDevice, Backend, with_verbose}`, `backend::gpu`; `minimax_h3::{run_minimax_h3_i2va, run_hyperflow_h3_video, generate, image_latents, image_encode, image_decode, image_sample, ImageSession}`; `backend::{DinoV3Encoder, DinoV3Output, DinoV3Workspace, Flux2VaeConfig, Flux2VaeEncoder, Flux2VaeOutput, Flux2VaeWorkspace, VisionEncoderConfig}`; the DSA and mHC types in `backend` |
-| `cuda` | `parakeet::{transcribe, tdt_transcription, ParakeetTdt, ParakeetEncoder, NemotronStream, StreamChunk, TdtTrajectory}`; `canary::{transcribe, Canary}`; `nemotron::transcribe`; `eou::{transcribe, Eou, EouUtterance}`; `diarization::{diarize, speaker_masks, SpeakerMasks, Diarization}`; `multitalker::{transcribe, Multitalker, MultitalkerTranscription, SpeakerTranscription}`; the `breeze` module; `music3::{generate, Runtime}`; `backend::{Hi3DGeneration, PixalGeneration, PixalSeededRequest, PixalView, PixalOutput, ProjectionCamera, TrellisTo3d, TrellisMesh, IdolPipelineRuntime}` and the other Idol, Pixal3D, Hi3D and TRELLIS.2 stage types; `backend::{Breeze, BreezeTokenizer, Music3Syn}` |
+| `cuda` | `minimax_h3::VideoSession`; `parakeet::{transcribe, tdt_transcription, ParakeetTdt, ParakeetEncoder, NemotronStream, StreamChunk, TdtTrajectory}`; `canary::{transcribe, Canary}`; `nemotron::transcribe`; `eou::{transcribe, Eou, EouUtterance}`; `diarization::{diarize, speaker_masks, SpeakerMasks, Diarization}`; `multitalker::{transcribe, Multitalker, MultitalkerTranscription, SpeakerTranscription}`; the `breeze` module; `music3::{generate, Runtime}`; `backend::{Hi3DGeneration, PixalGeneration, PixalSeededRequest, PixalView, PixalOutput, ProjectionCamera, TrellisTo3d, TrellisMesh, IdolPipelineRuntime}` and the other Idol, Pixal3D, Hi3D and TRELLIS.2 stage types; `backend::{Breeze, BreezeTokenizer, Music3Syn}` |
 | `rocm` | `backend::hip` |
 
 ## Run options and the runtime directory
@@ -401,6 +401,24 @@ let request = minimax_h3::HyperFlowH3Request {
 };
 let out = minimax_h3::run_hyperflow_h3_video(&request, options)?;
 ```
+
+### Resident MiniMax-H3 and HyperFlow video
+
+On CUDA, `minimax_h3::VideoSession` keeps the conditioner, transformer and video and audio decoders ready for successive requests. Call `prepare()` on a `MiniMaxH3I2vaRequest` or `HyperFlowH3Request` to build each `H3Request`.
+
+```rust
+pub fn open(
+    (model, companion): (&Path, Option<&Path>),
+    (lora, gguf): (Option<&Path>, Option<&Path>),
+    options: &RunOptions,
+    requests: impl IntoIterator<Item = Result<H3Request>>,
+) -> Result<VideoSession>
+pub fn render(&mut self, request: &H3Request) -> Result<H3Output>
+```
+
+For MiniMax-H3, pass `(&request.model, None)` and `(Some(&request.lora), request.gguf.as_deref())`. For HyperFlow, pass `(&request.model, Some(&request.base_model))` and `(None, None)`.
+
+`open` consumes a nonempty iterator of prepared requests to select a placement and decoder tile group. `render` accepts new seeds, prompt tokens and keyframe pixels when the canvas, frame count, packed token layout, image grids, keyframe positions and sampling schedule match. A shape mismatch returns an error. Each call returns the same RGB8 and stereo F32 layout as the one-shot API.
 
 ### MiniMax-H3-Image
 

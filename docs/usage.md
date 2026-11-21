@@ -258,6 +258,21 @@ HyperFlow uses the published `fl2va_int8_convrot` component and MiniMax-H3 compa
 
 Omit both keyframes for text-to-video; provide either one for a single anchor, or both for first+last conditioning. `--lora` and `--gguf` are invalid for HyperFlow. `--base-model` and `--last-image` are HyperFlow-only; MiniMax-H3 still requires its first keyframe and Turbo LoRA. MP4 requires ffmpeg on `PATH`; Y4M+WAV does not.
 
+### Multiple video requests
+
+```sh
+ff --model <MiniMax-H3-dir> video --lora <turbo-lora.safetensors> --frames 124 --requests requests.jsonl --json
+```
+
+Supply one JSON object per line. The model, weights and frame count apply to the whole file. Each record supplies its own prompt, seed, output and any keyframes. For HyperFlow, use `--base-model` and the optional record fields `image` and `last_image`.
+
+```jsonl
+{"prompt":"A boat crosses a quiet lake","seed":42,"image":"first.png","output":"boat-42.y4m"}
+{"prompt":"A boat crosses a quiet lake","seed":43,"image":"first.png","output":"boat-43.y4m"}
+```
+
+One record uses the one-shot pipeline. Two or more records share the loaded stages and need matching geometry, packed token layout and keyframe positions. With `--json`, each completed request writes one metadata record to stdout.
+
 ### MiniMax-H3-Image
 
 ```sh
