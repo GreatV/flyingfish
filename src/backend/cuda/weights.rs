@@ -2012,7 +2012,7 @@ impl DenseStreaming {
         narrow: Option<fn(&str) -> bool>,
     ) -> Result<Self> {
         use crate::experts::{catalogue::NativeRange, disk::DiskReader};
-        let fp16_weights = d.info.arch.published_bf16_lt() == crate::backend::setup::LtOperand::F16;
+        let fp16_weights = d.info.arch.fp16_stored_half();
         let mut layers: Vec<_> = plan
             .slots
             .iter()

@@ -153,7 +153,7 @@ fn condition_prompt(
     let manifest = MappedCheckpoint::open_component(&encoder, "model")?
         .minimax_h3_conditioner_manifest(&spec, TEXT_ENCODER_LAYER)?;
     let hidden = spec.hidden as usize;
-    let fp16 = super::fp16_stored_half(&device.info.arch);
+    let fp16 = device.info.arch.fp16_stored_half();
     let table = conditioner_table(&encoder, &manifest, prompt, image_token, hidden, fp16)?;
     let runs = image_runs(&prompt.tokens, image_token);
     ensure!(
@@ -168,7 +168,7 @@ fn condition_prompt(
                 device,
                 &spec,
                 (TEXT_ENCODER_LAYER, count, 0),
-                Source::new(&encoder, &manifest),
+                Source::new(&encoder, &manifest, fp16),
                 Placement::Derived,
                 1,
             )?,
@@ -202,7 +202,7 @@ fn condition_prompt(
             device,
             &spec,
             (TEXT_ENCODER_LAYER, count, media),
-            Source::new(&encoder, &manifest),
+            Source::new(&encoder, &manifest, fp16),
             Placement::Derived,
             1,
         )?;
@@ -243,7 +243,7 @@ fn conditioner_table(
         .into_iter()
         .collect();
     let rows = embedding_rows(
-        &mut Source::new(encoder, manifest),
+        &mut Source::new(encoder, manifest, fp16),
         "model.language_model.embed_tokens.weight",
         hidden,
         &ids,
@@ -533,10 +533,10 @@ fn prepare_transformer(
     };
     let adaln_plan = AdalnPlan::build(layout, &plan)?;
     let table = AdalnTable::build(device, blas, &source_dir, &manifest, spec, &adaln_plan)?;
-    let base = Source::new(&source_dir, &manifest);
+    let base = Source::new(&source_dir, &manifest, device.info.arch.fp16_stored_half());
     let lora = adapter
         .as_ref()
-        .map(|(dir, manifest, _)| Source::new(dir, manifest));
+        .map(|(dir, manifest, _)| Source::new(dir, manifest, device.info.arch.fp16_stored_half()));
     let dit = Dit::with_placement(
         device,
         blas,
@@ -719,7 +719,7 @@ fn run_mode<const SETUP_ONLY: bool>(
         #[cfg(test)]
         NoiseDraws::Recorded(input) => {
             let mut text = input.conditioner.clone();
-            if super::fp16_stored_half(&device.info.arch) {
+            if device.info.arch.fp16_stored_half() {
                 crate::tensors::bf16_table_to_runtime_half("video_text", &mut text)?;
             }
             (text, input.anchors.clone())
@@ -776,7 +776,7 @@ fn run_mode<const SETUP_ONLY: bool>(
                 dit.trace_gate = Some((input.case, Rc::clone(&input.gate)));
             }
         }
-        let kernels = BlockKernels::new(&device.ctx)?;
+        let kernels = BlockKernels::new(&device)?;
         let context = BlockContext {
             s,
             blas: &blas,
@@ -874,7 +874,7 @@ fn video_decode_device(
     let s = &device.stream;
     let mut decoded =
         s.alloc_zeros::<bf16>(vae.out_channels * total_frames * geometry.height * geometry.width)?;
-    let rounded = video_latent_entry(video_latents, super::fp16_stored_half(&device.info.arch))?;
+    let rounded = video_latent_entry(video_latents, device.info.arch.fp16_stored_half())?;
     let latents = s.clone_htod(&rounded)?;
     drop(rounded);
     let plan = decoder.decode(
@@ -1398,7 +1398,7 @@ impl ConditionerStage {
             runs.is_empty() == self.vision.is_none(),
             "resident vision input changed"
         );
-        let fp16 = super::fp16_stored_half(&device.info.arch);
+        let fp16 = device.info.arch.fp16_stored_half();
         let table = conditioner_table(
             &self.dir,
             &self.manifest,
@@ -2062,14 +2062,18 @@ impl VideoSession {
             &device,
             &text_spec,
             (TEXT_ENCODER_LAYER, count, transient),
-            Source::new(&text_dir, &text_manifest),
+            Source::new(
+                &text_dir,
+                &text_manifest,
+                device.info.arch.fp16_stored_half(),
+            ),
             (Placement::Derived, Some(text_plan)),
             request_count,
         )?;
         conditioner.prepare(&text_blas, count)?;
         let video = VideoDecoder::with_plan(&device, (&vae, &vae_dir, &vae_manifest), decode_plan)?;
         video.bind_groups(&mut sample_blas, &work, cap)?;
-        let kernels = BlockKernels::new(&device.ctx)?;
+        let kernels = BlockKernels::new(&device)?;
         device.finish_upload()?;
         let (free, total) = device.ctx.mem_get_info()?;
         ensure!(
@@ -2476,7 +2480,7 @@ impl ImageSession {
             &d,
             &text_spec,
             (TEXT_ENCODER_LAYER, count, temporary),
-            Source::new(&dir, &text_manifest),
+            Source::new(&dir, &text_manifest, d.info.arch.fp16_stored_half()),
             (Placement::Derived, Some(text_plan)),
             count,
         )?;
@@ -2488,7 +2492,7 @@ impl ImageSession {
             decoder_work,
             decode_plan,
         )?;
-        let kernels = BlockKernels::new(&d.ctx)?;
+        let kernels = BlockKernels::new(&d)?;
         d.finish_upload()?;
         let (free, total) = d.ctx.mem_get_info()?;
         let required = (total / 16)
@@ -4051,7 +4055,7 @@ fn hyperflow_composition_matches_frozen_references() -> Result<()> {
                 input.teacher_inputs.len() == plan.row_pairs.len(),
                 "Runner FAIL teacher step count"
             );
-            let kernels = BlockKernels::new(&device.ctx)?;
+            let kernels = BlockKernels::new(&device)?;
             let context = BlockContext {
                 s: &device.stream,
                 blas: &blas,
@@ -4061,7 +4065,7 @@ fn hyperflow_composition_matches_frozen_references() -> Result<()> {
             };
             let text = super::upload_runtime_half(
                 &device.stream,
-                super::fp16_stored_half(&device.info.arch),
+                device.info.arch.fp16_stored_half(),
                 "video_text",
                 &input.conditioner,
             )?;
@@ -4697,7 +4701,7 @@ fn hyperflow_conditioner_effect_gpu() -> Result<()> {
             None,
         )?;
         let s = &device.stream;
-        let kernels = BlockKernels::new(&device.ctx)?;
+        let kernels = BlockKernels::new(&device)?;
         let context = BlockContext {
             s,
             blas: &blas,
@@ -4724,7 +4728,7 @@ fn hyperflow_conditioner_effect_gpu() -> Result<()> {
             } else {
                 super::upload_runtime_half(
                     s,
-                    super::fp16_stored_half(&device.info.arch),
+                    device.info.arch.fp16_stored_half(),
                     "video_text",
                     &values,
                 )?

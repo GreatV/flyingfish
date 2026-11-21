@@ -2,11 +2,12 @@
 use anyhow::{Context as _, Result, ensure};
 use std::{
     any::Any,
+    collections::BTreeMap,
     ffi::{CStr, CString, c_char, c_void},
     marker::PhantomData,
     ops::{Bound, RangeBounds},
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -104,9 +105,17 @@ unsafe extern "C" {
         shared: usize,
     ) -> i32;
     fn ff_hip_device_properties(device: i32, output: *mut Properties) -> i32;
-    fn ff_hip_allocation_granularity(device: i32, out: *mut usize) -> i32;
+    fn ff_hip_allocation_granularity(
+        device: i32,
+        out: *mut usize,
+        failure: *mut *const c_char,
+    ) -> i32;
     #[cfg(test)]
     fn ff_hip_default_mem_pool_usage(device: i32, reserved: *mut u64, used: *mut u64) -> i32;
+    #[cfg(test)]
+    fn ff_hip_reset_default_mem_pool_peak(device: i32) -> i32;
+    #[cfg(test)]
+    fn ff_hip_default_mem_pool_peak(device: i32, used: *mut u64, peak: *mut u64) -> i32;
 }
 
 #[derive(Debug)]
@@ -170,10 +179,13 @@ pub struct Properties {
     pub max_grid_z: i32,
 }
 
+static ALLOCATION_GRANULARITIES: OnceLock<Mutex<BTreeMap<usize, usize>>> = OnceLock::new();
+
 pub struct Context {
     ordinal: usize,
     pub properties: Properties,
     architecture: String,
+    allocation_granularity: usize,
     deferred_error: Mutex<Option<String>>,
     #[cfg(test)]
     pub(crate) device_synchronizations: std::sync::atomic::AtomicUsize,
@@ -247,10 +259,38 @@ impl Context {
                 && properties.max_grid_z > 0,
             "invalid HIP device resource attributes"
         );
+        let allocation_granularity = {
+            let mut cache = ALLOCATION_GRANULARITIES
+                .get_or_init(|| Mutex::new(BTreeMap::new()))
+                .lock()
+                .expect("HIP granularity mutex poisoned");
+            if let Some(&granularity) = cache.get(&ordinal) {
+                granularity
+            } else {
+                let mut granularity = 0usize;
+                let mut failure: *const c_char = std::ptr::null();
+                let status = unsafe {
+                    ff_hip_allocation_granularity(device, &mut granularity, &mut failure)
+                };
+                if status != 0 {
+                    if !failure.is_null() {
+                        let reason = unsafe { CStr::from_ptr(failure) }.to_string_lossy();
+                        anyhow::bail!(
+                            "hipMalloc backing granularity probe on device {ordinal}: {reason} (HIP status {status})"
+                        );
+                    }
+                    check(status, "hipMalloc backing granularity")?;
+                }
+                ensure!(granularity > 0, "zero HIP allocation granularity");
+                cache.insert(ordinal, granularity);
+                granularity
+            }
+        };
         Ok(Arc::new(Self {
             ordinal,
             properties,
             architecture,
+            allocation_granularity,
             deferred_error: Mutex::new(None),
             #[cfg(test)]
             device_synchronizations: std::sync::atomic::AtomicUsize::new(0),
@@ -315,15 +355,7 @@ impl Context {
         Ok((free, total))
     }
     pub(crate) fn allocation_granularity(&self) -> Result<usize> {
-        self.bind_to_thread()?;
-        let mut granularity = 0usize;
-        unsafe {
-            check(
-                ff_hip_allocation_granularity(i32::try_from(self.ordinal)?, &mut granularity),
-                "hipMemGetAllocationGranularity",
-            )?;
-        }
-        Ok(granularity)
+        Ok(self.allocation_granularity)
     }
     #[cfg(test)]
     pub(crate) fn default_mem_pool_usage(&self) -> Result<(u64, u64)> {
@@ -340,6 +372,28 @@ impl Context {
             )?;
         }
         Ok((reserved, used))
+    }
+    #[cfg(test)]
+    pub(crate) fn reset_default_mem_pool_peak(&self) -> Result<()> {
+        self.bind_to_thread()?;
+        unsafe {
+            check(
+                ff_hip_reset_default_mem_pool_peak(i32::try_from(self.ordinal)?),
+                "hipMemPoolSetAttribute",
+            )
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn default_mem_pool_peak(&self) -> Result<(u64, u64)> {
+        self.bind_to_thread()?;
+        let (mut used, mut peak) = (0u64, 0u64);
+        unsafe {
+            check(
+                ff_hip_default_mem_pool_peak(i32::try_from(self.ordinal)?, &mut used, &mut peak),
+                "hipMemPoolGetAttribute",
+            )?;
+        }
+        Ok((used, peak))
     }
     /// # Safety
     /// The host span must remain live and exclusively registered until unregister completes.

@@ -62,10 +62,6 @@ pub(super) fn open_blas(
     }
 }
 
-fn fp16_stored_half(arch: &crate::backend::setup::DeviceArchitecture) -> bool {
-    arch.published_bf16_lt() == crate::backend::setup::LtOperand::F16
-}
-
 fn upload_runtime_half(
     stream: &Arc<CudaStream>,
     fp16: bool,
@@ -272,8 +268,6 @@ struct EntryReader {
     dir: PathBuf,
     readers: BTreeMap<String, SpanReader>,
     staging: Option<AlignedBytes>,
-    /// Set once from the device capability. sm below 80 rewrites BF16 weight bytes to FP16.
-    fp16_weights: Option<bool>,
 }
 
 /// One batched direct-read destination: tensor identity plus a disjoint writable
@@ -747,29 +741,7 @@ impl EntryReader {
             dir: dir.to_owned(),
             readers: BTreeMap::new(),
             staging: None,
-            fp16_weights: None,
         }
-    }
-
-    #[cfg(feature = "cuda")]
-    fn ensure_fp16(&mut self, stream: &Arc<CudaStream>) -> Result<()> {
-        if self.fp16_weights.is_none() {
-            self.fp16_weights = Some(cubin::capability(stream.context())? < 80);
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "rocm")]
-    fn ensure_fp16(&mut self, _stream: &Arc<CudaStream>) -> Result<()> {
-        self.fp16_weights = Some(false);
-        Ok(())
-    }
-
-    fn store_bf16_as_fp16(&self, name: &str, bytes: &mut [u8]) -> Result<()> {
-        if self.fp16_weights == Some(true) {
-            crate::tensors::bf16_weight_to_fp16(name, bytes, true)?;
-        }
-        Ok(())
     }
 
     /// Copies a finite BF16 or F32 tensor into a buffer of its element type; the pageable source is consumed when the
@@ -780,6 +752,7 @@ impl EntryReader {
         name: &str,
         entry: &TensorEntry,
         destination: &mut CudaViewMut<'_, T>,
+        fp16_weights: bool,
     ) -> Result<()> {
         ensure!(
             entry.dtype == T::DTYPE && entry.bytes == std::mem::size_of::<T>() * destination.len(),
@@ -789,8 +762,7 @@ impl EntryReader {
             destination.len(),
             T::DTYPE
         );
-        self.ensure_fp16(stream)?;
-        let convert = self.fp16_weights == Some(true) && entry.dtype == Dtype::BF16;
+        let convert = fp16_weights && entry.dtype == Dtype::BF16;
         let bytes = self.read(name, entry)?;
         ensure!(T::finite(bytes), "{name}: nonfinite value");
         let mut converted = Vec::new();
@@ -828,7 +800,13 @@ impl EntryReader {
     }
 
     /// Copies a finite BF16 or F32 tensor into host memory of exactly its size.
-    fn read_into(&mut self, name: &str, entry: &TensorEntry, destination: &mut [u8]) -> Result<()> {
+    fn read_into(
+        &mut self,
+        name: &str,
+        entry: &TensorEntry,
+        destination: &mut [u8],
+        fp16_weights: bool,
+    ) -> Result<()> {
         ensure!(
             matches!(entry.dtype, Dtype::BF16 | Dtype::F32) && entry.bytes == destination.len(),
             "{name}: {:?} {} B does not fill {} B",
@@ -844,8 +822,8 @@ impl EntryReader {
         };
         ensure!(finite, "{name}: nonfinite value");
         destination.copy_from_slice(bytes);
-        if entry.dtype == Dtype::BF16 {
-            self.store_bf16_as_fp16(name, destination)?;
+        if fp16_weights && entry.dtype == Dtype::BF16 {
+            crate::tensors::bf16_weight_to_fp16(name, destination, true)?;
         }
         Ok(())
     }
@@ -1139,7 +1117,7 @@ impl AdalnTable {
         let timesteps = plan.timesteps.len();
         let width = 6 * spec.hidden;
         let modulation = width * MODALITIES as usize;
-        let mut source = Source::new(transformer_dir, manifest);
+        let mut source = Source::new(transformer_dir, manifest, d.info.arch.fp16_stored_half());
         let hyperflow = spec.is_hyperflow()?;
         let time = AdalnTimeEmbedder {
             linear_1_weight: source.host_f32(
@@ -1194,7 +1172,7 @@ impl AdalnTable {
         } else {
             adaln_input(spec, &time, &plan.timesteps)
         };
-        let x = upload_runtime_half(s, fp16_stored_half(&d.info.arch), "adaln", &x_host)?;
+        let x = upload_runtime_half(s, d.info.arch.fp16_stored_half(), "adaln", &x_host)?;
         let tags = adaln_tags(&plan.pairs);
         let compact = width * tags.len();
         if crate::backend::diagnostics_enabled() {
@@ -1429,6 +1407,7 @@ pub(crate) struct BlockWeights {
 pub(crate) struct Source<'a> {
     reader: EntryReader,
     manifest: &'a TensorManifest,
+    fp16_weights: bool,
     quant: OnceLock<QuantKernels>,
     vectors: Option<(VectorArenaLayout, Arc<CudaSlice<u8>>)>,
     #[cfg(test)]
@@ -1436,10 +1415,11 @@ pub(crate) struct Source<'a> {
 }
 
 impl<'a> Source<'a> {
-    pub(crate) fn new(dir: &Path, manifest: &'a TensorManifest) -> Self {
+    pub(crate) fn new(dir: &Path, manifest: &'a TensorManifest, fp16_weights: bool) -> Self {
         Self {
             reader: EntryReader::new(dir),
             manifest,
+            fp16_weights,
             quant: OnceLock::new(),
             vectors: None,
             #[cfg(test)]
@@ -1469,10 +1449,17 @@ impl<'a> Source<'a> {
             .with_context(|| format!("manifest lacks {name}"))?;
         let quant = match entry.quant {
             Some(quant) => quant,
-            None => return self.reader.upload(s, name, entry, destination),
+            None => {
+                return self
+                    .reader
+                    .upload(s, name, entry, destination, self.fp16_weights);
+            }
         };
         match quant {
-            GgmlType::F32 | GgmlType::Bf16 => self.reader.upload(s, name, entry, destination),
+            GgmlType::F32 | GgmlType::Bf16 => {
+                self.reader
+                    .upload(s, name, entry, destination, self.fp16_weights)
+            }
             GgmlType::F16 | GgmlType::Q4_0 => {
                 let src = self.reader.read_device(s, name, entry)?;
                 let kernels = self.quant_kernels(s)?;
@@ -1523,8 +1510,7 @@ impl<'a> Source<'a> {
             destination.len(),
             T::DTYPE
         );
-        self.reader.ensure_fp16(s)?;
-        let convert = self.reader.fp16_weights == Some(true) && entry.dtype == Dtype::BF16;
+        let convert = self.fp16_weights && entry.dtype == Dtype::BF16;
         let slice = self.reader.read_range(name, entry, first, bytes)?;
         ensure!(T::finite(slice), "{name}: nonfinite value");
         let mut converted = Vec::new();
@@ -1608,7 +1594,6 @@ impl<'a> Source<'a> {
 
     fn pack_vectors(&mut self, s: &Arc<CudaStream>, spec: &H3Spec) -> Result<()> {
         ensure!(self.vectors.is_none(), "vector arena already loaded");
-        self.reader.ensure_fp16(s)?;
         let layout = VectorArenaLayout::new(self.manifest, spec)?;
         let dropped = spec
             .dropped_blocks
@@ -1624,8 +1609,12 @@ impl<'a> Source<'a> {
                         && entry.quant.is_none(),
                     "{name}: vector arena manifest extent or type"
                 );
-                self.reader
-                    .read_into(name, entry, &mut bytes[offset..offset + len])?;
+                self.reader.read_into(
+                    name,
+                    entry,
+                    &mut bytes[offset..offset + len],
+                    self.fp16_weights,
+                )?;
             } else {
                 ensure!(
                     dropped
@@ -2134,12 +2123,13 @@ pub(crate) struct BlockKernels {
     modulate_module: Arc<CudaModule>,
     act_module: Arc<CudaModule>,
     rope_module: Arc<CudaModule>,
-    sm: u32,
+    fp16_store: bool,
     stored_launch: std::sync::OnceLock<StoredLaunch>,
 }
 
 impl BlockKernels {
-    pub(crate) fn new(ctx: &Arc<crate::backend::gpu::CudaContext>) -> Result<Self> {
+    pub(crate) fn new(d: &Device) -> Result<Self> {
+        let ctx = &d.ctx;
         let modulate_module = cubin::module(ctx, "modulate")?;
         let norm_module = cubin::module(ctx, "norm")?;
         let act_module = cubin::module(ctx, "act")?;
@@ -2171,10 +2161,6 @@ impl BlockKernels {
             gated_active >= baseline,
             "gated_add_rms_norm_modulate occupancy {gated_active} below rms_norm_bf16 {baseline}"
         );
-        #[cfg(feature = "cuda")]
-        let sm = cubin::capability(ctx)?;
-        #[cfg(not(feature = "cuda"))]
-        let sm = 80u32;
         Ok(Self {
             norm: plain,
             norm_f32,
@@ -2198,7 +2184,7 @@ impl BlockKernels {
             modulate_module,
             act_module,
             rope_module,
-            sm,
+            fp16_store: d.info.arch.fp16_stored_half(),
             stored_launch: std::sync::OnceLock::new(),
         })
     }
@@ -3570,67 +3556,68 @@ struct ModulateRows {
     entries: u32,
 }
 
-// sm >= 80 cubins do not define ff_fp16_store_fault.
-#[cfg(feature = "cuda")]
-fn prepare_fp16_store_at(sm: u32, s: &Arc<CudaStream>, module: &Arc<CudaModule>) -> Result<()> {
-    if sm >= 80 {
+// Only FP16-store targets (CUDA below sm80) define ff_fp16_store_fault in kernels.
+pub(super) fn prepare_fp16_store_at(
+    fp16_store: bool,
+    s: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+) -> Result<()> {
+    if !fp16_store {
         return Ok(());
     }
-    let mut symbol = module.get_global("ff_fp16_store_fault", s)?;
-    ensure!(
-        symbol.len() == 4,
-        "ff_fp16_store_fault is {} bytes",
-        symbol.len()
-    );
-    s.memcpy_htod(&[0u8; 4], &mut symbol)?;
-    Ok(())
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (s, module);
+        bail!("FP16 store check requires CUDA");
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let mut symbol = module.get_global("ff_fp16_store_fault", s)?;
+        ensure!(
+            symbol.len() == 4,
+            "ff_fp16_store_fault is {} bytes",
+            symbol.len()
+        );
+        s.memcpy_htod(&[0u8; 4], &mut symbol)?;
+        Ok(())
+    }
 }
 
-#[cfg(feature = "rocm")]
-fn prepare_fp16_store_at(sm: u32, _s: &Arc<CudaStream>, _module: &Arc<CudaModule>) -> Result<()> {
-    ensure!(sm >= 80, "ROCm keeps BF16; FP16 store check requires CUDA");
-    Ok(())
-}
-
-#[cfg(feature = "cuda")]
-fn finish_fp16_store_at(
-    sm: u32,
+pub(super) fn finish_fp16_store_at(
+    fp16_store: bool,
     s: &Arc<CudaStream>,
     module: &Arc<CudaModule>,
     tensor: &str,
 ) -> Result<()> {
-    if sm >= 80 {
+    if !fp16_store {
         return Ok(());
     }
-    let mut symbol = module.get_global("ff_fp16_store_fault", s)?;
-    ensure!(
-        symbol.len() == 4,
-        "ff_fp16_store_fault is {} bytes",
-        symbol.len()
-    );
-    let bytes = s.clone_dtoh(&symbol)?;
-    s.memcpy_htod(&[0u8; 4], &mut symbol)?;
-    ensure!(
-        bytes == [0u8; 4],
-        "FP16 store of {tensor} is non-finite or above 65504"
-    );
-    Ok(())
-}
-
-#[cfg(feature = "rocm")]
-fn finish_fp16_store_at(
-    sm: u32,
-    _s: &Arc<CudaStream>,
-    _module: &Arc<CudaModule>,
-    _tensor: &str,
-) -> Result<()> {
-    ensure!(sm >= 80, "ROCm keeps BF16; FP16 store check requires CUDA");
-    Ok(())
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (s, module, tensor);
+        bail!("FP16 store check requires CUDA");
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let mut symbol = module.get_global("ff_fp16_store_fault", s)?;
+        ensure!(
+            symbol.len() == 4,
+            "ff_fp16_store_fault is {} bytes",
+            symbol.len()
+        );
+        let bytes = s.clone_dtoh(&symbol)?;
+        s.memcpy_htod(&[0u8; 4], &mut symbol)?;
+        ensure!(
+            bytes == [0u8; 4],
+            "FP16 store of {tensor} is non-finite or above 65504"
+        );
+        Ok(())
+    }
 }
 
 impl BlockKernels {
     fn prepare_fp16_store(&self, s: &Arc<CudaStream>, module: &Arc<CudaModule>) -> Result<()> {
-        prepare_fp16_store_at(self.sm, s, module)
+        prepare_fp16_store_at(self.fp16_store, s, module)
     }
 
     fn finish_fp16_store(
@@ -3639,7 +3626,7 @@ impl BlockKernels {
         module: &Arc<CudaModule>,
         tensor: &str,
     ) -> Result<()> {
-        finish_fp16_store_at(self.sm, s, module, tensor)
+        finish_fp16_store_at(self.fp16_store, s, module, tensor)
     }
 
     #[cfg(test)]
@@ -3989,13 +3976,13 @@ fn cast_rows(
     source: u64,
     target: u64,
     count: usize,
-    sm: u32,
+    fp16_store: bool,
     module: &Arc<CudaModule>,
 ) -> Result<()> {
     if count == 0 {
         return Ok(());
     }
-    prepare_fp16_store_at(sm, s, module)?;
+    prepare_fp16_store_at(fp16_store, s, module)?;
     unsafe {
         s.launch_builder(kernel)
             .arg(&source)
@@ -4005,7 +3992,7 @@ fn cast_rows(
             .arg(&1f32)
             .launch(flat(count))?;
     }
-    finish_fp16_store_at(sm, s, module, "affine")
+    finish_fp16_store_at(fp16_store, s, module, "affine")
 }
 
 /// `y [rows, n] = x [rows, k] * w^T + b` in F32 on rows starting at element `x_offset` of `x`.
@@ -4062,7 +4049,7 @@ fn round_into(
     source: u64,
     target: usize,
     count: usize,
-    store: (u32, &Arc<CudaModule>),
+    store: (bool, &Arc<CudaModule>),
 ) -> Result<()> {
     cast_rows(
         s,
@@ -4083,10 +4070,10 @@ fn upcast_from(
     scratch: &CudaSlice<f32>,
     source: usize,
     count: usize,
-    store: (u32, &Arc<CudaModule>),
+    store: (bool, &Arc<CudaModule>),
 ) -> Result<()> {
-    let (sm, module) = store;
-    prepare_fp16_store_at(sm, s, module)?;
+    let (fp16_store, module) = store;
+    prepare_fp16_store_at(fp16_store, s, module)?;
     unsafe {
         s.launch_builder(kernel)
             .arg(&(pointer(normed, s) + 2 * source as u64))
@@ -4094,7 +4081,7 @@ fn upcast_from(
             .arg(&u32::try_from(count)?)
             .launch(flat(count))?;
     }
-    finish_fp16_store_at(sm, s, module, "upcast")
+    finish_fp16_store_at(fp16_store, s, module, "upcast")
 }
 
 fn image_fill_rate(dir: &Path, manifest: &TensorManifest) -> Result<(usize, f64)> {
@@ -4128,9 +4115,9 @@ fn image_fill_rate(dir: &Path, manifest: &TensorManifest) -> Result<(usize, f64)
             cast: FillCast::Raw,
         })
         .collect::<Vec<_>>();
-    let mut source = Source::new(dir, manifest);
+    let mut reader = EntryReader::new(dir);
     let began = std::time::Instant::now();
-    source.reader.read_many_direct(&mut requests)?;
+    reader.read_many_direct(&mut requests)?;
     let seconds = began.elapsed().as_secs_f64();
     ensure!(
         seconds.is_finite() && seconds > 0.0,
@@ -4366,7 +4353,7 @@ fn bind_layers(
     let tier = if plan.slot_bytes > 0 {
         let dir = base.reader.dir.clone();
         let host_tier = plan.host.clone();
-        let fp16 = fp16_stored_half(&d.info.arch);
+        let fp16 = d.info.arch.fp16_stored_half();
         let mut dense =
             crate::backend::cuda::weights::DenseStreaming::new(&dir, base.manifest, plan, d, None)?;
         let mut requests = Vec::new();
@@ -5003,7 +4990,7 @@ fn place_stored_layers(
     let mut tier = None;
     if plan.slot_bytes > 0 {
         let dir = base.reader.dir.clone();
-        let fp16 = fp16_stored_half(&d.info.arch);
+        let fp16 = d.info.arch.fp16_stored_half();
         let mut dense = crate::backend::cuda::weights::DenseStreaming::new(
             &dir,
             base.manifest,
@@ -5482,7 +5469,7 @@ impl Dit {
         let audio = s.alloc_zeros::<f32>(ranges.audio * spec.audio_in_channels)?;
         let rotary = upload_runtime_half(
             s,
-            fp16_stored_half(&d.info.arch),
+            d.info.arch.fp16_stored_half(),
             "rotary",
             &crate::minimax_h3::rotary_table(spec, layout),
         )?;
@@ -5931,7 +5918,7 @@ impl Dit {
             scratch,
             r.text * h,
             r.condition * h,
-            (c.kernels.sm, &self.vision_ops),
+            (c.kernels.fp16_store, &self.vision_ops),
         )?;
         round_into(
             s,
@@ -5940,7 +5927,7 @@ impl Dit {
             scratch + 4 * (r.condition * h) as u64,
             r.video_start * h,
             (video_rows - r.condition) * h,
-            (c.kernels.sm, &self.vision_ops),
+            (c.kernels.fp16_store, &self.vision_ops),
         )?;
         projection(
             c.s,
@@ -5957,7 +5944,7 @@ impl Dit {
             scratch,
             r.audio_start * h,
             r.audio * h,
-            (c.kernels.sm, &self.vision_ops),
+            (c.kernels.fp16_store, &self.vision_ops),
         )?;
 
         let block_rows = 6 * h * pairs as usize;
@@ -6062,7 +6049,7 @@ impl Dit {
             &self.scratch,
             r.video_start * h,
             generated * h,
-            (c.kernels.sm, &self.vision_ops),
+            (c.kernels.fp16_store, &self.vision_ops),
         )?;
         projection(
             c.s,
@@ -6079,7 +6066,7 @@ impl Dit {
             &self.scratch,
             r.audio_start * h,
             r.audio * h,
-            (c.kernels.sm, &self.vision_ops),
+            (c.kernels.fp16_store, &self.vision_ops),
         )?;
         projection(
             c.s,
@@ -6252,7 +6239,7 @@ impl ImageDit {
                     .all(|(i, &row)| row as usize == text_rows + i),
             "image layout is not [text | reference | generated]"
         );
-        let mut base = Source::new(dir, manifest);
+        let mut base = Source::new(dir, manifest, d.info.arch.fp16_stored_half());
         let (h, row_width) = (spec.hidden, image.row_width());
         let proj_in = [
             base.tensor(s, "proj_in.weight", h * row_width)?,
@@ -6305,7 +6292,7 @@ impl ImageDit {
         let velocity = s.alloc_zeros::<f32>(image_rows * row_width)?;
         let rotary = upload_runtime_half(
             s,
-            fp16_stored_half(&d.info.arch),
+            d.info.arch.fp16_stored_half(),
             "image_rotary",
             &rotary_rows(spec.rope_freq_dim, spec.rope_theta, &layout.position_ids),
         )?;
@@ -6599,7 +6586,7 @@ impl ImageDit {
             pointer(&self.scratch, s),
             text_rows * h,
             image_rows * h,
-            (c.kernels.sm, &self.vision_ops),
+            (c.kernels.fp16_store, &self.vision_ops),
         )?;
         let block_rows = 6 * h * pairs as usize;
         let sources = Scale2Sources {
@@ -6689,7 +6676,7 @@ impl ImageDit {
             &self.scratch,
             text_rows * h,
             image_rows * h,
-            (c.kernels.sm, &self.vision_ops),
+            (c.kernels.fp16_store, &self.vision_ops),
         )?;
         projection(
             c.s,
@@ -7038,7 +7025,7 @@ impl Conditioner {
             capacity,
             layers: text_layers,
             tier,
-            kernels: BlockKernels::new(s.context())?,
+            kernels: BlockKernels::new(d)?,
             flash,
             x,
             normed,
@@ -7051,7 +7038,7 @@ impl Conditioner {
             gate_up,
             gated,
             rope,
-            fp16_rope: fp16_stored_half(&d.info.arch),
+            fp16_rope: d.info.arch.fp16_stored_half(),
         })
     }
 
@@ -7450,7 +7437,7 @@ pub(crate) fn image_sample_trace(
             crate::prefill::placement_visits(plan.len(), 1)?,
         ),
     )?;
-    let kernels = BlockKernels::new(&device.ctx)?;
+    let kernels = BlockKernels::new(&device)?;
     let s = &device.stream;
     let context = BlockContext {
         s,
@@ -7935,14 +7922,18 @@ mod tests {
                 "MiniMax-H3 refiner skinny-row test".into(),
             )),
         )?;
-        let kernels = BlockKernels::new(&device.ctx)?;
+        let kernels = BlockKernels::new(&device)?;
         let weights = BlockWeights::resident::<true>(
             s,
             &spec,
             adapter.rank,
             "token_refiner.refiner_blocks.0",
-            &mut Source::new(&transformer, &manifest),
-            Some(&mut Source::new(&lora_dir, &lora_manifest)),
+            &mut Source::new(&transformer, &manifest, device.info.arch.fp16_stored_half()),
+            Some(&mut Source::new(
+                &lora_dir,
+                &lora_manifest,
+                device.info.arch.fp16_stored_half(),
+            )),
         )?;
         for rows in [1usize, 12, 16, 17] {
             let mut work = BlockWork::new(s, &spec, adapter.rank, rows)?;
@@ -7954,7 +7945,7 @@ mod tests {
                 .collect();
             let mut x = upload_runtime_half(
                 s,
-                fp16_stored_half(&device.info.arch),
+                device.info.arch.fp16_stored_half(),
                 "block_hidden",
                 &input,
             )?;
@@ -8131,7 +8122,7 @@ mod tests {
         let device = Device::new(0)?;
         let s = &device.stream;
         device.finish_upload()?;
-        let kernels = BlockKernels::new(&device.ctx)?;
+        let kernels = BlockKernels::new(&device)?;
         let plain_active = kernels
             .norm
             .occupancy_max_active_blocks_per_multiprocessor(HIDDEN_NORM_THREADS, 0, None)?;
@@ -8689,7 +8680,7 @@ mod tests {
         use cudarc::driver::sys::{CUdevice_attribute as DA, CUfunction_attribute as FA};
         let device = Device::new(0)?;
         let s = &device.stream;
-        let kernels = BlockKernels::new(&device.ctx)?;
+        let kernels = BlockKernels::new(&device)?;
         let max_threads_sm = u32::try_from(
             device
                 .ctx
@@ -9021,7 +9012,7 @@ mod tests {
         let device = Device::new(0)?;
         let s = &device.stream;
         device.finish_upload()?;
-        let kernels = BlockKernels::new(&device.ctx)?;
+        let kernels = BlockKernels::new(&device)?;
         let eps = 1.0e-5f32;
         let pattern = |len: usize, stride: usize, bias: usize| -> Vec<bf16> {
             (0..len)
@@ -9181,7 +9172,7 @@ mod tests {
         let device = Device::new(0)?;
         let s = &device.stream;
         device.finish_upload()?;
-        let kernels = BlockKernels::new(&device.ctx)?;
+        let kernels = BlockKernels::new(&device)?;
         let eps = 1.0e-5f32;
         let pattern = |len: usize, stride: usize, bias: usize| -> Vec<bf16> {
             (0..len)
@@ -9360,9 +9351,13 @@ mod tests {
             &runtime,
             Rc::new(Closure::new(true, "MiniMax-H3 block norm control".into())),
         )?;
-        let kernels = BlockKernels::new(&device.ctx)?;
-        let mut base = Source::new(&transformer, &manifest);
-        let mut lora = Source::new(&lora_dir, &lora_manifest);
+        let kernels = BlockKernels::new(&device)?;
+        let mut base = Source::new(&transformer, &manifest, device.info.arch.fp16_stored_half());
+        let mut lora = Source::new(
+            &lora_dir,
+            &lora_manifest,
+            device.info.arch.fp16_stored_half(),
+        );
         let weights = BlockWeights::resident::<true>(
             s,
             &spec,
@@ -9512,10 +9507,7 @@ mod tests {
         let s = &device.stream;
         let module = cubin::module(s.context(), "vision_ops")?;
         let kernel = module.load_function("vision_affine_cast_bf16")?;
-        #[cfg(feature = "cuda")]
-        let sm = cubin::capability(s.context())?;
-        #[cfg(not(feature = "cuda"))]
-        let sm = 80u32;
+        let fp16 = device.info.arch.fp16_stored_half();
         let values: Vec<f32> = (0..16).map(|i| 1.0 + i as f32 / 3.0).collect();
         let source = s.clone_htod(&values)?;
         let target = s.alloc_zeros::<bf16>(16)?;
@@ -9525,7 +9517,7 @@ mod tests {
             pointer(&source, s),
             pointer(&target, s),
             0,
-            sm,
+            fp16,
             &module,
         )?;
         s.synchronize()?;
@@ -9539,14 +9531,14 @@ mod tests {
             pointer(&source, s),
             pointer(&target, s),
             16,
-            sm,
+            fp16,
             &module,
         )?;
         let rounded = |v: f32| {
-            if sm >= 80 {
-                bf16::from_f32(v).to_bits()
-            } else {
+            if fp16 {
                 half::f16::from_f32(v).to_bits()
+            } else {
+                bf16::from_f32(v).to_bits()
             }
         };
         ensure!(
@@ -10095,7 +10087,7 @@ mod tests {
             "row partitions must cover the discriminator within production extents"
         );
         let total = *partitions.iter().max().context("row partitions empty")?;
-        let mut source = Source::new(dir, &manifest);
+        let mut source = Source::new(dir, &manifest, device.info.arch.fp16_stored_half());
         {
             let rows = 664;
             let weights = source.tensor::<bf16>(
@@ -10120,7 +10112,7 @@ mod tests {
             );
             let input = upload_runtime_half(
                 stream,
-                fp16_stored_half(&device.info.arch),
+                device.info.arch.fp16_stored_half(),
                 "block_hidden",
                 &host,
             )?;
@@ -10235,7 +10227,7 @@ mod tests {
             };
             let x = upload_runtime_half(
                 stream,
-                fp16_stored_half(&device.info.arch),
+                device.info.arch.fp16_stored_half(),
                 "block_hidden",
                 &host,
             )?;
@@ -10292,7 +10284,7 @@ mod tests {
                     .collect();
                 let raw = upload_runtime_half(
                     stream,
-                    fp16_stored_half(&device.info.arch),
+                    device.info.arch.fp16_stored_half(),
                     "block_hidden",
                     &values,
                 )?;
@@ -10326,7 +10318,7 @@ mod tests {
              -> Result<Vec<bf16>> {
                 let y = upload_runtime_half(
                     stream,
-                    fp16_stored_half(&device.info.arch),
+                    device.info.arch.fp16_stored_half(),
                     "block_hidden",
                     &initial,
                 )?;
@@ -10469,7 +10461,7 @@ mod tests {
             &runtime,
             Rc::new(Closure::new(true, "base row invariance".into())),
         )?;
-        let mut source = Source::new(&dir, &manifest);
+        let mut source = Source::new(&dir, &manifest, device.info.arch.fp16_stored_half());
         let mut defects = 0;
         let mut cells = 0;
         for layer in [0, spec.layers / 2] {
@@ -10503,7 +10495,7 @@ mod tests {
                                 .collect();
                             let x = upload_runtime_half(
                                 stream,
-                                fp16_stored_half(&device.info.arch),
+                                device.info.arch.fp16_stored_half(),
                                 "block_hidden",
                                 &host,
                             )?;
@@ -10619,7 +10611,7 @@ mod tests {
         let s = &device.stream;
         let ops = Ops::new(&device.ctx)?;
         device.finish_upload()?;
-        let kernels = BlockKernels::new(&device.ctx)?;
+        let kernels = BlockKernels::new(&device)?;
         let weights: Vec<BlockWeights> = (0..2)
             .map(|layer| {
                 BlockWeights::resident::<true>(
@@ -10627,8 +10619,12 @@ mod tests {
                     &spec,
                     adapter.rank,
                     &format!("transformer_blocks.{layer}"),
-                    &mut Source::new(&transformer, &manifest),
-                    Some(&mut Source::new(lora_dir, &lora_manifest)),
+                    &mut Source::new(&transformer, &manifest, device.info.arch.fp16_stored_half()),
+                    Some(&mut Source::new(
+                        lora_dir,
+                        &lora_manifest,
+                        device.info.arch.fp16_stored_half(),
+                    )),
                 )
             })
             .collect::<Result<_>>()?;
@@ -10644,7 +10640,7 @@ mod tests {
             let mut input: Vec<bf16> = (0..rows * spec.hidden)
                 .map(|i| common[((i / spec.hidden + 17) % 1511) * spec.hidden + i % spec.hidden])
                 .collect();
-            if fp16_stored_half(&device.info.arch) {
+            if device.info.arch.fp16_stored_half() {
                 crate::tensors::bf16_table_to_runtime_half("block_hidden", &mut input)?;
             }
             let runtime =
@@ -10696,7 +10692,7 @@ mod tests {
             let receipt = blas.bound_plan_receipt()?;
             let rotary = upload_runtime_half(
                 s,
-                fp16_stored_half(&device.info.arch),
+                device.info.arch.fp16_stored_half(),
                 "rotary",
                 &crate::minimax_h3::rotary_table(&spec, &layout),
             )?;
@@ -10717,7 +10713,7 @@ mod tests {
                     Ok((
                         upload_runtime_half(
                             s,
-                            fp16_stored_half(&device.info.arch),
+                            device.info.arch.fp16_stored_half(),
                             "adaln",
                             &values,
                         )?,
@@ -11012,24 +11008,28 @@ mod tests {
         let r = adapter.rank;
         let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
             .with_full_single_probability()?;
-        let kernels = BlockKernels::new(&device.ctx)?;
+        let kernels = BlockKernels::new(&device)?;
         let weights = BlockWeights::resident::<true>(
             s,
             &spec,
             r,
             "transformer_blocks.0",
-            &mut Source::new(&transformer, &manifest),
-            Some(&mut Source::new(&lora_dir, &lora_manifest)),
+            &mut Source::new(&transformer, &manifest, device.info.arch.fp16_stored_half()),
+            Some(&mut Source::new(
+                &lora_dir,
+                &lora_manifest,
+                device.info.arch.fp16_stored_half(),
+            )),
         )?;
         let mut work = BlockWork::new(s, &spec, r, rows)?;
         work.prepare::<true>(&blas, &spec)?;
         let rotary = upload_runtime_half(
             s,
-            fp16_stored_half(&device.info.arch),
+            device.info.arch.fp16_stored_half(),
             "rotary",
             &rotary_host,
         )?;
-        if fp16_stored_half(&device.info.arch) {
+        if device.info.arch.fp16_stored_half() {
             crate::tensors::bf16_table_to_runtime_half("block_hidden", &mut input)?;
             crate::tensors::bf16_table_to_runtime_half("adaln", &mut table_host)?;
             crate::tensors::bf16_table_to_runtime_half("block_hidden", &mut final_hidden_host)?;
@@ -11041,11 +11041,9 @@ mod tests {
         {
             let hidden = s.clone_htod(&input)?;
             let final_hidden = s.clone_htod(&final_hidden_host)?;
-            let final_weight = Source::new(&transformer, &manifest).tensor::<bf16>(
-                s,
-                "norm_out.norm.weight",
-                spec.hidden,
-            )?;
+            let final_weight =
+                Source::new(&transformer, &manifest, device.info.arch.fp16_stored_half())
+                    .tensor::<bf16>(s, "norm_out.norm.weight", spec.hidden)?;
             let final_table = s.clone_htod(&final_table_host)?;
             let final_index = s.clone_htod(&final_index_host)?;
             let reference = s.alloc_zeros::<bf16>(rows * spec.hidden)?;
@@ -11337,14 +11335,18 @@ mod tests {
         let gguf_dir = gguf_path.parent().context("GGUF directory")?;
         let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
             .with_full_single_probability()?;
-        let kernels = BlockKernels::new(&device.ctx)?;
+        let kernels = BlockKernels::new(&device)?;
         let weights = BlockWeights::resident::<true>(
             s,
             &spec,
             r,
             "transformer_blocks.0",
-            &mut Source::new(gguf_dir, &manifest),
-            Some(&mut Source::new(&lora_dir, &lora_manifest)),
+            &mut Source::new(gguf_dir, &manifest, device.info.arch.fp16_stored_half()),
+            Some(&mut Source::new(
+                &lora_dir,
+                &lora_manifest,
+                device.info.arch.fp16_stored_half(),
+            )),
         )?;
         let mut wrong = manifest.clone();
         wrong
@@ -11357,27 +11359,35 @@ mod tests {
             &spec,
             r,
             "transformer_blocks.0",
-            &mut Source::new(gguf_dir, &wrong),
-            Some(&mut Source::new(&lora_dir, &lora_manifest)),
+            &mut Source::new(gguf_dir, &wrong, device.info.arch.fp16_stored_half()),
+            Some(&mut Source::new(
+                &lora_dir,
+                &lora_manifest,
+                device.info.arch.fp16_stored_half(),
+            )),
         )?;
         let official_weights = BlockWeights::resident::<true>(
             s,
             &spec,
             r,
             "transformer_blocks.0",
-            &mut Source::new(&transformer, &official),
-            Some(&mut Source::new(&lora_dir, &lora_manifest)),
+            &mut Source::new(&transformer, &official, device.info.arch.fp16_stored_half()),
+            Some(&mut Source::new(
+                &lora_dir,
+                &lora_manifest,
+                device.info.arch.fp16_stored_half(),
+            )),
         )?;
         let mut work = BlockWork::new(s, &spec, r, rows)?;
         work.prepare::<true>(&blas, &spec)?;
         let rotary_device = upload_runtime_half(
             s,
-            fp16_stored_half(&device.info.arch),
+            device.info.arch.fp16_stored_half(),
             "rotary",
             &rotary_host,
         )?;
         let table_device =
-            upload_runtime_half(s, fp16_stored_half(&device.info.arch), "adaln", &table_host)?;
+            upload_runtime_half(s, device.info.arch.fp16_stored_half(), "adaln", &table_host)?;
         let index_device = s.clone_htod(&index_host)?;
         let modulation = Modulation {
             table: &table_device,
@@ -11399,7 +11409,7 @@ mod tests {
         let mut run = |weights: &BlockWeights| -> Result<Vec<f64>> {
             let mut x = upload_runtime_half(
                 s,
-                fp16_stored_half(&device.info.arch),
+                device.info.arch.fp16_stored_half(),
                 "block_hidden",
                 &input_host,
             )?;
@@ -11522,65 +11532,70 @@ mod tests {
 
         let device = Device::new(0)?;
         let stream = &device.stream;
-        let mismatches =
-            |placement: Placement, perturb: Option<(usize, &str, isize)>| -> Result<Vec<usize>> {
-                let mut base = Source::new(&gguf_dir, &manifest);
-                let placed = place_layers(
-                    "dit",
-                    &device,
-                    &mut base,
-                    (
-                        &sizing.layers,
-                        &sizing.source_layers,
-                        sizing.largest,
-                        owned,
-                        0,
-                    ),
-                    (placement, crate::prefill::placement_visits(2, 1)?),
-                    |layer| format!("transformer_blocks.{layer}"),
-                    &LINEAR_ROLES,
+        let mismatches = |placement: Placement,
+                          perturb: Option<(usize, &str, isize)>|
+         -> Result<Vec<usize>> {
+            let mut base = Source::new(&gguf_dir, &manifest, device.info.arch.fp16_stored_half());
+            let placed = place_layers(
+                "dit",
+                &device,
+                &mut base,
+                (
+                    &sizing.layers,
+                    &sizing.source_layers,
+                    sizing.largest,
+                    owned,
+                    0,
+                ),
+                (placement, crate::prefill::placement_visits(2, 1)?),
+                |layer| format!("transformer_blocks.{layer}"),
+                &LINEAR_ROLES,
+            )?;
+            let mut tier = placed.tier.context("streamed placement")?;
+            tier.ready()?;
+            if let Some((layer, name, delta)) = perturb {
+                tier.dense.shift_source_offset(layer, name, delta)?;
+            }
+            let mut mismatches = Vec::new();
+            for (layer, &layer_bytes) in sizing.layers.iter().enumerate() {
+                let name = format!("transformer_blocks.{layer}");
+                let resident = BlockWeights::resident::<true>(
+                    stream,
+                    &spec,
+                    adapter.rank,
+                    &name,
+                    &mut Source::new(&gguf_dir, &manifest, device.info.arch.fp16_stored_half()),
+                    Some(&mut Source::new(
+                        &lora_dir,
+                        &lora_manifest,
+                        device.info.arch.fp16_stored_half(),
+                    )),
                 )?;
-                let mut tier = placed.tier.context("streamed placement")?;
-                tier.ready()?;
-                if let Some((layer, name, delta)) = perturb {
-                    tier.dense.shift_source_offset(layer, name, delta)?;
-                }
-                let mut mismatches = Vec::new();
-                for (layer, &layer_bytes) in sizing.layers.iter().enumerate() {
-                    let name = format!("transformer_blocks.{layer}");
-                    let resident = BlockWeights::resident::<true>(
+                let expected =
+                    stream.clone_dtoh(resident.storage.as_ref().context("resident storage")?)?;
+                tier.dense.begin(layer, stream)?;
+                let pointer = tier.dense.pointer(layer, 0, layer_bytes)?;
+                let actual = stream.alloc_zeros::<bf16>(expected.len())?;
+                unsafe {
+                    crate::backend::cuda::copy::dtod_raw(
+                        actual.device_ptr(stream).0,
+                        pointer,
+                        layer_bytes,
                         stream,
-                        &spec,
-                        adapter.rank,
-                        &name,
-                        &mut Source::new(&gguf_dir, &manifest),
-                        Some(&mut Source::new(&lora_dir, &lora_manifest)),
                     )?;
-                    let expected = stream
-                        .clone_dtoh(resident.storage.as_ref().context("resident storage")?)?;
-                    tier.dense.begin(layer, stream)?;
-                    let pointer = tier.dense.pointer(layer, 0, layer_bytes)?;
-                    let actual = stream.alloc_zeros::<bf16>(expected.len())?;
-                    unsafe {
-                        crate::backend::cuda::copy::dtod_raw(
-                            actual.device_ptr(stream).0,
-                            pointer,
-                            layer_bytes,
-                            stream,
-                        )?;
-                    }
-                    tier.dense.end(layer, stream)?;
-                    let actual = stream.clone_dtoh(&actual)?;
-                    if actual
-                        .iter()
-                        .map(|v| v.to_bits())
-                        .ne(expected.iter().map(|v| v.to_bits()))
-                    {
-                        mismatches.push(layer);
-                    }
                 }
-                Ok(mismatches)
-            };
+                tier.dense.end(layer, stream)?;
+                let actual = stream.clone_dtoh(&actual)?;
+                if actual
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .ne(expected.iter().map(|v| v.to_bits()))
+                {
+                    mismatches.push(layer);
+                }
+            }
+            Ok(mismatches)
+        };
         for placement in [Placement::Streamed, Placement::StreamedDisk] {
             let clean = mismatches(placement, None)?;
             ensure!(
@@ -11929,14 +11944,18 @@ mod tests {
             &mut blas,
             &spec,
             (adapter.rank, &layout),
-            Source::new(&transformer, &manifest),
-            Some(Source::new(&lora_dir, &lora_manifest)),
+            Source::new(&transformer, &manifest, device.info.arch.fp16_stored_half()),
+            Some(Source::new(
+                &lora_dir,
+                &lora_manifest,
+                device.info.arch.fp16_stored_half(),
+            )),
             (
                 Placement::from_env()?,
                 crate::prefill::placement_visits(plan.len(), 1)?,
             ),
         )?;
-        let kernels = BlockKernels::new(&device.ctx)?;
+        let kernels = BlockKernels::new(&device)?;
         let context = BlockContext {
             s,
             blas: &blas,
@@ -11950,7 +11969,7 @@ mod tests {
         );
         let text = upload_runtime_half(
             s,
-            fp16_stored_half(&device.info.arch),
+            device.info.arch.fp16_stored_half(),
             "video_text",
             &text_host,
         )?;
@@ -11961,7 +11980,7 @@ mod tests {
             .collect();
         let rotated = upload_runtime_half(
             s,
-            fp16_stored_half(&device.info.arch),
+            device.info.arch.fp16_stored_half(),
             "video_text",
             &rotated,
         )?;
@@ -12206,14 +12225,18 @@ mod tests {
             &mut blas,
             &spec,
             (adapter.rank, &layout),
-            Source::new(&transformer, &manifest),
-            Some(Source::new(&lora_dir, &lora_manifest)),
+            Source::new(&transformer, &manifest, device.info.arch.fp16_stored_half()),
+            Some(Source::new(
+                &lora_dir,
+                &lora_manifest,
+                device.info.arch.fp16_stored_half(),
+            )),
             (
                 Placement::from_env()?,
                 crate::prefill::placement_visits(plan.len(), 1)?,
             ),
         )?;
-        let kernels = BlockKernels::new(&device.ctx)?;
+        let kernels = BlockKernels::new(&device)?;
         let context = BlockContext {
             s,
             blas: &blas,
@@ -12223,7 +12246,7 @@ mod tests {
         };
         let text = upload_runtime_half(
             s,
-            fp16_stored_half(&device.info.arch),
+            device.info.arch.fp16_stored_half(),
             "video_text",
             &text_host,
         )?;
@@ -12686,7 +12709,7 @@ mod tests {
             let ids: Vec<u32> = ids.into_iter().collect();
             let hidden = spec.hidden as usize;
             let rows = embedding_rows(
-                &mut Source::new(&encoder, &manifest),
+                &mut Source::new(&encoder, &manifest, false),
                 "model.language_model.embed_tokens.weight",
                 hidden,
                 &ids,
@@ -12823,7 +12846,7 @@ mod tests {
                 .context("hidden_states_50")?;
             let (hidden, image_token) = (gate.spec.hidden as usize, gate.image_token()?);
             let device = Device::new(0)?;
-            if fp16_stored_half(&device.info.arch) {
+            if device.info.arch.fp16_stored_half() {
                 for row in gate.table.values_mut() {
                     crate::tensors::bf16_table_to_runtime_half("image_text", row)?;
                 }
@@ -12849,7 +12872,11 @@ mod tests {
                 &device,
                 &gate.spec,
                 (layers, capacity, 0),
-                Source::new(&gate.encoder, &gate.manifest),
+                Source::new(
+                    &gate.encoder,
+                    &gate.manifest,
+                    device.info.arch.fp16_stored_half(),
+                ),
                 Placement::from_env()?,
                 1,
             )?;
@@ -12859,7 +12886,7 @@ mod tests {
             {
                 conditioner.prepare(&blas, inputs.tokens.len())?;
                 let mut features = vision.clone();
-                if fp16_stored_half(&device.info.arch) {
+                if device.info.arch.fp16_stored_half() {
                     for row in &mut features {
                         crate::tensors::bf16_table_to_runtime_half("vision_features", row)?;
                     }
@@ -13044,7 +13071,11 @@ mod tests {
             &device,
             &gate.spec,
             (50, capacity, media),
-            Source::new(&gate.encoder, &gate.manifest),
+            Source::new(
+                &gate.encoder,
+                &gate.manifest,
+                device.info.arch.fp16_stored_half(),
+            ),
             Placement::from_env()?,
             1,
         )?;
@@ -14201,12 +14232,12 @@ mod tests {
     }
 
     fn scored_image_tau(
-        sm: u32,
+        fp16: bool,
         name: &str,
         published_max: f64,
         published_rmse: f64,
     ) -> (f64, f64) {
-        if sm < 80 && name.starts_with("dit_") {
+        if fp16 && name.starts_with("dit_") {
             fp16_dit_bound()
         } else {
             (published_max, published_rmse)
@@ -14235,24 +14266,24 @@ mod tests {
             Some(fp16_dit_bound())
         );
         assert_eq!(
-            scored_image_tau(75, "dit_step0", 1.0, 0.1),
+            scored_image_tau(true, "dit_step0", 1.0, 0.1),
             fp16_dit_bound()
         );
         assert_eq!(
-            scored_image_tau(75, "dit_step5", 1.0, 0.1),
+            scored_image_tau(true, "dit_step5", 1.0, 0.1),
             fp16_dit_bound()
         );
         assert_eq!(
-            scored_image_tau(75, "dit_edit_step0", 1.0, 0.1),
+            scored_image_tau(true, "dit_edit_step0", 1.0, 0.1),
             fp16_dit_bound()
         );
-        assert_eq!(scored_image_tau(75, "euler_step0", 1.0, 0.1), (1.0, 0.1));
+        assert_eq!(scored_image_tau(true, "euler_step0", 1.0, 0.1), (1.0, 0.1));
         assert_eq!(
-            scored_image_tau(75, "euler_edit_step0", 2.0, 0.2),
+            scored_image_tau(true, "euler_edit_step0", 2.0, 0.2),
             (2.0, 0.2)
         );
-        assert_eq!(scored_image_tau(89, "dit_step0", 1.0, 0.1), (1.0, 0.1));
-        assert_eq!(scored_image_tau(80, "dit_step5", 3.0, 0.3), (3.0, 0.3));
+        assert_eq!(scored_image_tau(false, "dit_step0", 1.0, 0.1), (1.0, 0.1));
+        assert_eq!(scored_image_tau(false, "dit_step5", 3.0, 0.3), (3.0, 0.3));
     }
 
     #[test]
@@ -14462,11 +14493,8 @@ mod tests {
         let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
             .minimax_h3_image_manifest(&image_spec)?;
         let device = Device::new(0)?;
-        #[cfg(feature = "cuda")]
-        let sm = cubin::capability(&device.ctx)?;
-        #[cfg(not(feature = "cuda"))]
-        let sm = 80u32;
-        println!("H3_IMAGE_DIT sm={sm}");
+        let fp16 = device.info.arch.fp16_stored_half();
+        println!("H3_IMAGE_DIT arch={:?} fp16={fp16}", device.info.arch);
         let ops = Ops::new(&device.ctx)?;
         device.finish_upload()?;
         let s = &device.stream;
@@ -14503,7 +14531,7 @@ mod tests {
                     crate::prefill::placement_visits(schedule.timesteps.len(), 1)?,
                 ),
             )?;
-            let kernels = BlockKernels::new(&device.ctx)?;
+            let kernels = BlockKernels::new(&device)?;
             let context = BlockContext {
                 s,
                 blas: &blas,
@@ -14518,7 +14546,7 @@ mod tests {
             let rows_d = s.clone_htod(&t2i_rows)?;
             let text_d = upload_runtime_half(
                 s,
-                fp16_stored_half(&device.info.arch),
+                device.info.arch.fp16_stored_half(),
                 "image_text",
                 &t2i_text,
             )?;
@@ -14577,7 +14605,7 @@ mod tests {
                     .context(name)?;
                 let (max_abs, rmse) = image_max_rmse(candidate, reference)?;
                 let (tau_max, tau_rmse) = scored_image_tau(
-                    sm,
+                    fp16,
                     name,
                     image_dit_tau(cell.cross_max_abs),
                     image_dit_tau(cell.cross_rmse),
@@ -14605,14 +14633,14 @@ mod tests {
             );
             dit.rotary = upload_runtime_half(
                 s,
-                fp16_stored_half(&device.info.arch),
+                device.info.arch.fp16_stored_half(),
                 "image_rotary",
                 &shifted_table,
             )?;
             let shift = velocity(&context, 0, &text_d, &mut dit)?;
             dit.rotary = upload_runtime_half(
                 s,
-                fp16_stored_half(&device.info.arch),
+                device.info.arch.fp16_stored_half(),
                 "image_rotary",
                 &transposed_table,
             )?;
@@ -14723,7 +14751,7 @@ mod tests {
                     crate::prefill::placement_visits(schedule.timesteps.len(), 1)?,
                 ),
             )?;
-            let kernels = BlockKernels::new(&device.ctx)?;
+            let kernels = BlockKernels::new(&device)?;
             let context = BlockContext {
                 s,
                 blas: &blas,
@@ -14738,7 +14766,7 @@ mod tests {
             let rows_d = s.clone_htod(&edit_rows)?;
             let text_d = upload_runtime_half(
                 s,
-                fp16_stored_half(&device.info.arch),
+                device.info.arch.fp16_stored_half(),
                 "image_text",
                 &edit_text,
             )?;
@@ -14778,7 +14806,7 @@ mod tests {
                     .context(name)?;
                 let (max_abs, rmse) = image_max_rmse(candidate, reference)?;
                 let (tau_max, tau_rmse) = scored_image_tau(
-                    sm,
+                    fp16,
                     name,
                     image_dit_tau(cell.cross_max_abs),
                     image_dit_tau(cell.cross_rmse),
@@ -14799,7 +14827,7 @@ mod tests {
             .iter()
             .find(|cell| cell.name == "dit_step0")
             .context("dit_step0")?;
-        let (bar_max, bar_rmse, shift_gt, caught) = if sm < 80 {
+        let (bar_max, bar_rmse, shift_gt, caught) = if fp16 {
             let (bar_max, bar_rmse) = fp16_dit_bound();
             (
                 bar_max,
@@ -14826,7 +14854,7 @@ mod tests {
         ensure!(
             caught,
             "rope-transpose control stayed within {}",
-            if sm < 80 { "the FP16 floor" } else { "3x tau" }
+            if fp16 { "the FP16 floor" } else { "3x tau" }
         );
         ensure!(sample_changed, "image sample left the input unchanged");
         ensure!(
@@ -14999,11 +15027,8 @@ mod tests {
             + sizing.staging
             + sizing.transient;
         let device = Device::new(0)?;
-        #[cfg(feature = "cuda")]
-        let sm = cubin::capability(&device.ctx)?;
-        #[cfg(not(feature = "cuda"))]
-        let sm = 80u32;
-        println!("H3_IMAGE_4096 sm={sm}");
+        let fp16 = device.info.arch.fp16_stored_half();
+        println!("H3_IMAGE_4096 arch={:?} fp16={fp16}", device.info.arch);
         let ops = Ops::new(&device.ctx)?;
         device.finish_upload()?;
         let s = &device.stream;
@@ -15018,117 +15043,22 @@ mod tests {
         )?;
         let table = AdalnTable::build(&device, &mut blas, &dir, &manifest, &spec, &row_plan)?;
         let visits = crate::prefill::placement_visits(schedule.timesteps.len(), 1)?;
-        let mut dit = ImageDit::new(
-            &device,
-            &mut blas,
-            (&spec, &image_spec),
-            &layout,
-            &dir,
-            &manifest,
-            (Placement::Derived, visits),
-        )?;
-        let kernels = BlockKernels::new(&device.ctx)?;
-        let context = BlockContext {
-            s,
-            blas: &blas,
-            kernels: &kernels,
-            spec: &spec,
-            lora_scale: 1.0,
-        };
-        {
-            let facts = dit.placement;
-            let dense = dit
-                .tier
-                .as_ref()
-                .map(|tier| &tier.dense)
-                .context("4096 placement kept every block resident")?;
-            ensure!(
-                facts.largest_bytes == sizing.largest && facts.owned_bytes == owned,
-                "placement facts differ from the image block sizes"
-            );
-            ensure!(
-                facts.host_available_bytes.is_some() && dense.plan.slot_bytes > 0,
-                "4096 placement kept every block resident"
-            );
-            let slot_count = dense
-                .plan
-                .slots
-                .iter()
-                .flatten()
-                .copied()
-                .max()
-                .map(|index| index + 1)
-                .context("4096 placement kept every block resident")?;
-            let (plan, again) = super::plan_dense_layers(
-                (
-                    &sizing.layers,
-                    &sizing.source_layers,
-                    sizing.largest,
-                    owned,
-                    0,
-                ),
-                Placement::Derived,
-                (
-                    facts.free_bytes,
-                    facts.total_bytes,
-                    facts.host_available_bytes,
-                ),
-                slot_count,
-                visits,
-            )?;
-            let resident = plan.slots.iter().filter(|slot| slot.is_none()).count();
-            let host = plan.host.iter().filter(|flag| **flag).count();
-            let disk = plan
-                .slots
-                .iter()
-                .zip(&plan.host)
-                .filter(|(slot, flag)| slot.is_some() && !**flag)
-                .count();
-            let streamed = sizing
-                .source_layers
-                .iter()
-                .zip(&plan.slots)
-                .filter(|(_, slot)| slot.is_some())
-                .map(|(bytes, _)| *bytes)
-                .sum::<usize>();
-            let host_available = facts
-                .host_available_bytes
-                .context("4096 placement kept every block resident")?;
-            println!(
-                "H3_IMAGE_4096_PLACEMENT resident={resident} host={host} disk={disk} free_bytes={} total_bytes={} device_budget={} host_budget={} slot_bytes={} host_available_bytes={host_available}",
-                facts.free_bytes,
-                facts.total_bytes,
-                facts.device_budget,
-                facts.host_budget,
-                plan.slot_bytes
-            );
-            ensure!(
-                again.device_budget == facts.device_budget
-                    && again.host_budget == facts.host_budget
-                    && plan.slots == dense.plan.slots
-                    && plan.host == dense.plan.host
-                    && plan.slot_bytes == dense.plan.slot_bytes
-                    && plan.resident_bytes == dense.plan.resident_bytes
-                    && plan.host_bytes == dense.plan.host_bytes
-                    && plan.disk_bytes == dense.plan.disk_bytes,
-                "derived placement disagrees with the live free bytes"
-            );
-            if facts.host_budget >= streamed {
-                ensure!(plan.disk_bytes == 0, "host budget holds the spill");
-            }
-        }
         let counts = (
             u32::try_from(row_plan.pairs.len())?,
             u32::try_from(row_plan.timesteps.len())?,
         );
         let rows_d = s.clone_htod(&rows_host)?;
         let text_d =
-            upload_runtime_half(s, fp16_stored_half(&device.info.arch), "image_text", &text)?;
+            upload_runtime_half(s, device.info.arch.fp16_stored_half(), "image_text", &text)?;
         let mut defects = Vec::new();
-        let mut score = |name: &'static str, candidate: &[f32], reference: &[f32]| -> Result<()> {
+        let mut score = |mode: Placement,
+                         name: &'static str,
+                         candidate: &[f32],
+                         reference: &[f32]|
+         -> Result<()> {
             ensure!(
                 candidate.len() == image_rows * width && candidate.iter().all(|v| v.is_finite()),
-                "{name} length {} or a non-finite value",
+                "{mode:?} {name} length {} or a non-finite value",
                 candidate.len()
             );
             let cell = IMAGE_DIT_4096
@@ -15136,70 +15066,192 @@ mod tests {
                 .find(|cell| cell.name == name)
                 .context(name)?;
             let (max_abs, rmse) = image_max_rmse(candidate, reference)?;
-            let (tau_max, tau_rmse) = scored_image_tau(sm, name, cell.tau_max, cell.tau_rmse);
+            let (tau_max, tau_rmse) = scored_image_tau(fp16, name, cell.tau_max, cell.tau_rmse);
             let ok = max_abs <= tau_max && rmse <= tau_rmse;
             println!(
-                "H3_IMAGE_4096 {name} max_abs={max_abs:.8e} rmse={rmse:.8e} tau_max={tau_max:.8e} tau_rmse={tau_rmse:.8e} within={ok}"
+                "H3_IMAGE_4096 mode={mode:?} {name} max_abs={max_abs:.8e} rmse={rmse:.8e} tau_max={tau_max:.8e} tau_rmse={tau_rmse:.8e} within={ok}"
             );
             if !ok {
                 defects.push(name);
             }
             Ok(())
         };
-        let velocity = |head: usize, dit: &mut ImageDit| -> Result<Vec<f32>> {
-            let row_pairs = s.clone_htod(&row_plan.row_pairs[head])?;
-            let row_timesteps = s.clone_htod(&row_plan.row_timesteps[head])?;
-            dit.step(
-                &context,
-                &table,
-                counts,
-                head,
-                &ImageStepInputs {
-                    image: &rows_d,
-                    text: &text_d,
-                    row_pairs: &row_pairs,
-                    row_timesteps: &row_timesteps,
-                },
+        let mut control_metrics = None;
+        for placement in [Placement::Derived, Placement::Streamed] {
+            let mut dit = ImageDit::new(
+                &device,
+                &mut blas,
+                (&spec, &image_spec),
+                &layout,
+                &dir,
+                &manifest,
+                (placement, visits),
             )?;
-            s.clone_dtoh(&dit.velocity)
-                .context("copy DiT velocity to host")
-        };
-        let step0 = velocity(0, &mut dit)?;
-        score("dit_step0", &step0, &step0_ref)?;
-        let euler_rows = s.clone_htod(&rows_host)?;
-        dit.euler(s, &euler_rows, &schedule, 0)?;
-        let euler = s.clone_dtoh(&euler_rows)?;
-        score("euler_step0", &euler, &euler_ref)?;
-        let step5 = velocity(5, &mut dit)?;
-        score("dit_step5", &step5, &step5_ref)?;
-        let transposed = rotary_rows(spec.rope_freq_dim, spec.rope_theta, &transposed_ids);
-        ensure!(
-            transposed.len() == dit.rotary.len(),
-            "transposed rotary length {} {}",
-            transposed.len(),
-            dit.rotary.len()
-        );
-        dit.rotary = upload_runtime_half(
-            s,
-            fp16_stored_half(&device.info.arch),
-            "image_rotary",
-            &transposed,
-        )?;
-        let control = velocity(0, &mut dit)?;
-        ensure!(
-            control.len() == image_rows * width && control.iter().all(|v| v.is_finite()),
-            "rope_transpose length {} or a non-finite value",
-            control.len()
-        );
-        let (control_max, control_rmse) = image_max_rmse(&control, &step0_ref)?;
-        let (versus_max, versus_rmse) = image_max_rmse(&control, &step0)?;
+            let kernels = BlockKernels::new(&device)?;
+            let context = BlockContext {
+                s,
+                blas: &blas,
+                kernels: &kernels,
+                spec: &spec,
+                lora_scale: 1.0,
+            };
+            {
+                let facts = dit.placement;
+                ensure!(
+                    facts.largest_bytes == sizing.largest && facts.owned_bytes == owned,
+                    "placement facts differ from the image block sizes"
+                );
+                if placement == Placement::Streamed || dit.tier.is_some() {
+                    let dense = dit
+                        .tier
+                        .as_ref()
+                        .map(|tier| &tier.dense)
+                        .context("4096 placement kept every block resident")?;
+                    ensure!(
+                        facts.host_available_bytes.is_some() && dense.plan.slot_bytes > 0,
+                        "4096 placement kept every block resident"
+                    );
+                    let slot_count = dense
+                        .plan
+                        .slots
+                        .iter()
+                        .flatten()
+                        .copied()
+                        .max()
+                        .map(|index| index + 1)
+                        .context("4096 placement kept every block resident")?;
+                    let (plan, again) = super::plan_dense_layers(
+                        (
+                            &sizing.layers,
+                            &sizing.source_layers,
+                            sizing.largest,
+                            owned,
+                            0,
+                        ),
+                        placement,
+                        (
+                            facts.free_bytes,
+                            facts.total_bytes,
+                            facts.host_available_bytes,
+                        ),
+                        slot_count,
+                        visits,
+                    )?;
+                    let resident = plan.slots.iter().filter(|slot| slot.is_none()).count();
+                    let host = plan.host.iter().filter(|flag| **flag).count();
+                    let disk = plan
+                        .slots
+                        .iter()
+                        .zip(&plan.host)
+                        .filter(|(slot, flag)| slot.is_some() && !**flag)
+                        .count();
+                    let streamed = sizing
+                        .source_layers
+                        .iter()
+                        .zip(&plan.slots)
+                        .filter(|(_, slot)| slot.is_some())
+                        .map(|(bytes, _)| *bytes)
+                        .sum::<usize>();
+                    let host_available = facts
+                        .host_available_bytes
+                        .context("4096 placement kept every block resident")?;
+                    println!(
+                        "H3_IMAGE_4096_PLACEMENT mode={placement:?} resident={resident} host={host} disk={disk} free_bytes={} total_bytes={} device_budget={} host_budget={} slot_bytes={} host_available_bytes={host_available}",
+                        facts.free_bytes,
+                        facts.total_bytes,
+                        facts.device_budget,
+                        facts.host_budget,
+                        plan.slot_bytes
+                    );
+                    ensure!(
+                        again.device_budget == facts.device_budget
+                            && again.host_budget == facts.host_budget
+                            && plan.slots == dense.plan.slots
+                            && plan.host == dense.plan.host
+                            && plan.slot_bytes == dense.plan.slot_bytes
+                            && plan.resident_bytes == dense.plan.resident_bytes
+                            && plan.host_bytes == dense.plan.host_bytes
+                            && plan.disk_bytes == dense.plan.disk_bytes,
+                        "derived placement disagrees with the live free bytes"
+                    );
+                    if facts.host_budget >= streamed {
+                        ensure!(plan.disk_bytes == 0, "host budget holds the spill");
+                    }
+                } else {
+                    println!(
+                        "H3_IMAGE_4096_PLACEMENT mode={placement:?} resident={} host=0 disk=0 free_bytes={} total_bytes={} device_budget={} host_budget={} slot_bytes=0 host_available_bytes={}",
+                        spec.layers,
+                        facts.free_bytes,
+                        facts.total_bytes,
+                        facts.device_budget,
+                        facts.host_budget,
+                        facts.host_available_bytes.unwrap_or(0)
+                    );
+                }
+            }
+            let velocity = |head: usize, dit: &mut ImageDit| -> Result<Vec<f32>> {
+                let row_pairs = s.clone_htod(&row_plan.row_pairs[head])?;
+                let row_timesteps = s.clone_htod(&row_plan.row_timesteps[head])?;
+                dit.step(
+                    &context,
+                    &table,
+                    counts,
+                    head,
+                    &ImageStepInputs {
+                        image: &rows_d,
+                        text: &text_d,
+                        row_pairs: &row_pairs,
+                        row_timesteps: &row_timesteps,
+                    },
+                )?;
+                s.clone_dtoh(&dit.velocity)
+                    .context("copy DiT velocity to host")
+            };
+            let step0 = velocity(0, &mut dit)?;
+            score(placement, "dit_step0", &step0, &step0_ref)?;
+            let euler_rows = s.clone_htod(&rows_host)?;
+            dit.euler(s, &euler_rows, &schedule, 0)?;
+            let euler = s.clone_dtoh(&euler_rows)?;
+            score(placement, "euler_step0", &euler, &euler_ref)?;
+            let step5 = velocity(5, &mut dit)?;
+            score(placement, "dit_step5", &step5, &step5_ref)?;
+            if placement == Placement::Derived {
+                let transposed = rotary_rows(spec.rope_freq_dim, spec.rope_theta, &transposed_ids);
+                ensure!(
+                    transposed.len() == dit.rotary.len(),
+                    "transposed rotary length {} {}",
+                    transposed.len(),
+                    dit.rotary.len()
+                );
+                dit.rotary = upload_runtime_half(
+                    s,
+                    device.info.arch.fp16_stored_half(),
+                    "image_rotary",
+                    &transposed,
+                )?;
+                let control = velocity(0, &mut dit)?;
+                ensure!(
+                    control.len() == image_rows * width && control.iter().all(|v| v.is_finite()),
+                    "rope_transpose length {} or a non-finite value",
+                    control.len()
+                );
+                control_metrics = Some((
+                    image_max_rmse(&control, &step0_ref)?,
+                    image_max_rmse(&control, &step0)?,
+                ));
+            }
+        }
         drop(score);
+        drop(table);
+        drop(blas);
         fs::remove_dir_all(&runtime)?;
+        let ((control_max, control_rmse), (versus_max, versus_rmse)) =
+            control_metrics.context("rope_transpose control missing")?;
         let step0_cell = IMAGE_DIT_4096
             .iter()
             .find(|cell| cell.name == "dit_step0")
             .context("dit_step0")?;
-        let (bar_max, bar_rmse, caught) = if sm < 80 {
+        let (bar_max, bar_rmse, caught) = if fp16 {
             let (bar_max, bar_rmse) = fp16_dit_bound();
             (
                 bar_max,
@@ -15221,7 +15273,7 @@ mod tests {
         ensure!(
             caught,
             "rope-transpose control stayed within {}",
-            if sm < 80 { "the FP16 floor" } else { "3x tau" }
+            if fp16 { "the FP16 floor" } else { "3x tau" }
         );
         ensure!(
             defects.is_empty(),
@@ -15273,10 +15325,7 @@ mod tests {
         let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
             .minimax_h3_image_manifest(&image_spec)?;
         let device = Device::new(0)?;
-        #[cfg(feature = "cuda")]
-        let sm = cubin::capability(&device.ctx)?;
-        #[cfg(not(feature = "cuda"))]
-        let sm = 80u32;
+        let fp16 = device.info.arch.fp16_stored_half();
         let ops = Ops::new(&device.ctx)?;
         device.finish_upload()?;
         let s = &device.stream;
@@ -15328,8 +15377,12 @@ mod tests {
             .and_then(|bytes| bytes.checked_mul(steps))
             .context("2048 re-read bytes overflow")?;
         println!(
-            "H3_IMAGE_2048_PLACEMENT sm={sm} resident={resident} resident_bytes={} host_pins={host_pins} disk_layers={disk_layers} slot_bytes={} slot_count={slot_n} host_bytes={} disk_bytes={} host_budget={host_budget} visits={visits} reread_bytes={reread}",
-            plan.resident_bytes, plan.slot_bytes, plan.host_bytes, plan.disk_bytes
+            "H3_IMAGE_2048_PLACEMENT arch={:?} fp16={fp16} resident={resident} resident_bytes={} host_pins={host_pins} disk_layers={disk_layers} slot_bytes={} slot_count={slot_n} host_bytes={} disk_bytes={} host_budget={host_budget} visits={visits} reread_bytes={reread}",
+            device.info.arch,
+            plan.resident_bytes,
+            plan.slot_bytes,
+            plan.host_bytes,
+            plan.disk_bytes
         );
         ensure!(
             plan.slot_bytes == 770_703_360
@@ -15341,7 +15394,7 @@ mod tests {
             plan.slot_bytes,
             plan.resident_bytes
         );
-        let kernels = BlockKernels::new(&device.ctx)?;
+        let kernels = BlockKernels::new(&device)?;
         let context = BlockContext {
             s,
             blas: &blas,
@@ -15355,7 +15408,7 @@ mod tests {
         );
         let rows_d = s.clone_htod(&rows_host)?;
         let text_d =
-            upload_runtime_half(s, fp16_stored_half(&device.info.arch), "image_text", &text)?;
+            upload_runtime_half(s, device.info.arch.fp16_stored_half(), "image_text", &text)?;
         let row_pairs = s.clone_htod(&row_plan.row_pairs[0])?;
         let row_timesteps = s.clone_htod(&row_plan.row_timesteps[0])?;
         dit.step(
@@ -15378,7 +15431,10 @@ mod tests {
             "2048 velocity length {} or a non-finite value",
             velocity.len()
         );
-        println!("H3_IMAGE_2048_ADMISSION finite=true rows={image_rows} width={width} sm={sm}");
+        println!(
+            "H3_IMAGE_2048_ADMISSION finite=true rows={image_rows} width={width} arch={:?} fp16={fp16}",
+            device.info.arch
+        );
         Ok(())
     }
 
@@ -15399,11 +15455,25 @@ mod tests {
     /// t2i `uncross_*` is the isolated arm-A versus MATH pair. It is 0 when a cell has no uncross figure.
     /// `gate_max` is false where the max_abs tau exceeds rms(arm A).
     const IMAGE_E2E: &[ImageE2eCell] = &[
+        #[cfg(not(feature = "rocm"))]
         ImageE2eCell {
             name: "t2i_conditioner",
             tau_max: 4.0,
             tau_rmse: 0.11145047448683923,
             tau_rel: 0.0013261567336856647,
+            gate_max: true,
+            gate_rmse: true,
+            gate_rel: true,
+            uncross_max: 0.0,
+            uncross_rmse: 0.0,
+        },
+        // 2026-11-21 ROCm: 2 * ROCm PyTorch BF16 (hipBLASLt) vs arm-A at `[0,0,731]` (`15680` vs `15744`, 1 BF16 ULP = 64.0).
+        #[cfg(feature = "rocm")]
+        ImageE2eCell {
+            name: "t2i_conditioner",
+            tau_max: 128.0,
+            tau_rmse: 0.72555,
+            tau_rel: 0.008634,
             gate_max: true,
             gate_rmse: true,
             gate_rel: true,
@@ -15931,7 +16001,7 @@ mod tests {
         };
         let fp16 = {
             let device = Device::new(0)?;
-            fp16_stored_half(&device.info.arch)
+            device.info.arch.fp16_stored_half()
         };
         let mut text = job.text.to_vec();
         if fp16 {
@@ -16262,7 +16332,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_H3_IMAGE"]
     fn resident_image_request_two_matches_fresh_and_bounds_allocations() -> Result<()> {
@@ -16324,9 +16393,6 @@ mod tests {
                 );
                 drop(first);
                 let ctx = crate::backend::cuda::Device::new(0)?.ctx;
-                use cudarc::driver::sys::{self, CUmemPool_attribute};
-                let mut pool = std::ptr::null_mut();
-                unsafe { sys::cuDeviceGetDefaultMemPool(&mut pool, ctx.cu_device()).result()? };
                 let media_control = edit.then(|| {
                     let mut alternate = make_request(true);
                     alternate.references = make_request(false).references;
@@ -16335,15 +16401,7 @@ mod tests {
                 let mut boundary_bytes = None;
                 let mut latent_bits_exact = true;
                 for request_number in 2..=8 {
-                    let mut peak = 0u64;
-                    unsafe {
-                        sys::cuMemPoolSetAttribute(
-                            pool,
-                            CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
-                            (&mut peak as *mut u64).cast(),
-                        )
-                        .result()?;
-                    }
+                    crate::backend::cuda::reset_default_mem_pool_peak(&ctx)?;
                     let different_media = media_control.as_ref().filter(|_| request_number == 3);
                     let got = resident.render(different_media.unwrap_or(&b))?;
                     if different_media.is_some() {
@@ -16365,21 +16423,7 @@ mod tests {
                     drop(got);
                     ctx.synchronize()?;
                     let (free, total) = ctx.mem_get_info()?;
-                    let mut used = 0u64;
-                    unsafe {
-                        sys::cuMemPoolGetAttribute(
-                            pool,
-                            CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
-                            (&mut used as *mut u64).cast(),
-                        )
-                        .result()?;
-                        sys::cuMemPoolGetAttribute(
-                            pool,
-                            CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
-                            (&mut peak as *mut u64).cast(),
-                        )
-                        .result()?;
-                    }
+                    let (used, peak) = crate::backend::cuda::default_mem_pool_peak(&ctx)?;
                     ensure!(
                         free >= total / 16 && u64::try_from(total - total / 16)? >= peak,
                         "resident request {request_number} exhausted the device reserve: free={free}, pool_peak={peak}, total={total}"
@@ -16990,7 +17034,7 @@ mod tests {
             &runtime,
             Rc::new(Closure::new(true, "HyperFlow block cells".into())),
         )?;
-        let mut source = Source::new(&model, &manifest);
+        let mut source = Source::new(&model, &manifest, device.info.arch.fp16_stored_half());
         source.pack_vectors(s, &spec)?;
         let current = time_embedder(&mut source, s, &spec, "time_embedder")?;
         let endpoint = time_embedder(&mut source, s, &spec, "endpoint_time_embedder")?;
@@ -17043,7 +17087,7 @@ mod tests {
         );
         let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
             .with_full_single_probability()?;
-        let kernels = BlockKernels::new(&device.ctx)?;
+        let kernels = BlockKernels::new(&device)?;
         let mut work = BlockWork::new(s, &spec, 0, rows)?;
         work.plan_rotation(&device, &spec)?;
         work.prepare::<false>(&blas, &spec)?;
@@ -17059,10 +17103,10 @@ mod tests {
             vector(&bias, s)?,
             mode,
         )?;
-        let x = upload_runtime_half(s, fp16_stored_half(&device.info.arch), "adaln", &x_host)?;
+        let x = upload_runtime_half(s, device.info.arch.fp16_stored_half(), "adaln", &x_host)?;
         let rotary = upload_runtime_half(
             s,
-            fp16_stored_half(&device.info.arch),
+            device.info.arch.fp16_stored_half(),
             "rotary",
             &rotary_host,
         )?;
@@ -17100,7 +17144,7 @@ mod tests {
             let mut launch = |index: &CudaSlice<u32>| -> Result<Vec<f64>> {
                 let mut row = upload_runtime_half(
                     s,
-                    fp16_stored_half(&device.info.arch),
+                    device.info.arch.fp16_stored_half(),
                     "block_hidden",
                     &hidden,
                 )?;
@@ -17154,7 +17198,7 @@ mod tests {
         };
         let mut row = upload_runtime_half(
             s,
-            fp16_stored_half(&device.info.arch),
+            device.info.arch.fp16_stored_half(),
             "block_hidden",
             &hidden,
         )?;
@@ -17221,7 +17265,7 @@ mod tests {
         work.prepare::<false>(&blas, &spec)?;
         let ragged_rotary = upload_runtime_half(
             s,
-            fp16_stored_half(&device.info.arch),
+            device.info.arch.fp16_stored_half(),
             "rotary",
             &ragged_rotary_host,
         )?;
@@ -17259,7 +17303,7 @@ mod tests {
             let mut launch = |index: &CudaSlice<u32>| -> Result<Vec<f64>> {
                 let mut row = upload_runtime_half(
                     s,
-                    fp16_stored_half(&device.info.arch),
+                    device.info.arch.fp16_stored_half(),
                     "block_hidden",
                     &ragged_hidden,
                 )?;
@@ -18145,7 +18189,7 @@ mod tests {
             &mut blas,
             &spec,
             (0, &layout),
-            Source::new(&model, &manifest),
+            Source::new(&model, &manifest, device.info.arch.fp16_stored_half()),
             None,
             (
                 Placement::Derived,
@@ -18159,7 +18203,7 @@ mod tests {
                 .is_some_and(|s| s.convrot.is_some() == spec.int8_convrot.is_some()),
             "convrot scratch allocation disagrees with quantization presence"
         );
-        let kernels = BlockKernels::new(&device.ctx)?;
+        let kernels = BlockKernels::new(&device)?;
         let context = BlockContext {
             s,
             blas: &blas,
@@ -18186,7 +18230,7 @@ mod tests {
         let generated_elems = STEP_GENERATED * STEP_VIDEO_WIDTH;
         let text = upload_runtime_half(
             s,
-            fp16_stored_half(&device.info.arch),
+            device.info.arch.fp16_stored_half(),
             "video_text",
             &text_host,
         )?;
@@ -18391,7 +18435,7 @@ mod tests {
             &runtime,
             Rc::new(Closure::new(true, "HyperFlow low-rank over-read".into())),
         )?;
-        let mut source = Source::new(&model, &manifest);
+        let mut source = Source::new(&model, &manifest, device.info.arch.fp16_stored_half());
         source.pack_vectors(s, &spec)?;
         let weights = BlockWeights::stored(s, &spec, "transformer_blocks.2", &mut source, None)?;
         let check = |linear: &BlockLinear, rank: usize| -> Result<()> {
@@ -18415,12 +18459,12 @@ mod tests {
         let rows = 20usize;
         let mut work = BlockWork::new(s, &spec, 0, rows)?;
         work.prepare::<false>(&blas, &spec)?;
-        let kernels = BlockKernels::new(&device.ctx)?;
+        let kernels = BlockKernels::new(&device)?;
         let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
             .with_full_single_probability()?;
         let hidden = upload_runtime_half(
             s,
-            fp16_stored_half(&device.info.arch),
+            device.info.arch.fp16_stored_half(),
             "block_hidden",
             &vec![bf16::from_f32(1.0); rows * spec.hidden],
         )?;

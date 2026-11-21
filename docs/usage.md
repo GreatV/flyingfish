@@ -212,7 +212,7 @@ Sampling uses the plain `[S0]` prompt and the checkpoint's `generation_config.js
 
 ## Media generation
 
-These commands use CUDA. Default stderr contains progress and errors only, with timing fields hidden unless `--verbose` is enabled. `--verbose` prints placement, Lt and decode-plan diagnostics.
+`video` and `music` use CUDA; `image` uses CUDA or ROCm. Default stderr contains progress and errors only, with timing fields hidden unless `--verbose` is enabled. `--verbose` prints placement, Lt and decode-plan diagnostics.
 
 ### MiniMax-H3 image-to-video with audio
 

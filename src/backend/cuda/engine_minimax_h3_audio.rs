@@ -194,7 +194,7 @@ impl AudioDecoder {
         };
         let mut load = Loader {
             s,
-            source: Source::new(audio_dir, manifest),
+            source: Source::new(audio_dir, manifest, d.info.arch.fp16_stored_half()),
             fold: &kernels.fold,
             bytes: 0,
         };
