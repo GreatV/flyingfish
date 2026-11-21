@@ -153,7 +153,7 @@ fn condition_prompt(
     let manifest = MappedCheckpoint::open_component(&encoder, "model")?
         .minimax_h3_conditioner_manifest(&spec, TEXT_ENCODER_LAYER)?;
     let hidden = spec.hidden as usize;
-    let fp16 = cubin::capability(&device.ctx)? < 80;
+    let fp16 = super::fp16_stored_half(&device.info.arch);
     let table = conditioner_table(&encoder, &manifest, prompt, image_token, hidden, fp16)?;
     let runs = image_runs(&prompt.tokens, image_token);
     ensure!(
@@ -1398,7 +1398,7 @@ impl ConditionerStage {
             runs.is_empty() == self.vision.is_none(),
             "resident vision input changed"
         );
-        let fp16 = cubin::capability(&device.ctx)? < 80;
+        let fp16 = super::fp16_stored_half(&device.info.arch);
         let table = conditioner_table(
             &self.dir,
             &self.manifest,
