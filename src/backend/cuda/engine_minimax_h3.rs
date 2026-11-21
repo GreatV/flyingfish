@@ -1116,7 +1116,8 @@ impl AdalnTable {
     /// Kept blocks: `[6 * hidden * tags, time_dim]` projection of the plan embedding over the plan's addressed
     /// modality tags (full 3-tag tables read every block), bias before output rounding, keeping the addressed
     /// `(timestep, tag)` slices. HyperFlow's embedding is SiLU of `mix_temb` on the two f32
-    /// time embedders, rounded to BF16. A dropped block's modulation rows stay zero.
+    /// time embedders, rounded to BF16. When the Lt operand is FP16, the upload stores that
+    /// encoding. A dropped block's modulation rows stay zero.
     pub(crate) fn build(
         d: &Device,
         blas: &mut Blas,
@@ -1184,7 +1185,7 @@ impl AdalnTable {
         } else {
             adaln_input(spec, &time, &plan.timesteps)
         };
-        let x = s.clone_htod(&x_host)?;
+        let x = upload_runtime_half(s, fp16_stored_half(&d.info.arch), "adaln", &x_host)?;
         let tags = adaln_tags(&plan.pairs);
         let compact = width * tags.len();
         if crate::backend::diagnostics_enabled() {
@@ -16918,7 +16919,7 @@ mod tests {
             vector(&bias, s)?,
             mode,
         )?;
-        let x = s.clone_htod(&x_host)?;
+        let x = upload_runtime_half(s, fp16_stored_half(&device.info.arch), "adaln", &x_host)?;
         let rotary = upload_runtime_half(
             s,
             fp16_stored_half(&device.info.arch),

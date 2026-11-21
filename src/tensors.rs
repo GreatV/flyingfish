@@ -244,6 +244,13 @@ mod tests {
         assert_eq!(signed[1].to_bits(), 0x3800);
     }
 
+    #[test]
+    fn sm75_adaln_embedding_stores_fp16_one() {
+        let mut one = [half::bf16::from_bits(0x3f80)];
+        bf16_table_to_runtime_half("adaln", &mut one).unwrap();
+        assert_eq!(one[0].to_bits(), 0x3c00);
+    }
+
     fn word(sign: u16, exp: u16, man: u16) -> [u8; 2] {
         ((sign << 15) | (exp << 7) | man).to_le_bytes()
     }

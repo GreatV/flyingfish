@@ -3,6 +3,26 @@ use std::{env, fs, path::PathBuf, process::Command};
 #[path = "src/build_arch.rs"]
 mod build_arch;
 
+// A build list with no sm80+ architecture has no FA2 image.
+// ff_profile_push and ff_profile_pop are empty in that build.
+const FA2_ABSENT_CU: &str = r#"extern "C" {
+const char* ff_fa2_error() { return "FA2 is sm80+"; }
+
+int ff_fa2_run(void*, void*, void*, void*, void*, int, int, int, int, int, int, long long, int,
+               void*) {
+    return -1;
+}
+
+int ff_fa2_run_window(void*, void*, void*, void*, void*, int, int, int, int, int, int, long long,
+                      int, int, void*) {
+    return -1;
+}
+
+void ff_profile_push(const char*) {}
+void ff_profile_pop() {}
+}
+"#;
+
 fn compile_device(
     out: &std::path::Path,
     nvcc: &std::path::Path,
@@ -716,34 +736,41 @@ fn main() {
     println!("cargo:rerun-if-changed=third_party/flash-attention/src");
     println!("cargo:rerun-if-changed=third_party/cutlass/include");
     let archive = out.join("libff_fa2.a");
-    let mut command = Command::new(&nvcc);
-    command.env("TMPDIR", &temp).args([
-        "--lib",
-        "--threads=1",
-        "-O3",
-        "--std=c++17",
-        "--expt-relaxed-constexpr",
-        "--expt-extended-lambda",
-        "-Xcompiler=-fPIC",
-        "--use_fast_math",
-        "-DFLASHATTENTION_DISABLE_DROPOUT",
-        "-DFLASHATTENTION_DISABLE_ALIBI",
-        "-DFLASHATTENTION_DISABLE_UNEVEN_K",
-        "-DFLASHATTENTION_DISABLE_SOFTCAP",
-        "-Ithird_party/cutlass/include",
-    ]);
     let fa_archs: Vec<u32> = archs.iter().copied().filter(|sm| *sm >= 80).collect();
-    assert!(
-        !fa_archs.is_empty(),
-        "FA2 is sm80+; the build list has no sm80+ architecture"
-    );
-    for sm in &fa_archs {
+    let mut command = Command::new(&nvcc);
+    command.env("TMPDIR", &temp);
+    if fa_archs.is_empty() {
+        println!("cargo:warning=FA2 has no sm80+ architecture; calls return an error");
+        let stub = out.join("ff_fa2_absent.cu");
+        fs::write(&stub, FA2_ABSENT_CU).expect("cannot write the FA2 stub");
         command
-            .arg("--generate-code")
-            .arg(format!("arch=compute_{sm},code=sm_{sm}"));
+            .args(["--lib", "--threads=1", "-O3", "--std=c++17"])
+            .arg(&stub);
+    } else {
+        command.args([
+            "--lib",
+            "--threads=1",
+            "-O3",
+            "--std=c++17",
+            "--expt-relaxed-constexpr",
+            "--expt-extended-lambda",
+            "-Xcompiler=-fPIC",
+            "--use_fast_math",
+            "-DFLASHATTENTION_DISABLE_DROPOUT",
+            "-DFLASHATTENTION_DISABLE_ALIBI",
+            "-DFLASHATTENTION_DISABLE_UNEVEN_K",
+            "-DFLASHATTENTION_DISABLE_SOFTCAP",
+            "-Ithird_party/cutlass/include",
+        ]);
+        for sm in &fa_archs {
+            command
+                .arg("--generate-code")
+                .arg(format!("arch=compute_{sm},code=sm_{sm}"));
+        }
+        command.arg("third_party/flash-attention/adapter.cu");
     }
     let result = command
-        .args(["third_party/flash-attention/adapter.cu", "-o"])
+        .arg("-o")
         .arg(&archive)
         .output()
         .expect("cannot compile FA2");
