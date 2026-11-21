@@ -490,6 +490,10 @@ impl Drop for RouteLogits {
 
 type LinearPlans = RefCell<BTreeMap<(usize, usize, usize, u32, bool), Plan>>;
 
+fn biased_group_dtypes(half: sys::cudaDataType_t) -> (sys::cudaDataType_t, sys::cudaDataType_t) {
+    (half, half)
+}
+
 fn cuda_lt_dtype(operand: crate::backend::setup::LtOperand) -> sys::cudaDataType_t {
     use crate::backend::setup::LtOperand;
     match operand {
@@ -2188,14 +2192,14 @@ impl Blas {
             plans.entry((shape, bias.ptr, mode))
         {
             let workspace = self.workspace.borrow().len();
-            let dtype = sys::cudaDataType_t::CUDA_R_16BF;
+            let (ab, c) = biased_group_dtypes(self.half_dtype);
             let plan = Plan::build(
                 self.handle,
                 (rows, shape.output, shape.input, shape.input),
                 workspace,
                 Some(bias.ptr),
-                dtype,
-                dtype,
+                ab,
+                c,
                 PlanAlgo::Fixed(algo),
             )?;
             ensure!(
@@ -2521,6 +2525,14 @@ mod tests {
             cuda_lt_dtype(lt_compute_operand()),
             sys::cudaDataType_t::CUDA_R_32F
         );
+    }
+
+    #[test]
+    fn grouped_biased_plan_keeps_the_fp16_operand() {
+        let fp16 = sys::cudaDataType_t::CUDA_R_16F;
+        assert_eq!(biased_group_dtypes(fp16), (fp16, fp16));
+        let bf16 = sys::cudaDataType_t::CUDA_R_16BF;
+        assert_eq!(biased_group_dtypes(bf16), (bf16, bf16));
     }
 
     #[test]

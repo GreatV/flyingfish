@@ -62,6 +62,27 @@ pub(super) fn open_blas(
     }
 }
 
+fn fp16_stored_half(arch: &crate::backend::setup::DeviceArchitecture) -> bool {
+    arch.published_bf16_lt() == crate::backend::setup::LtOperand::F16
+}
+
+fn upload_runtime_half(
+    stream: &Arc<CudaStream>,
+    fp16: bool,
+    name: &str,
+    table: &[bf16],
+) -> Result<CudaSlice<bf16>> {
+    let mut converted = Vec::new();
+    let bits = if fp16 {
+        converted.extend_from_slice(table);
+        crate::tensors::bf16_table_to_runtime_half(name, &mut converted)?;
+        converted.as_slice()
+    } else {
+        table
+    };
+    Ok(stream.clone_htod(bits)?)
+}
+
 fn equal_int8_bf16_rate(arch: &crate::backend::setup::DeviceArchitecture) -> bool {
     matches!(
         arch,
@@ -5426,7 +5447,12 @@ impl Dit {
         let scratch = s.alloc_zeros::<f32>(scratch_rows * h)?;
         let video = s.alloc_zeros::<f32>(generated * patch)?;
         let audio = s.alloc_zeros::<f32>(ranges.audio * spec.audio_in_channels)?;
-        let rotary = s.clone_htod(&crate::minimax_h3::rotary_table(spec, layout))?;
+        let rotary = upload_runtime_half(
+            s,
+            fp16_stored_half(&d.info.arch),
+            "rotary",
+            &crate::minimax_h3::rotary_table(spec, layout),
+        )?;
 
         let sizing = dense_sizing(base.manifest, spec.layers)?;
         let lora_bytes = if hyperflow {
@@ -6244,11 +6270,12 @@ impl ImageDit {
         let text = s.alloc_zeros::<bf16>(text_rows * h)?;
         let scratch = s.alloc_zeros::<f32>(image_rows * h)?;
         let velocity = s.alloc_zeros::<f32>(image_rows * row_width)?;
-        let rotary = s.clone_htod(&rotary_rows(
-            spec.rope_freq_dim,
-            spec.rope_theta,
-            &layout.position_ids,
-        ))?;
+        let rotary = upload_runtime_half(
+            s,
+            fp16_stored_half(&d.info.arch),
+            "image_rotary",
+            &rotary_rows(spec.rope_freq_dim, spec.rope_theta, &layout.position_ids),
+        )?;
         let sizing = dense_sizing(manifest, spec.layers)?;
         let owned =
             spec.layers * 2 * (2 * h + 2 * spec.head_dim) + sizing.staging + sizing.transient;
@@ -6843,6 +6870,7 @@ pub(crate) struct Conditioner {
     gate_up: CudaSlice<bf16>,
     gated: CudaSlice<bf16>,
     rope: CudaSlice<bf16>,
+    fp16_rope: bool,
 }
 
 impl Conditioner {
@@ -6990,6 +7018,7 @@ impl Conditioner {
             gate_up,
             gated,
             rope,
+            fp16_rope: fp16_stored_half(&d.info.arch),
         })
     }
 
@@ -7049,7 +7078,15 @@ impl Conditioner {
             self.layers.len()
         );
         s.memcpy_htod(input.embeds, &mut self.x.slice_mut(..rows * h))?;
-        s.memcpy_htod(input.rope, &mut self.rope.slice_mut(..rows * d))?;
+        let mut converted_rope = Vec::new();
+        let rope = if self.fp16_rope {
+            converted_rope.extend_from_slice(input.rope);
+            crate::tensors::bf16_table_to_runtime_half("conditioner_rope", &mut converted_rope)?;
+            converted_rope.as_slice()
+        } else {
+            input.rope
+        };
+        s.memcpy_htod(rope, &mut self.rope.slice_mut(..rows * d))?;
         let rows_i = i32::try_from(rows)?;
         let linear = |weight: Tensor<bf16, 2>,
                       x: &CudaSlice<bf16>,
@@ -10591,7 +10628,12 @@ mod tests {
                 "borrowed address/control capacity"
             );
             let receipt = blas.bound_plan_receipt()?;
-            let rotary = s.clone_htod(&crate::minimax_h3::rotary_table(&spec, &layout))?;
+            let rotary = upload_runtime_half(
+                s,
+                fp16_stored_half(&device.info.arch),
+                "rotary",
+                &crate::minimax_h3::rotary_table(&spec, &layout),
+            )?;
             let tables: Vec<_> = (0..2)
                 .map(|layer| -> Result<_> {
                     let view = adaln.tensor(&format!("block{layer}.step0"))?;
@@ -10907,7 +10949,12 @@ mod tests {
         )?;
         let mut work = BlockWork::new(s, &spec, r, rows)?;
         work.prepare::<true>(&blas, &spec)?;
-        let rotary = s.clone_htod(&rotary_host)?;
+        let rotary = upload_runtime_half(
+            s,
+            fp16_stored_half(&device.info.arch),
+            "rotary",
+            &rotary_host,
+        )?;
         let table = s.clone_htod(&table_host)?;
         let index = s.clone_htod(&index)?;
         let mut captured_norm_defects = 0;
@@ -11243,7 +11290,12 @@ mod tests {
         )?;
         let mut work = BlockWork::new(s, &spec, r, rows)?;
         work.prepare::<true>(&blas, &spec)?;
-        let rotary_device = s.clone_htod(&rotary_host)?;
+        let rotary_device = upload_runtime_half(
+            s,
+            fp16_stored_half(&device.info.arch),
+            "rotary",
+            &rotary_host,
+        )?;
         let table_device = s.clone_htod(&table_host)?;
         let index_device = s.clone_htod(&index_host)?;
         let modulation = Modulation {
@@ -14431,9 +14483,19 @@ mod tests {
                 transposed_table.len(),
                 dit.rotary.len()
             );
-            dit.rotary = s.clone_htod(&shifted_table)?;
+            dit.rotary = upload_runtime_half(
+                s,
+                fp16_stored_half(&device.info.arch),
+                "image_rotary",
+                &shifted_table,
+            )?;
             let shift = velocity(&context, 0, &text_d, &mut dit)?;
-            dit.rotary = s.clone_htod(&transposed_table)?;
+            dit.rotary = upload_runtime_half(
+                s,
+                fp16_stored_half(&device.info.arch),
+                "image_rotary",
+                &transposed_table,
+            )?;
             let control = velocity(&context, 0, &text_d, &mut dit)?;
             let (shift_max, shift_rmse) = image_max_rmse(&shift, &step0_ref)?;
             let (shift_vs_max, shift_vs_rmse) = image_max_rmse(&shift, &step0)?;
@@ -14988,7 +15050,12 @@ mod tests {
             transposed.len(),
             dit.rotary.len()
         );
-        dit.rotary = s.clone_htod(&transposed)?;
+        dit.rotary = upload_runtime_half(
+            s,
+            fp16_stored_half(&device.info.arch),
+            "image_rotary",
+            &transposed,
+        )?;
         let control = velocity(0, &mut dit)?;
         ensure!(
             control.len() == image_rows * width && control.iter().all(|v| v.is_finite()),
@@ -16852,7 +16919,12 @@ mod tests {
             mode,
         )?;
         let x = s.clone_htod(&x_host)?;
-        let rotary = s.clone_htod(&rotary_host)?;
+        let rotary = upload_runtime_half(
+            s,
+            fp16_stored_half(&device.info.arch),
+            "rotary",
+            &rotary_host,
+        )?;
         let index = s.clone_htod(&adaln)?;
         let swapped = s.clone_htod(&swap_video_pair(&adaln))?;
         for (block, tau, reference_out) in [
@@ -16996,7 +17068,12 @@ mod tests {
         let mut work = BlockWork::new(s, &spec, 0, RAGGED_ROWS)?;
         work.plan_rotation(&device, &spec)?;
         work.prepare::<false>(&blas, &spec)?;
-        let ragged_rotary = s.clone_htod(&ragged_rotary_host)?;
+        let ragged_rotary = upload_runtime_half(
+            s,
+            fp16_stored_half(&device.info.arch),
+            "rotary",
+            &ragged_rotary_host,
+        )?;
         let ragged_index = s.clone_htod(&ragged_adaln)?;
         let ragged_swapped = s.clone_htod(&swap_video_pair(&ragged_adaln))?;
         for (block, tau, reference_out) in [

@@ -144,6 +144,19 @@ pub fn bf16_weight_to_fp16(name: &str, bytes: &mut [u8], report: bool) -> Result
     Ok(flushed)
 }
 
+/// Generated BF16 table words become the FP16 encoding [`bf16_weight_to_fp16`] stores.
+pub fn bf16_table_to_runtime_half(name: &str, table: &mut [half::bf16]) -> Result<()> {
+    let mut bytes = Vec::with_capacity(table.len() * 2);
+    for value in table.iter() {
+        bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+    }
+    bf16_weight_to_fp16(name, &mut bytes, false)?;
+    for (value, pair) in table.iter_mut().zip(bytes.as_chunks::<2>().0) {
+        *value = half::bf16::from_bits(u16::from_le_bytes(*pair));
+    }
+    Ok(())
+}
+
 /// `fp16` rewrites a BF16 tensor through [`bf16_weight_to_fp16`]. F32, I8, and U8 bytes stay as stored.
 pub fn convert_loaded_weight(
     name: &str,
@@ -218,6 +231,17 @@ mod tests {
         let loaded = safetensors::SafeTensors::deserialize(&bytes).unwrap();
         let anc = loaded.tensor("anc").unwrap();
         assert_eq!(u64::from_le_bytes(anc.data().try_into().unwrap()), bits);
+    }
+
+    #[test]
+    fn sm75_rotary_table_stores_fp16_one() {
+        let mut one = [half::bf16::from_bits(0x3f80)];
+        bf16_table_to_runtime_half("rotary", &mut one).unwrap();
+        assert_eq!(one[0].to_bits(), 0x3c00);
+        let mut signed = [half::bf16::from_bits(0xbf80), half::bf16::from_bits(0x3f00)];
+        bf16_table_to_runtime_half("rotary", &mut signed).unwrap();
+        assert_eq!(signed[0].to_bits(), 0xbc00);
+        assert_eq!(signed[1].to_bits(), 0x3800);
     }
 
     fn word(sign: u16, exp: u16, man: u16) -> [u8; 2] {
