@@ -952,6 +952,7 @@ extern "C" __global__ void tile_stitch_bf16(
 
 // out[c, out_first + k, :] = linear blend of a[c, a_first + k, :] and b[c, b_first + k, :] at position k of extent
 // frames; a, b and out are [channels, frames, plane] with their own frame counts.
+// Below sm80, a and b hold FP16 bits and linear_blend loads them with cvt.f32.f16.
 extern "C" __global__ void frame_blend_bf16(
     const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out, uint32_t channels,
     uint32_t extent, uint64_t plane, uint32_t a_frames, uint32_t a_first, uint32_t b_frames,

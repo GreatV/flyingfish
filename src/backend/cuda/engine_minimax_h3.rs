@@ -221,11 +221,7 @@ trait Element: crate::backend::gpu::DeviceRepr {
 impl Element for bf16 {
     const DTYPE: Dtype = Dtype::BF16;
     fn finite(bytes: &[u8]) -> bool {
-        bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .all(|v| u16::from_le_bytes(*v) & 0x7f80 != 0x7f80)
+        width2_finite(bytes, 0x7f80)
     }
 }
 
@@ -312,6 +308,32 @@ fn weight_fill_cast(fp16: bool, entry: &TensorEntry) -> FillCast {
     } else {
         FillCast::Raw
     }
+}
+
+/// Element stored in the filled window. FP16 casts use exponent `0x7C00`; BF16 uses `0x7F80`.
+fn fill_element_dtype(cast: FillCast, published: Dtype) -> Dtype {
+    match cast {
+        FillCast::Bf16ToFp16 | FillCast::F32ToFp16 => Dtype::F16,
+        FillCast::F32ToBf16 => Dtype::BF16,
+        FillCast::Raw => published,
+    }
+}
+
+fn width2_finite(bytes: &[u8], exponent: u16) -> bool {
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .all(|v| u16::from_le_bytes(*v) & exponent != exponent)
+}
+
+fn runtime_half_finite(bytes: &[u8], dtype: Dtype) -> bool {
+    let exponent = match dtype {
+        Dtype::F16 => 0x7c00,
+        Dtype::BF16 => 0x7f80,
+        _ => return false,
+    };
+    width2_finite(bytes, exponent)
 }
 
 /// The resident ring's raw windows keep the loader's finite check: unquantized F32 kept as
@@ -558,7 +580,7 @@ fn check_filled_tier(
             continue;
         }
         ensure!(
-            matches!(check.dtype, Dtype::BF16 | Dtype::F32),
+            matches!(check.dtype, Dtype::BF16 | Dtype::F16 | Dtype::F32),
             "{}: {:?} is not a finite-checkable dtype",
             check.tensor,
             check.dtype
@@ -567,10 +589,10 @@ fn check_filled_tier(
             .host_layer(check.layer)?
             .with_context(|| format!("{}: host tier vanished", check.tensor))?;
         let filled = &host[check.at..check.at + check.bytes];
-        let finite = if check.dtype == Dtype::F32 {
-            <f32 as Element>::finite(filled)
-        } else {
-            <bf16 as Element>::finite(filled)
+        let finite = match check.dtype {
+            Dtype::F32 => <f32 as Element>::finite(filled),
+            Dtype::F16 | Dtype::BF16 => runtime_half_finite(filled, check.dtype),
+            _ => false,
         };
         ensure!(finite, "{}: nonfinite value", check.tensor);
     }
@@ -4316,17 +4338,18 @@ fn bind_layers(
                 } else {
                     2 * offset
                 };
+                let cast = weight_fill_cast(fp16, entry);
                 requests.push(OwnedRead {
                     name: tensor.clone(),
                     entry: entry.clone(),
                     dest: unsafe { host.as_mut_ptr().add(at) },
                     dest_len: entry.bytes,
-                    cast: weight_fill_cast(fp16, entry),
+                    cast,
                 });
                 checks.push(FillCheck {
                     layer,
                     tensor,
-                    dtype: entry.dtype,
+                    dtype: fill_element_dtype(cast, entry.dtype),
                     quant: entry.quant,
                     at,
                     bytes: entry.bytes,
@@ -4965,18 +4988,19 @@ fn place_stored_layers(
                 let end = offset
                     .checked_add(entry.bytes)
                     .with_context(|| format!("{name} stored host offset"))?;
+                let cast = weight_fill_cast(fp16, &entry);
                 requests.push(OwnedRead {
                     name: name.clone(),
                     entry: entry.clone(),
                     dest: unsafe { host.as_mut_ptr().add(offset) },
                     dest_len: entry.bytes,
-                    cast: weight_fill_cast(fp16, &entry),
+                    cast,
                 });
                 if entry.dtype == Dtype::BF16 {
                     checks.push(FillCheck {
                         layer,
                         tensor: name.clone(),
-                        dtype: entry.dtype,
+                        dtype: fill_element_dtype(cast, entry.dtype),
                         quant: entry.quant,
                         at: offset,
                         bytes: entry.bytes,
@@ -18534,6 +18558,30 @@ mod h3_direct_batch_tests {
         // The narrowed form validates inside the cast, not here.
         resident_raw_finite("t", &entry(Dtype::F32), FillCast::F32ToBf16, &nan)?;
         Ok(())
+    }
+
+    #[test]
+    fn width2_finite_mask_follows_the_element() {
+        let word = |bits: u16| bits.to_le_bytes();
+        assert!(!runtime_half_finite(&word(0x7c00), Dtype::F16));
+        assert!(!runtime_half_finite(&word(0x7f80), Dtype::BF16));
+        let finite_fp16 = 0x7bffu16;
+        assert_eq!(finite_fp16 & 0x7f80, 0x7b80);
+        assert!(runtime_half_finite(&word(finite_fp16), Dtype::F16));
+        assert!(runtime_half_finite(&word(0x7c00), Dtype::BF16));
+        assert_eq!(
+            fill_element_dtype(FillCast::F32ToFp16, Dtype::F32),
+            Dtype::F16
+        );
+        assert_eq!(
+            fill_element_dtype(FillCast::Bf16ToFp16, Dtype::BF16),
+            Dtype::F16
+        );
+        assert_eq!(
+            fill_element_dtype(FillCast::F32ToBf16, Dtype::F32),
+            Dtype::BF16
+        );
+        assert_eq!(fill_element_dtype(FillCast::Raw, Dtype::BF16), Dtype::BF16);
     }
 
     #[test]

@@ -1787,7 +1787,6 @@ fn video_weight_load<'a>(
             if let Some(pinned) = dense.host_layer(layer)? {
                 let mut offset = 0;
                 for name in names {
-                    let width = decoder_weight_width(name);
                     let bytes = decoder_tensor_bytes(manifest, name);
                     let entry = &manifest.entries[name.as_str()];
                     ensure!(offset % 16 == 0, "video pinned weight alignment");
@@ -1803,11 +1802,7 @@ fn video_weight_load<'a>(
                     checks.push(FillCheck::finite(
                         layer,
                         name,
-                        if width == 2 {
-                            safetensors::Dtype::BF16
-                        } else {
-                            safetensors::Dtype::F32
-                        },
+                        super::fill_element_dtype(cast, entry.dtype),
                         offset,
                         bytes,
                     ));
@@ -3677,6 +3672,28 @@ pub(crate) mod image_tests {
             ))?)?
             .single_frame(),
         )
+    }
+
+    fn fp16_round(value: f32) -> half::f16 {
+        half::f16::from_f32(value)
+    }
+
+    fn fp16_linear_blend(a: u16, b: u16, position: u32, extent: u32) -> u16 {
+        let a = half::f16::from_bits(a);
+        let b = half::f16::from_bits(b);
+        let p = fp16_round(position as f32).to_f32();
+        let w = fp16_round(p / extent as f32);
+        let inv = fp16_round(fp16_round(1.0).to_f32() - w.to_f32());
+        let left = fp16_round(a.to_f32() * inv.to_f32());
+        let right = fp16_round(b.to_f32() * w.to_f32());
+        fp16_round(left.to_f32() + right.to_f32()).to_bits()
+    }
+
+    #[test]
+    fn frame_blend_fp16_matches_the_rounded_reference() {
+        assert_eq!(fp16_linear_blend(0x3c00, 0x4000, 0, 4), 0x3c00);
+        assert_eq!(fp16_linear_blend(0x3c00, 0x4000, 1, 2), 0x3e00);
+        assert_eq!(fp16_linear_blend(0x3c00, 0x4000, 1, 3), 0x3d56);
     }
 
     #[test]
