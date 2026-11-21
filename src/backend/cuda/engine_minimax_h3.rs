@@ -14,8 +14,8 @@ use crate::backend::cuda::{
     verification::Shape,
 };
 use crate::backend::gpu::{
-    CudaFunction, CudaSlice, CudaStream, CudaViewMut, DevicePtr, DevicePtrMut, LaunchConfig,
-    PushKernelArg,
+    CudaFunction, CudaModule, CudaSlice, CudaStream, CudaViewMut, DevicePtr, DevicePtrMut,
+    LaunchConfig, PushKernelArg,
 };
 use crate::checkpoint::{MappedCheckpoint, TensorEntry, TensorManifest};
 use crate::convrot::ProductKernel;
@@ -60,6 +60,27 @@ pub(super) fn open_blas(
         let _ = (ops, runtime, closure);
         Blas::new(Arc::clone(&device.stream))
     }
+}
+
+fn fp16_stored_half(arch: &crate::backend::setup::DeviceArchitecture) -> bool {
+    arch.published_bf16_lt() == crate::backend::setup::LtOperand::F16
+}
+
+fn upload_runtime_half(
+    stream: &Arc<CudaStream>,
+    fp16: bool,
+    name: &str,
+    table: &[bf16],
+) -> Result<CudaSlice<bf16>> {
+    let mut converted = Vec::new();
+    let bits = if fp16 {
+        converted.extend_from_slice(table);
+        crate::tensors::bf16_table_to_runtime_half(name, &mut converted)?;
+        converted.as_slice()
+    } else {
+        table
+    };
+    Ok(stream.clone_htod(bits)?)
 }
 
 fn equal_int8_bf16_rate(arch: &crate::backend::setup::DeviceArchitecture) -> bool {
@@ -221,11 +242,7 @@ trait Element: crate::backend::gpu::DeviceRepr {
 impl Element for bf16 {
     const DTYPE: Dtype = Dtype::BF16;
     fn finite(bytes: &[u8]) -> bool {
-        bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .all(|v| u16::from_le_bytes(*v) & 0x7f80 != 0x7f80)
+        width2_finite(bytes, 0x7f80)
     }
 }
 
@@ -253,6 +270,8 @@ struct EntryReader {
     dir: PathBuf,
     readers: BTreeMap<String, SpanReader>,
     staging: Option<AlignedBytes>,
+    /// Set once from the device capability. sm below 80 rewrites BF16 weight bytes to FP16.
+    fp16_weights: Option<bool>,
 }
 
 /// One batched direct-read destination: tensor identity plus a disjoint writable
@@ -294,12 +313,48 @@ pub(crate) struct OwnedRead {
     cast: FillCast,
 }
 
-/// Destination form of one fill read: the stored bytes, or their BF16 narrowing with the
-/// loader's finite and overflow checks.
+/// Destination form of one fill read: the stored bytes, their BF16 narrowing, or BF16
+/// weight bits rewritten as FP16. F32, I8, and U8 stay [`FillCast::Raw`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FillCast {
     Raw,
     F32ToBf16,
+    F32ToFp16,
+    Bf16ToFp16,
+}
+
+fn weight_fill_cast(fp16: bool, entry: &TensorEntry) -> FillCast {
+    if fp16 && entry.quant.is_none() && entry.dtype == Dtype::BF16 {
+        FillCast::Bf16ToFp16
+    } else {
+        FillCast::Raw
+    }
+}
+
+/// Element stored in the filled window. FP16 casts use exponent `0x7C00`; BF16 uses `0x7F80`.
+fn fill_element_dtype(cast: FillCast, published: Dtype) -> Dtype {
+    match cast {
+        FillCast::Bf16ToFp16 | FillCast::F32ToFp16 => Dtype::F16,
+        FillCast::F32ToBf16 => Dtype::BF16,
+        FillCast::Raw => published,
+    }
+}
+
+fn width2_finite(bytes: &[u8], exponent: u16) -> bool {
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .all(|v| u16::from_le_bytes(*v) & exponent != exponent)
+}
+
+fn runtime_half_finite(bytes: &[u8], dtype: Dtype) -> bool {
+    let exponent = match dtype {
+        Dtype::F16 => 0x7c00,
+        Dtype::BF16 => 0x7f80,
+        _ => return false,
+    };
+    width2_finite(bytes, exponent)
 }
 
 /// The resident ring's raw windows keep the loader's finite check: unquantized F32 kept as
@@ -546,7 +601,7 @@ fn check_filled_tier(
             continue;
         }
         ensure!(
-            matches!(check.dtype, Dtype::BF16 | Dtype::F32),
+            matches!(check.dtype, Dtype::BF16 | Dtype::F16 | Dtype::F32),
             "{}: {:?} is not a finite-checkable dtype",
             check.tensor,
             check.dtype
@@ -555,10 +610,10 @@ fn check_filled_tier(
             .host_layer(check.layer)?
             .with_context(|| format!("{}: host tier vanished", check.tensor))?;
         let filled = &host[check.at..check.at + check.bytes];
-        let finite = if check.dtype == Dtype::F32 {
-            <f32 as Element>::finite(filled)
-        } else {
-            <bf16 as Element>::finite(filled)
+        let finite = match check.dtype {
+            Dtype::F32 => <f32 as Element>::finite(filled),
+            Dtype::F16 | Dtype::BF16 => runtime_half_finite(filled, check.dtype),
+            _ => false,
         };
         ensure!(finite, "{}: nonfinite value", check.tensor);
     }
@@ -690,7 +745,22 @@ impl EntryReader {
             dir: dir.to_owned(),
             readers: BTreeMap::new(),
             staging: None,
+            fp16_weights: None,
         }
+    }
+
+    fn ensure_fp16(&mut self, stream: &Arc<CudaStream>) -> Result<()> {
+        if self.fp16_weights.is_none() {
+            self.fp16_weights = Some(cubin::capability(stream.context())? < 80);
+        }
+        Ok(())
+    }
+
+    fn store_bf16_as_fp16(&self, name: &str, bytes: &mut [u8]) -> Result<()> {
+        if self.fp16_weights == Some(true) {
+            crate::tensors::bf16_weight_to_fp16(name, bytes, true)?;
+        }
+        Ok(())
     }
 
     /// Copies a finite BF16 or F32 tensor into a buffer of its element type; the pageable source is consumed when the
@@ -710,11 +780,21 @@ impl EntryReader {
             destination.len(),
             T::DTYPE
         );
+        self.ensure_fp16(stream)?;
+        let convert = self.fp16_weights == Some(true) && entry.dtype == Dtype::BF16;
         let bytes = self.read(name, entry)?;
         ensure!(T::finite(bytes), "{name}: nonfinite value");
+        let mut converted = Vec::new();
+        let payload = if convert {
+            converted.extend_from_slice(bytes);
+            crate::tensors::bf16_weight_to_fp16(name, &mut converted, true)?;
+            converted.as_slice()
+        } else {
+            bytes
+        };
         let (pointer, _record) = destination.device_ptr_mut(stream);
         unsafe {
-            super::copy::htod_async(pointer, bytes, stream)?;
+            super::copy::htod_async(pointer, payload, stream)?;
         }
         Ok(())
     }
@@ -755,6 +835,9 @@ impl EntryReader {
         };
         ensure!(finite, "{name}: nonfinite value");
         destination.copy_from_slice(bytes);
+        if entry.dtype == Dtype::BF16 {
+            self.store_bf16_as_fp16(name, destination)?;
+        }
         Ok(())
     }
 
@@ -871,12 +954,26 @@ impl EntryReader {
             .max(entry.bytes + head);
         let filled = match cast {
             FillCast::Raw => entry.bytes,
-            FillCast::F32ToBf16 => {
+            FillCast::Bf16ToFp16 => {
+                ensure!(
+                    entry.dtype == Dtype::BF16
+                        && entry.quant.is_none()
+                        && entry.bytes.is_multiple_of(2),
+                    "{name}: BF16 to FP16 fill source"
+                );
+                entry.bytes
+            }
+            FillCast::F32ToBf16 | FillCast::F32ToFp16 => {
+                let kind = if cast == FillCast::F32ToFp16 {
+                    "FP16"
+                } else {
+                    "BF16"
+                };
                 ensure!(
                     entry.dtype == Dtype::F32
                         && entry.quant.is_none()
                         && entry.bytes.is_multiple_of(4),
-                    "{name}: F32 to BF16 fill source"
+                    "{name}: F32 to {kind} fill source"
                 );
                 entry.bytes / 2
             }
@@ -895,8 +992,14 @@ impl EntryReader {
         let source = &span[head..head + entry.bytes];
         match cast {
             FillCast::Raw => destination[..entry.bytes].copy_from_slice(source),
-            FillCast::F32ToBf16 => {
+            FillCast::Bf16ToFp16 => {
+                let output = &mut destination[..entry.bytes];
+                output.copy_from_slice(source);
+                crate::tensors::bf16_weight_to_fp16(name, output, true)?;
+            }
+            FillCast::F32ToBf16 | FillCast::F32ToFp16 => {
                 let output = &mut destination[..filled];
+                let fp16 = cast == FillCast::F32ToFp16;
                 for (value, dst) in source
                     .as_chunks::<4>()
                     .0
@@ -905,9 +1008,15 @@ impl EntryReader {
                 {
                     let value = f32::from_le_bytes(*value);
                     ensure!(value.is_finite(), "{name}: nonfinite value");
-                    let narrowed = bf16::from_f32(value);
-                    ensure!(narrowed.is_finite(), "BF16 overflow for {name}");
-                    *dst = narrowed.to_bits().to_le_bytes();
+                    if fp16 {
+                        let narrowed = half::f16::from_f32(value);
+                        ensure!(narrowed.is_finite(), "FP16 overflow for {name}");
+                        *dst = narrowed.to_bits().to_le_bytes();
+                    } else {
+                        let narrowed = bf16::from_f32(value);
+                        ensure!(narrowed.is_finite(), "BF16 overflow for {name}");
+                        *dst = narrowed.to_bits().to_le_bytes();
+                    }
                 }
             }
         }
@@ -1007,7 +1116,8 @@ impl AdalnTable {
     /// Kept blocks: `[6 * hidden * tags, time_dim]` projection of the plan embedding over the plan's addressed
     /// modality tags (full 3-tag tables read every block), bias before output rounding, keeping the addressed
     /// `(timestep, tag)` slices. HyperFlow's embedding is SiLU of `mix_temb` on the two f32
-    /// time embedders, rounded to BF16. A dropped block's modulation rows stay zero.
+    /// time embedders, rounded to BF16. When the Lt operand is FP16, the upload stores that
+    /// encoding. A dropped block's modulation rows stay zero.
     pub(crate) fn build(
         d: &Device,
         blas: &mut Blas,
@@ -1075,7 +1185,7 @@ impl AdalnTable {
         } else {
             adaln_input(spec, &time, &plan.timesteps)
         };
-        let x = s.clone_htod(&x_host)?;
+        let x = upload_runtime_half(s, fp16_stored_half(&d.info.arch), "adaln", &x_host)?;
         let tags = adaln_tags(&plan.pairs);
         let compact = width * tags.len();
         if crate::backend::diagnostics_enabled() {
@@ -1404,11 +1514,21 @@ impl<'a> Source<'a> {
             destination.len(),
             T::DTYPE
         );
+        self.reader.ensure_fp16(s)?;
+        let convert = self.reader.fp16_weights == Some(true) && entry.dtype == Dtype::BF16;
         let slice = self.reader.read_range(name, entry, first, bytes)?;
         ensure!(T::finite(slice), "{name}: nonfinite value");
+        let mut converted = Vec::new();
+        let payload = if convert {
+            converted.extend_from_slice(slice);
+            crate::tensors::bf16_weight_to_fp16(name, &mut converted, true)?;
+            converted.as_slice()
+        } else {
+            slice
+        };
         let (pointer, _record) = destination.device_ptr_mut(s);
         unsafe {
-            super::copy::htod_async(pointer, slice, s)?;
+            super::copy::htod_async(pointer, payload, s)?;
         }
         Ok(())
     }
@@ -1479,6 +1599,7 @@ impl<'a> Source<'a> {
 
     fn pack_vectors(&mut self, s: &Arc<CudaStream>, spec: &H3Spec) -> Result<()> {
         ensure!(self.vectors.is_none(), "vector arena already loaded");
+        self.reader.ensure_fp16(s)?;
         let layout = VectorArenaLayout::new(self.manifest, spec)?;
         let dropped = spec
             .dropped_blocks
@@ -2000,18 +2121,25 @@ pub(crate) struct BlockKernels {
     #[cfg(test)]
     gated_add_rms_raw: crate::backend::gpu::CudaFunction,
     residual: crate::backend::gpu::CudaFunction,
+    norm_module: Arc<CudaModule>,
+    modulate_module: Arc<CudaModule>,
+    act_module: Arc<CudaModule>,
+    rope_module: Arc<CudaModule>,
+    sm: u32,
     stored_launch: std::sync::OnceLock<StoredLaunch>,
 }
 
 impl BlockKernels {
     pub(crate) fn new(ctx: &Arc<crate::backend::gpu::CudaContext>) -> Result<Self> {
-        let modulate = cubin::module(ctx, "modulate")?;
-        let norm = cubin::module(ctx, "norm")?;
-        let plain = norm.load_function("rms_norm_bf16")?;
-        let norm_f32 = norm.load_function("rms_norm")?;
+        let modulate_module = cubin::module(ctx, "modulate")?;
+        let norm_module = cubin::module(ctx, "norm")?;
+        let act_module = cubin::module(ctx, "act")?;
+        let rope_module = cubin::module(ctx, "rope")?;
+        let plain = norm_module.load_function("rms_norm_bf16")?;
+        let norm_f32 = norm_module.load_function("rms_norm")?;
         #[cfg(test)]
-        let norm_modulate = norm.load_function("rms_norm_modulate_bf16")?;
-        let norm_modulate_f32 = norm.load_function("rms_norm_modulate")?;
+        let norm_modulate = norm_module.load_function("rms_norm_modulate_bf16")?;
+        let norm_modulate_f32 = norm_module.load_function("rms_norm_modulate")?;
         let active = |kernel: &crate::backend::gpu::CudaFunction| {
             kernel.occupancy_max_active_blocks_per_multiprocessor(HIDDEN_NORM_THREADS, 0, None)
         };
@@ -2028,7 +2156,7 @@ impl BlockKernels {
             fused_f32 >= baseline,
             "rms_norm_modulate occupancy {fused_f32} below rms_norm_bf16 {baseline}"
         );
-        let gated_add_rms = norm.load_function("gated_add_rms_norm_modulate")?;
+        let gated_add_rms = norm_module.load_function("gated_add_rms_norm_modulate")?;
         let gated_active = active(&gated_add_rms)?;
         ensure!(
             gated_active >= baseline,
@@ -2040,19 +2168,24 @@ impl BlockKernels {
             #[cfg(test)]
             norm_modulate,
             norm_modulate_f32,
-            residual: norm.load_function("residual")?,
-            rotary: cubin::module(ctx, "rope")?.load_function("rotary_prefix_kv")?,
-            rotary_q: norm.load_function("rmsnorm_rotary_q")?,
-            rotary_kv: norm.load_function("rmsnorm_rotary_kv")?,
-            swiglu: cubin::module(ctx, "act")?.load_function("silu_mul")?,
+            residual: norm_module.load_function("residual")?,
+            rotary: rope_module.load_function("rotary_prefix_kv")?,
+            rotary_q: norm_module.load_function("rmsnorm_rotary_q")?,
+            rotary_kv: norm_module.load_function("rmsnorm_rotary_kv")?,
+            swiglu: act_module.load_function("silu_mul")?,
             #[cfg(test)]
-            modulate: modulate.load_function("row_modulate")?,
+            modulate: modulate_module.load_function("row_modulate")?,
             #[cfg(test)]
             serial_norm_modulate: std::cell::Cell::new(false),
-            gated_add: modulate.load_function("row_gated_add")?,
+            gated_add: modulate_module.load_function("row_gated_add")?,
             gated_add_rms,
             #[cfg(test)]
-            gated_add_rms_raw: norm.load_function("gated_add_rms_norm_modulate_raw_var")?,
+            gated_add_rms_raw: norm_module.load_function("gated_add_rms_norm_modulate_raw_var")?,
+            norm_module,
+            modulate_module,
+            act_module,
+            rope_module,
+            sm: cubin::capability(ctx)?,
             stored_launch: std::sync::OnceLock::new(),
         })
     }
@@ -3043,6 +3176,7 @@ fn block_forward_tail<const LORA: bool>(
         }
     };
     let gated_add = |residual: u64, update: u64, gate: usize| -> Result<()> {
+        kernels.prepare_fp16_store(s, &kernels.modulate_module)?;
         unsafe {
             s.launch_builder(&kernels.gated_add)
                 .arg(&residual)
@@ -3055,9 +3189,10 @@ fn block_forward_tail<const LORA: bool>(
                 .arg(&entries)
                 .launch(row_grid)?;
         }
-        Ok(())
+        kernels.finish_fp16_store(s, &kernels.modulate_module, "gated_add")
     };
     let residual = |residual: u64, update: u64| -> Result<()> {
+        kernels.prepare_fp16_store(s, &kernels.norm_module)?;
         unsafe {
             s.launch_builder(&kernels.residual)
                 .arg(&residual)
@@ -3065,7 +3200,7 @@ fn block_forward_tail<const LORA: bool>(
                 .arg(&i32::try_from(rows * h)?)
                 .launch(flat(rows * h / 8))?;
         }
-        Ok(())
+        kernels.finish_fp16_store(s, &kernels.norm_module, "residual")
     };
     let scratch = stored_ptrs(s, work);
     let base = |index: usize, x: Tensor<bf16, 2>, y: Tensor<bf16, 2>| -> Result<()> {
@@ -3122,6 +3257,7 @@ fn block_forward_tail<const LORA: bool>(
         block_dim: (QK_ROPE_THREADS, 1, 1),
         shared_mem_bytes: 0,
     };
+    kernels.prepare_fp16_store(s, &kernels.norm_module)?;
     unsafe {
         s.launch_builder(&kernels.rotary_q)
             .arg(&pointer(&work.q_raw, s))
@@ -3136,6 +3272,10 @@ fn block_forward_tail<const LORA: bool>(
             .arg(&rows_i)
             .arg(&spec.qk_norm_eps)
             .launch(qk_rope_cfg)?;
+    }
+    kernels.finish_fp16_store(s, &kernels.norm_module, "q")?;
+    kernels.prepare_fp16_store(s, &kernels.norm_module)?;
+    unsafe {
         s.launch_builder(&kernels.rotary_kv)
             .arg(&pointer(&work.k_raw, s))
             .arg(&w.norm_k.tensor.ptr)
@@ -3152,6 +3292,7 @@ fn block_forward_tail<const LORA: bool>(
             .arg(&spec.qk_norm_eps)
             .launch(qk_rope_cfg)?;
     }
+    kernels.finish_fp16_store(s, &kernels.norm_module, "k")?;
     flash.run(
         &work.q,
         width,
@@ -3317,6 +3458,7 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
         let hidden = work.hidden.ptr + if SHIFT_INPUT { 256 } else { 0 };
         let gated = work.gated.ptr;
         let cfg = ops::silu_mul_grid(n, f, hidden, gated)?;
+        c.kernels.prepare_fp16_store(s, &c.kernels.act_module)?;
         unsafe {
             s.launch_builder(&c.kernels.swiglu)
                 .arg(&hidden)
@@ -3326,6 +3468,8 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
                 .arg(&3i32)
                 .launch(cfg)?;
         }
+        c.kernels
+            .finish_fp16_store(s, &c.kernels.act_module, "ffn")?;
         base(FF_OUT, work.gated.prefix_rows(u32::try_from(n)?)?, output)?;
         if LORA {
             lora_pair(
@@ -3413,7 +3557,59 @@ struct ModulateRows {
     entries: u32,
 }
 
+// sm >= 80 cubins do not define ff_fp16_store_fault.
+fn prepare_fp16_store_at(sm: u32, s: &Arc<CudaStream>, module: &Arc<CudaModule>) -> Result<()> {
+    if sm >= 80 {
+        return Ok(());
+    }
+    let mut symbol = module.get_global("ff_fp16_store_fault", s)?;
+    ensure!(
+        symbol.len() == 4,
+        "ff_fp16_store_fault is {} bytes",
+        symbol.len()
+    );
+    s.memcpy_htod(&[0u8; 4], &mut symbol)?;
+    Ok(())
+}
+
+fn finish_fp16_store_at(
+    sm: u32,
+    s: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    tensor: &str,
+) -> Result<()> {
+    if sm >= 80 {
+        return Ok(());
+    }
+    let mut symbol = module.get_global("ff_fp16_store_fault", s)?;
+    ensure!(
+        symbol.len() == 4,
+        "ff_fp16_store_fault is {} bytes",
+        symbol.len()
+    );
+    let bytes = s.clone_dtoh(&symbol)?;
+    s.memcpy_htod(&[0u8; 4], &mut symbol)?;
+    ensure!(
+        bytes == [0u8; 4],
+        "FP16 store of {tensor} is non-finite or above 65504"
+    );
+    Ok(())
+}
+
 impl BlockKernels {
+    fn prepare_fp16_store(&self, s: &Arc<CudaStream>, module: &Arc<CudaModule>) -> Result<()> {
+        prepare_fp16_store_at(self.sm, s, module)
+    }
+
+    fn finish_fp16_store(
+        &self,
+        s: &Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+        tensor: &str,
+    ) -> Result<()> {
+        finish_fp16_store_at(self.sm, s, module, tensor)
+    }
+
     #[cfg(test)]
     fn rms_norm_modulate(&self, s: &Arc<CudaStream>, n: NormRows, m: ModulateRows) -> Result<()> {
         self.prepare_norm_modulate(&n, &m)?;
@@ -3478,6 +3674,7 @@ impl BlockKernels {
         n: &NormRows,
         m: &ModulateRows,
     ) -> Result<()> {
+        self.prepare_fp16_store(s, &self.norm_module)?;
         unsafe {
             s.launch_builder(kernel)
                 .arg(&n.input)
@@ -3497,7 +3694,7 @@ impl BlockKernels {
                     shared_mem_bytes: 0,
                 })?;
         }
-        Ok(())
+        self.finish_fp16_store(s, &self.norm_module, "rms_norm_modulate")
     }
 
     fn gated_add_rms(&self, s: &Arc<CudaStream>, g: &GatedAddRms) -> Result<()> {
@@ -3548,6 +3745,7 @@ impl BlockKernels {
             .context("norm table extent overflow")?;
         let rows = i32::try_from(g.rows)?;
         let dim = i32::try_from(g.dim)?;
+        self.prepare_fp16_store(s, &self.norm_module)?;
         unsafe {
             s.launch_builder(kernel)
                 .arg(&g.x)
@@ -3572,7 +3770,7 @@ impl BlockKernels {
                     shared_mem_bytes: 0,
                 })?;
         }
-        Ok(())
+        self.finish_fp16_store(s, &self.norm_module, "gated_residual")
     }
 
     fn rms_norm(&self, s: &Arc<CudaStream>, n: NormRows) -> Result<()> {
@@ -3590,6 +3788,7 @@ impl BlockKernels {
         kernel: &crate::backend::gpu::CudaFunction,
         n: NormRows,
     ) -> Result<()> {
+        self.prepare_fp16_store(s, &self.norm_module)?;
         unsafe {
             s.launch_builder(kernel)
                 .arg(&n.input)
@@ -3604,7 +3803,7 @@ impl BlockKernels {
                     shared_mem_bytes: 0,
                 })?;
         }
-        Ok(())
+        self.finish_fp16_store(s, &self.norm_module, "rms_norm")
     }
 
     #[cfg(test)]
@@ -3758,10 +3957,13 @@ fn cast_rows(
     source: u64,
     target: u64,
     count: usize,
+    sm: u32,
+    module: &Arc<CudaModule>,
 ) -> Result<()> {
     if count == 0 {
         return Ok(());
     }
+    prepare_fp16_store_at(sm, s, module)?;
     unsafe {
         s.launch_builder(kernel)
             .arg(&source)
@@ -3771,7 +3973,7 @@ fn cast_rows(
             .arg(&1f32)
             .launch(flat(count))?;
     }
-    Ok(())
+    finish_fp16_store_at(sm, s, module, "affine")
 }
 
 /// `y [rows, n] = x [rows, k] * w^T + b` in F32 on rows starting at element `x_offset` of `x`.
@@ -3828,6 +4030,7 @@ fn round_into(
     source: u64,
     target: usize,
     count: usize,
+    store: (u32, &Arc<CudaModule>),
 ) -> Result<()> {
     cast_rows(
         s,
@@ -3835,6 +4038,8 @@ fn round_into(
         source,
         pointer(hidden, s) + 2 * target as u64,
         count,
+        store.0,
+        store.1,
     )
 }
 
@@ -3846,7 +4051,10 @@ fn upcast_from(
     scratch: &CudaSlice<f32>,
     source: usize,
     count: usize,
+    store: (u32, &Arc<CudaModule>),
 ) -> Result<()> {
+    let (sm, module) = store;
+    prepare_fp16_store_at(sm, s, module)?;
     unsafe {
         s.launch_builder(kernel)
             .arg(&(pointer(normed, s) + 2 * source as u64))
@@ -3854,7 +4062,7 @@ fn upcast_from(
             .arg(&u32::try_from(count)?)
             .launch(flat(count))?;
     }
-    Ok(())
+    finish_fp16_store_at(sm, s, module, "upcast")
 }
 
 fn image_fill_rate(dir: &Path, manifest: &TensorManifest) -> Result<(usize, f64)> {
@@ -4126,6 +4334,7 @@ fn bind_layers(
     let tier = if plan.slot_bytes > 0 {
         let dir = base.reader.dir.clone();
         let host_tier = plan.host.clone();
+        let fp16 = cubin::capability(&d.ctx)? < 80;
         let mut dense =
             crate::backend::cuda::weights::DenseStreaming::new(&dir, base.manifest, plan, d, None)?;
         let mut requests = Vec::new();
@@ -4151,17 +4360,18 @@ fn bind_layers(
                 } else {
                     2 * offset
                 };
+                let cast = weight_fill_cast(fp16, entry);
                 requests.push(OwnedRead {
                     name: tensor.clone(),
                     entry: entry.clone(),
                     dest: unsafe { host.as_mut_ptr().add(at) },
                     dest_len: entry.bytes,
-                    cast: FillCast::Raw,
+                    cast,
                 });
                 checks.push(FillCheck {
                     layer,
                     tensor,
-                    dtype: entry.dtype,
+                    dtype: fill_element_dtype(cast, entry.dtype),
                     quant: entry.quant,
                     at,
                     bytes: entry.bytes,
@@ -4761,6 +4971,7 @@ fn place_stored_layers(
     let mut tier = None;
     if plan.slot_bytes > 0 {
         let dir = base.reader.dir.clone();
+        let fp16 = cubin::capability(&d.ctx)? < 80;
         let mut dense = crate::backend::cuda::weights::DenseStreaming::new(
             &dir,
             base.manifest,
@@ -4799,18 +5010,19 @@ fn place_stored_layers(
                 let end = offset
                     .checked_add(entry.bytes)
                     .with_context(|| format!("{name} stored host offset"))?;
+                let cast = weight_fill_cast(fp16, &entry);
                 requests.push(OwnedRead {
                     name: name.clone(),
                     entry: entry.clone(),
                     dest: unsafe { host.as_mut_ptr().add(offset) },
                     dest_len: entry.bytes,
-                    cast: FillCast::Raw,
+                    cast,
                 });
                 if entry.dtype == Dtype::BF16 {
                     checks.push(FillCheck {
                         layer,
                         tensor: name.clone(),
-                        dtype: entry.dtype,
+                        dtype: fill_element_dtype(cast, entry.dtype),
                         quant: entry.quant,
                         at: offset,
                         bytes: entry.bytes,
@@ -4972,6 +5184,7 @@ pub(crate) struct Dit {
     upcast: crate::backend::gpu::CudaFunction,
     bias: crate::backend::gpu::CudaFunction,
     round: crate::backend::gpu::CudaFunction,
+    vision_ops: Arc<CudaModule>,
     euler: crate::backend::gpu::CudaFunction,
     /// Velocity of the generated video rows, `[generated rows, 96]`.
     pub video: CudaSlice<f32>,
@@ -5235,7 +5448,12 @@ impl Dit {
         let scratch = s.alloc_zeros::<f32>(scratch_rows * h)?;
         let video = s.alloc_zeros::<f32>(generated * patch)?;
         let audio = s.alloc_zeros::<f32>(ranges.audio * spec.audio_in_channels)?;
-        let rotary = s.clone_htod(&crate::minimax_h3::rotary_table(spec, layout))?;
+        let rotary = upload_runtime_half(
+            s,
+            fp16_stored_half(&d.info.arch),
+            "rotary",
+            &crate::minimax_h3::rotary_table(spec, layout),
+        )?;
 
         let sizing = dense_sizing(base.manifest, spec.layers)?;
         let lora_bytes = if hyperflow {
@@ -5419,6 +5637,7 @@ impl Dit {
             )?;
         }
         let vision = cubin::module(s.context(), "vision_ops")?;
+        let vision_ops = Arc::clone(&vision);
         #[cfg(test)]
         if let Some((layout, buffer)) = &base.vectors {
             let expected = base
@@ -5462,6 +5681,7 @@ impl Dit {
             upcast: vision.load_function("vision_upcast_f32")?,
             bias: vision.load_function("vision_bias_f32")?,
             round: vision.load_function("vision_affine_cast_bf16")?,
+            vision_ops,
             euler: cubin::module(s.context(), "flow")?.load_function("euler_blend_f32")?,
             video,
             audio,
@@ -5679,6 +5899,7 @@ impl Dit {
             scratch,
             r.text * h,
             r.condition * h,
+            (c.kernels.sm, &self.vision_ops),
         )?;
         round_into(
             s,
@@ -5687,6 +5908,7 @@ impl Dit {
             scratch + 4 * (r.condition * h) as u64,
             r.video_start * h,
             (video_rows - r.condition) * h,
+            (c.kernels.sm, &self.vision_ops),
         )?;
         projection(
             c.s,
@@ -5703,6 +5925,7 @@ impl Dit {
             scratch,
             r.audio_start * h,
             r.audio * h,
+            (c.kernels.sm, &self.vision_ops),
         )?;
 
         let block_rows = 6 * h * pairs as usize;
@@ -5807,6 +6030,7 @@ impl Dit {
             &self.scratch,
             r.video_start * h,
             generated * h,
+            (c.kernels.sm, &self.vision_ops),
         )?;
         projection(
             c.s,
@@ -5823,6 +6047,7 @@ impl Dit {
             &self.scratch,
             r.audio_start * h,
             r.audio * h,
+            (c.kernels.sm, &self.vision_ops),
         )?;
         projection(
             c.s,
@@ -5903,6 +6128,7 @@ pub(crate) struct ImageDit {
     upcast: crate::backend::gpu::CudaFunction,
     bias: crate::backend::gpu::CudaFunction,
     round: crate::backend::gpu::CudaFunction,
+    vision_ops: Arc<CudaModule>,
     euler: crate::backend::gpu::CudaFunction,
 }
 
@@ -6045,11 +6271,12 @@ impl ImageDit {
         let text = s.alloc_zeros::<bf16>(text_rows * h)?;
         let scratch = s.alloc_zeros::<f32>(image_rows * h)?;
         let velocity = s.alloc_zeros::<f32>(image_rows * row_width)?;
-        let rotary = s.clone_htod(&rotary_rows(
-            spec.rope_freq_dim,
-            spec.rope_theta,
-            &layout.position_ids,
-        ))?;
+        let rotary = upload_runtime_half(
+            s,
+            fp16_stored_half(&d.info.arch),
+            "image_rotary",
+            &rotary_rows(spec.rope_freq_dim, spec.rope_theta, &layout.position_ids),
+        )?;
         let sizing = dense_sizing(manifest, spec.layers)?;
         let owned =
             spec.layers * 2 * (2 * h + 2 * spec.head_dim) + sizing.staging + sizing.transient;
@@ -6175,6 +6402,7 @@ impl ImageDit {
             );
         }
         let vision = cubin::module(s.context(), "vision_ops")?;
+        let vision_ops = Arc::clone(&vision);
         require_resident_norms(s, &blocks, &norm_out, h)?;
         Ok(Self {
             text_rows,
@@ -6203,6 +6431,7 @@ impl ImageDit {
             upcast: vision.load_function("vision_upcast_f32")?,
             bias: vision.load_function("vision_bias_f32")?,
             round: vision.load_function("vision_affine_cast_bf16")?,
+            vision_ops,
             euler: cubin::module(s.context(), "flow")?.load_function("euler_blend_f32")?,
         })
     }
@@ -6338,6 +6567,7 @@ impl ImageDit {
             pointer(&self.scratch, s),
             text_rows * h,
             image_rows * h,
+            (c.kernels.sm, &self.vision_ops),
         )?;
         let block_rows = 6 * h * pairs as usize;
         let sources = Scale2Sources {
@@ -6427,6 +6657,7 @@ impl ImageDit {
             &self.scratch,
             text_rows * h,
             image_rows * h,
+            (c.kernels.sm, &self.vision_ops),
         )?;
         projection(
             c.s,
@@ -6640,6 +6871,7 @@ pub(crate) struct Conditioner {
     gate_up: CudaSlice<bf16>,
     gated: CudaSlice<bf16>,
     rope: CudaSlice<bf16>,
+    fp16_rope: bool,
 }
 
 impl Conditioner {
@@ -6787,6 +7019,7 @@ impl Conditioner {
             gate_up,
             gated,
             rope,
+            fp16_rope: fp16_stored_half(&d.info.arch),
         })
     }
 
@@ -6846,7 +7079,15 @@ impl Conditioner {
             self.layers.len()
         );
         s.memcpy_htod(input.embeds, &mut self.x.slice_mut(..rows * h))?;
-        s.memcpy_htod(input.rope, &mut self.rope.slice_mut(..rows * d))?;
+        let mut converted_rope = Vec::new();
+        let rope = if self.fp16_rope {
+            converted_rope.extend_from_slice(input.rope);
+            crate::tensors::bf16_table_to_runtime_half("conditioner_rope", &mut converted_rope)?;
+            converted_rope.as_slice()
+        } else {
+            input.rope
+        };
+        s.memcpy_htod(rope, &mut self.rope.slice_mut(..rows * d))?;
         let rows_i = i32::try_from(rows)?;
         let linear = |weight: Tensor<bf16, 2>,
                       x: &CudaSlice<bf16>,
@@ -6881,6 +7122,7 @@ impl Conditioner {
             )
         };
         let residual = |residual: u64, update: u64, count: usize| -> Result<()> {
+            kernels.prepare_fp16_store(s, &kernels.norm_module)?;
             unsafe {
                 s.launch_builder(&kernels.residual)
                     .arg(&residual)
@@ -6888,7 +7130,7 @@ impl Conditioner {
                     .arg(&i32::try_from(count)?)
                     .launch(flat(count / 8))?;
             }
-            Ok(())
+            kernels.finish_fp16_store(s, &kernels.norm_module, "residual")
         };
         let mut tapped = Vec::with_capacity(taps.len());
         let x = pointer(&self.x, s);
@@ -6919,6 +7161,7 @@ impl Conditioner {
                 (rows * self.kv_heads, d, HEAD_NORM_THREADS),
             )?;
             // q rotates in place; k and v land head-major [kv_heads, rows, head_dim] in keys and values.
+            kernels.prepare_fp16_store(s, &kernels.rope_module)?;
             unsafe {
                 s.launch_builder(&kernels.rotary)
                     .arg(&pointer(&self.q, s))
@@ -6936,6 +7179,7 @@ impl Conditioner {
                     .arg(&rows_i)
                     .launch(flat(rows * (self.q_heads + self.kv_heads) * d))?;
             }
+            kernels.finish_fp16_store(s, &kernels.rope_module, "qk")?;
             self.flash.run(
                 &self.q,
                 qw,
@@ -6964,6 +7208,7 @@ impl Conditioner {
             linear(layer.gate_up, &self.normed, h, &self.gate_up, 2 * self.ffn)?;
             let (gate_up, gated) = (pointer(&self.gate_up, s), pointer(&self.gated, s));
             let cfg = ops::silu_mul_grid(rows, self.ffn, gate_up, gated)?;
+            kernels.prepare_fp16_store(s, &kernels.act_module)?;
             unsafe {
                 s.launch_builder(&kernels.swiglu)
                     .arg(&gate_up)
@@ -6973,6 +7218,7 @@ impl Conditioner {
                     .arg(&0i32)
                     .launch(cfg)?;
             }
+            kernels.finish_fp16_store(s, &kernels.act_module, "ffn")?;
             linear(layer.down, &self.gated, self.ffn, &self.normed, h)?;
             #[cfg(test)]
             if index == 43 && rows > 20 && h > 731 {
@@ -7021,6 +7267,7 @@ pub(crate) fn embedding_rows(
     embed: &str,
     hidden: usize,
     ids: &[u32],
+    fp16: bool,
 ) -> Result<Vec<bf16>> {
     let entry = base
         .manifest
@@ -7035,6 +7282,7 @@ pub(crate) fn embedding_rows(
     );
     let row = 2 * hidden;
     let mut out = Vec::with_capacity(ids.len() * hidden);
+    let mut flushed = 0u64;
     for &id in ids {
         ensure!((id as usize) < entry.shape[0], "token {id} outside {embed}");
         let bytes = base
@@ -7044,13 +7292,20 @@ pub(crate) fn embedding_rows(
             <bf16 as Element>::finite(bytes),
             "{embed}: nonfinite row {id}"
         );
+        let mut row_bytes = bytes.to_vec();
+        if fp16 {
+            flushed += crate::tensors::bf16_weight_to_fp16(embed, &mut row_bytes, false)?;
+        }
         out.extend(
-            bytes
+            row_bytes
                 .as_chunks::<2>()
                 .0
                 .iter()
                 .map(|b| bf16::from_le_bytes(*b)),
         );
+    }
+    if flushed > 0 {
+        eprintln!("{embed}: BF16 to FP16 flushed {flushed} values to +0");
     }
     Ok(out)
 }
@@ -9218,24 +9473,51 @@ mod tests {
     fn cast_rows_skips_an_empty_conditioning_range_gpu() -> Result<()> {
         let device = Device::new(0)?;
         let s = &device.stream;
-        let kernel =
-            cubin::module(s.context(), "vision_ops")?.load_function("vision_affine_cast_bf16")?;
+        let module = cubin::module(s.context(), "vision_ops")?;
+        let kernel = module.load_function("vision_affine_cast_bf16")?;
+        #[cfg(feature = "cuda")]
+        let sm = cubin::capability(s.context())?;
+        #[cfg(not(feature = "cuda"))]
+        let sm = 80u32;
         let values: Vec<f32> = (0..16).map(|i| 1.0 + i as f32 / 3.0).collect();
         let source = s.clone_htod(&values)?;
         let target = s.alloc_zeros::<bf16>(16)?;
-        cast_rows(s, &kernel, pointer(&source, s), pointer(&target, s), 0)?;
+        cast_rows(
+            s,
+            &kernel,
+            pointer(&source, s),
+            pointer(&target, s),
+            0,
+            sm,
+            &module,
+        )?;
         s.synchronize()?;
         ensure!(
             s.clone_dtoh(&target)?.iter().all(|v| v.to_bits() == 0),
             "empty range wrote"
         );
-        cast_rows(s, &kernel, pointer(&source, s), pointer(&target, s), 16)?;
+        cast_rows(
+            s,
+            &kernel,
+            pointer(&source, s),
+            pointer(&target, s),
+            16,
+            sm,
+            &module,
+        )?;
+        let rounded = |v: f32| {
+            if sm >= 80 {
+                bf16::from_f32(v).to_bits()
+            } else {
+                half::f16::from_f32(v).to_bits()
+            }
+        };
         ensure!(
             s.clone_dtoh(&target)?
                 .iter()
                 .zip(&values)
-                .all(|(got, &v)| got.to_bits() == bf16::from_f32(v).to_bits()),
-            "cast differs from BF16 rounding"
+                .all(|(got, &v)| got.to_bits() == rounded(v)),
+            "cast differs from the device 16-bit rounding"
         );
         Ok(())
     }
@@ -10347,7 +10629,12 @@ mod tests {
                 "borrowed address/control capacity"
             );
             let receipt = blas.bound_plan_receipt()?;
-            let rotary = s.clone_htod(&crate::minimax_h3::rotary_table(&spec, &layout))?;
+            let rotary = upload_runtime_half(
+                s,
+                fp16_stored_half(&device.info.arch),
+                "rotary",
+                &crate::minimax_h3::rotary_table(&spec, &layout),
+            )?;
             let tables: Vec<_> = (0..2)
                 .map(|layer| -> Result<_> {
                     let view = adaln.tensor(&format!("block{layer}.step0"))?;
@@ -10663,7 +10950,12 @@ mod tests {
         )?;
         let mut work = BlockWork::new(s, &spec, r, rows)?;
         work.prepare::<true>(&blas, &spec)?;
-        let rotary = s.clone_htod(&rotary_host)?;
+        let rotary = upload_runtime_half(
+            s,
+            fp16_stored_half(&device.info.arch),
+            "rotary",
+            &rotary_host,
+        )?;
         let table = s.clone_htod(&table_host)?;
         let index = s.clone_htod(&index)?;
         let mut captured_norm_defects = 0;
@@ -10999,7 +11291,12 @@ mod tests {
         )?;
         let mut work = BlockWork::new(s, &spec, r, rows)?;
         work.prepare::<true>(&blas, &spec)?;
-        let rotary_device = s.clone_htod(&rotary_host)?;
+        let rotary_device = upload_runtime_half(
+            s,
+            fp16_stored_half(&device.info.arch),
+            "rotary",
+            &rotary_host,
+        )?;
         let table_device = s.clone_htod(&table_host)?;
         let index_device = s.clone_htod(&index_host)?;
         let modulation = Modulation {
@@ -12293,6 +12590,7 @@ mod tests {
                 "model.language_model.embed_tokens.weight",
                 hidden,
                 &ids,
+                false,
             )?;
             let table = ids
                 .iter()
@@ -13775,6 +14073,88 @@ mod tests {
         },
     ];
 
+    /// Twice the 2026-11-19T10:35:51Z FP16-versus-BF16 floor. prod64 is the production cell.
+    const FP16_BF16_FLOOR: &[(&str, f64, f64)] = &[
+        ("tiny1", 0.015625, 0.0126576966),
+        ("tiny7", 0.5, 0.123593084),
+        ("full16", 1.0, 0.167570942),
+        ("m1", 0.375, 0.142660596),
+        ("m17", 0.5, 0.154278528),
+        ("m64", 1.0, 0.2326228),
+        ("prod64", 4.0, 0.73971736),
+        ("tail12", 0.125, 0.037559314),
+    ];
+
+    fn fp16_dit_bound() -> (f64, f64) {
+        (4.0, 0.73971736)
+    }
+
+    fn scored_image_tau(
+        sm: u32,
+        name: &str,
+        published_max: f64,
+        published_rmse: f64,
+    ) -> (f64, f64) {
+        if sm < 80 && name.starts_with("dit_") {
+            fp16_dit_bound()
+        } else {
+            (published_max, published_rmse)
+        }
+    }
+
+    #[test]
+    fn fp16_dit_bound_matches_the_frozen_gemm_floor() {
+        let frozen = [
+            ("tiny1", 0.015625, 0.0126576966),
+            ("tiny7", 0.5, 0.123593084),
+            ("full16", 1.0, 0.167570942),
+            ("m1", 0.375, 0.142660596),
+            ("m17", 0.5, 0.154278528),
+            ("m64", 1.0, 0.2326228),
+            ("prod64", 4.0, 0.73971736),
+            ("tail12", 0.125, 0.037559314),
+        ];
+        assert_eq!(FP16_BF16_FLOOR, &frozen[..]);
+        assert_eq!(fp16_dit_bound(), (4.0, 0.73971736));
+        assert_eq!(
+            FP16_BF16_FLOOR
+                .iter()
+                .find(|cell| cell.0 == "prod64")
+                .map(|cell| (cell.1, cell.2)),
+            Some(fp16_dit_bound())
+        );
+        assert_eq!(
+            scored_image_tau(75, "dit_step0", 1.0, 0.1),
+            fp16_dit_bound()
+        );
+        assert_eq!(
+            scored_image_tau(75, "dit_step5", 1.0, 0.1),
+            fp16_dit_bound()
+        );
+        assert_eq!(
+            scored_image_tau(75, "dit_edit_step0", 1.0, 0.1),
+            fp16_dit_bound()
+        );
+        assert_eq!(scored_image_tau(75, "euler_step0", 1.0, 0.1), (1.0, 0.1));
+        assert_eq!(
+            scored_image_tau(75, "euler_edit_step0", 2.0, 0.2),
+            (2.0, 0.2)
+        );
+        assert_eq!(scored_image_tau(89, "dit_step0", 1.0, 0.1), (1.0, 0.1));
+        assert_eq!(scored_image_tau(80, "dit_step5", 3.0, 0.3), (3.0, 0.3));
+    }
+
+    #[test]
+    fn t4_standard_pin_matches_the_counted_budget() {
+        let slot = 770_703_360usize;
+        let pin = 7_768_899_584usize;
+        let host_pins = pin / slot;
+        let disk_layers = 50 - host_pins;
+        assert_eq!(host_pins, 10);
+        assert_eq!(disk_layers, 40);
+        assert_eq!(disk_layers * slot * 6, 184_968_806_400);
+    }
+
     fn image_dit_tau(cross: f64) -> f64 {
         (2.0 * cross).max(1e-6)
     }
@@ -13825,7 +14205,9 @@ mod tests {
     /// rows. Euler step 0 writes generated rows only. `inputs.safetensors` supplies `t2i_rows` and `edit_rows`.
     /// Image row `i` takes the `(h, w)` of image row `i + 1`. That line is printed.
     /// Every image row's `(h, w)` is swapped to `(w, h)`.
-    /// Control bar dated 2026-11-12: both metrics must exceed `3 * tau`.
+    /// On sm >= 80 the control bar is `3 * tau` against the BF16 reference.
+    /// On sm < 80 a `dit_*` cell uses the prod64 floor. Euler stays on `image_dit_tau`.
+    /// On sm < 80 the transpose must differ from the unshifted candidate by more than that floor.
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_H3_IMAGE, FF_H3_IMAGE_DEVICE0, FF_H3_PLACEMENT"]
     fn image_dit_512_matches_the_frozen_cells() -> Result<()> {
@@ -13969,6 +14351,8 @@ mod tests {
         let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
             .minimax_h3_image_manifest(&image_spec)?;
         let device = Device::new(0)?;
+        let sm = cubin::capability(&device.ctx)?;
+        println!("H3_IMAGE_DIT sm={sm}");
         let ops = Ops::new(&device.ctx)?;
         device.finish_upload()?;
         let s = &device.stream;
@@ -14073,8 +14457,12 @@ mod tests {
                     .find(|cell| cell.name == name)
                     .context(name)?;
                 let (max_abs, rmse) = image_max_rmse(candidate, reference)?;
-                let tau_max = image_dit_tau(cell.cross_max_abs);
-                let tau_rmse = image_dit_tau(cell.cross_rmse);
+                let (tau_max, tau_rmse) = scored_image_tau(
+                    sm,
+                    name,
+                    image_dit_tau(cell.cross_max_abs),
+                    image_dit_tau(cell.cross_rmse),
+                );
                 let ok = candidate.iter().all(|v| v.is_finite())
                     && max_abs <= tau_max
                     && rmse <= tau_rmse;
@@ -14096,9 +14484,19 @@ mod tests {
                 transposed_table.len(),
                 dit.rotary.len()
             );
-            dit.rotary = s.clone_htod(&shifted_table)?;
+            dit.rotary = upload_runtime_half(
+                s,
+                fp16_stored_half(&device.info.arch),
+                "image_rotary",
+                &shifted_table,
+            )?;
             let shift = velocity(&context, 0, &text_d, &mut dit)?;
-            dit.rotary = s.clone_htod(&transposed_table)?;
+            dit.rotary = upload_runtime_half(
+                s,
+                fp16_stored_half(&device.info.arch),
+                "image_rotary",
+                &transposed_table,
+            )?;
             let control = velocity(&context, 0, &text_d, &mut dit)?;
             let (shift_max, shift_rmse) = image_max_rmse(&shift, &step0_ref)?;
             let (shift_vs_max, shift_vs_rmse) = image_max_rmse(&shift, &step0)?;
@@ -14255,8 +14653,12 @@ mod tests {
                     .find(|cell| cell.name == name)
                     .context(name)?;
                 let (max_abs, rmse) = image_max_rmse(candidate, reference)?;
-                let tau_max = image_dit_tau(cell.cross_max_abs);
-                let tau_rmse = image_dit_tau(cell.cross_rmse);
+                let (tau_max, tau_rmse) = scored_image_tau(
+                    sm,
+                    name,
+                    image_dit_tau(cell.cross_max_abs),
+                    image_dit_tau(cell.cross_rmse),
+                );
                 let ok = candidate.iter().all(|v| v.is_finite())
                     && max_abs <= tau_max
                     && rmse <= tau_rmse;
@@ -14273,17 +14675,35 @@ mod tests {
             .iter()
             .find(|cell| cell.name == "dit_step0")
             .context("dit_step0")?;
-        let bar_max = 3.0 * image_dit_tau(step0_cell.cross_max_abs);
-        let bar_rmse = 3.0 * image_dit_tau(step0_cell.cross_rmse);
-        let shift_gt = shift_max > bar_max && shift_rmse > bar_rmse;
-        let caught = control_max > bar_max && control_rmse > bar_rmse;
+        let (bar_max, bar_rmse, shift_gt, caught) = if sm < 80 {
+            let (bar_max, bar_rmse) = fp16_dit_bound();
+            (
+                bar_max,
+                bar_rmse,
+                shift_vs_max > bar_max && shift_vs_rmse > bar_rmse,
+                versus_max > bar_max && versus_rmse > bar_rmse,
+            )
+        } else {
+            let bar_max = 3.0 * image_dit_tau(step0_cell.cross_max_abs);
+            let bar_rmse = 3.0 * image_dit_tau(step0_cell.cross_rmse);
+            (
+                bar_max,
+                bar_rmse,
+                shift_max > bar_max && shift_rmse > bar_rmse,
+                control_max > bar_max && control_rmse > bar_rmse,
+            )
+        };
         println!(
             "H3_IMAGE_DIT rope_shift max_abs={shift_max:.8e} rmse={shift_rmse:.8e} vs_step0_max={shift_vs_max:.8e} vs_step0_rmse={shift_vs_rmse:.8e} bar_max={bar_max:.8e} bar_rmse={bar_rmse:.8e} gt={shift_gt} sample_changed={sample_changed}"
         );
         println!(
             "H3_IMAGE_DIT rope_transpose max_abs={control_max:.8e} rmse={control_rmse:.8e} vs_step0_max={versus_max:.8e} vs_step0_rmse={versus_rmse:.8e} bar_max={bar_max:.8e} bar_rmse={bar_rmse:.8e} gt={caught} sample_changed={sample_changed}"
         );
-        ensure!(caught, "rope-transpose control stayed within 3x tau");
+        ensure!(
+            caught,
+            "rope-transpose control stayed within {}",
+            if sm < 80 { "the FP16 floor" } else { "3x tau" }
+        );
         ensure!(sample_changed, "image sample left the input unchanged");
         ensure!(
             defects.is_empty(),
@@ -14342,7 +14762,9 @@ mod tests {
     /// Canvas 4096, latent 256, 16384 image rows, S=16391. Placement is `Derived`.
     /// Step 0, Euler of a copy of those rows, then step 5. The reference is the G4 sdpa B=1 arm.
     /// Every image row swaps `(h, w)` to `(w, h)`.
-    /// Control bar dated 2026-11-12: both metrics must exceed `3 * tau`.
+    /// On sm >= 80 the control bar is `3 * tau` against the BF16 reference.
+    /// On sm < 80 a `dit_*` cell uses the prod64 floor. Euler stays on the frozen 4096 tau.
+    /// On sm < 80 the transpose must differ from the unshifted candidate by more than that floor.
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_H3_IMAGE, FF_H3_IMAGE_4096"]
     fn image_dit_4096_matches_the_frozen_cells() -> Result<()> {
@@ -14453,6 +14875,8 @@ mod tests {
             + sizing.staging
             + sizing.transient;
         let device = Device::new(0)?;
+        let sm = cubin::capability(&device.ctx)?;
+        println!("H3_IMAGE_4096 sm={sm}");
         let ops = Ops::new(&device.ctx)?;
         device.finish_upload()?;
         let s = &device.stream;
@@ -14584,7 +15008,7 @@ mod tests {
                 .find(|cell| cell.name == name)
                 .context(name)?;
             let (max_abs, rmse) = image_max_rmse(candidate, reference)?;
-            let (tau_max, tau_rmse) = (cell.tau_max, cell.tau_rmse);
+            let (tau_max, tau_rmse) = scored_image_tau(sm, name, cell.tau_max, cell.tau_rmse);
             let ok = max_abs <= tau_max && rmse <= tau_rmse;
             println!(
                 "H3_IMAGE_4096 {name} max_abs={max_abs:.8e} rmse={rmse:.8e} tau_max={tau_max:.8e} tau_rmse={tau_rmse:.8e} within={ok}"
@@ -14627,7 +15051,12 @@ mod tests {
             transposed.len(),
             dit.rotary.len()
         );
-        dit.rotary = s.clone_htod(&transposed)?;
+        dit.rotary = upload_runtime_half(
+            s,
+            fp16_stored_half(&device.info.arch),
+            "image_rotary",
+            &transposed,
+        )?;
         let control = velocity(0, &mut dit)?;
         ensure!(
             control.len() == image_rows * width && control.iter().all(|v| v.is_finite()),
@@ -14642,18 +15071,182 @@ mod tests {
             .iter()
             .find(|cell| cell.name == "dit_step0")
             .context("dit_step0")?;
-        let bar_max = 3.0 * step0_cell.tau_max;
-        let bar_rmse = 3.0 * step0_cell.tau_rmse;
-        let caught = control_max > bar_max && control_rmse > bar_rmse;
+        let (bar_max, bar_rmse, caught) = if sm < 80 {
+            let (bar_max, bar_rmse) = fp16_dit_bound();
+            (
+                bar_max,
+                bar_rmse,
+                versus_max > bar_max && versus_rmse > bar_rmse,
+            )
+        } else {
+            let bar_max = 3.0 * step0_cell.tau_max;
+            let bar_rmse = 3.0 * step0_cell.tau_rmse;
+            (
+                bar_max,
+                bar_rmse,
+                control_max > bar_max && control_rmse > bar_rmse,
+            )
+        };
         println!(
             "H3_IMAGE_4096 rope_transpose max_abs={control_max:.8e} rmse={control_rmse:.8e} vs_step0_max={versus_max:.8e} vs_step0_rmse={versus_rmse:.8e} bar_max={bar_max:.8e} bar_rmse={bar_rmse:.8e} gt={caught}"
         );
-        ensure!(caught, "rope-transpose control stayed within 3x tau");
+        ensure!(
+            caught,
+            "rope-transpose control stayed within {}",
+            if sm < 80 { "the FP16 floor" } else { "3x tau" }
+        );
         ensure!(
             defects.is_empty(),
             "H3_IMAGE_4096_GATE DEFECT cells outside the frozen taus: {defects:?}"
         );
         println!("H3_IMAGE_4096_GATE PASS cells=3 control=FAIL_AS_REQUIRED");
+        Ok(())
+    }
+
+    /// Canvas 2048, latent 128, 4096 image rows. Placement is `Streamed`.
+    /// One step of constant 0.1. The velocity is finite. Two device slots and no resident block.
+    /// Host pins follow the sensed host budget. The counted re-read is `disk_layers * slot_bytes * 6`.
+    #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_H3_IMAGE"]
+    fn image_dit_2048_streamed_admission() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let model = PathBuf::from(std::env::var_os("FF_H3_IMAGE").context("FF_H3_IMAGE missing")?);
+        let image_spec = ImageSpec::read(&model)?;
+        let spec = super::image_block_spec(&image_spec);
+        let width = image_spec.row_width();
+        let tokens = 64usize;
+        let latent = tokens * image_spec.patch[1];
+        ensure!(
+            width == 96 && latent == 128 && image_spec.patch == [1, 2, 2] && spec.layers == 50,
+            "2048 image geometry width={width} latent={latent} layers={} patch={:?}",
+            spec.layers,
+            image_spec.patch
+        );
+        let image_rows = tokens * tokens;
+        let tags = vec![TEXT_TAG; 7];
+        let text = vec![bf16::from_f32(0.1); tags.len() * image_spec.text_dim];
+        let rows_host = vec![0.1f32; image_rows * width];
+        let layout = image_layout(&image_spec, &tags, &[], latent, latent)?;
+        ensure!(
+            layout.image_indices.len() == image_rows
+                && layout.text_indices.len() == tags.len()
+                && layout.reference_rows == 0,
+            "2048 layout extents"
+        );
+        let schedule = ImageSchedule::published()?;
+        let row_plan =
+            AdalnPlan::from_tags(&layout.token_tags, &image_row_plan(&layout, &schedule)?)?;
+        let steps = row_plan.row_pairs.len();
+        ensure!(steps == 6, "evaluation count");
+        let dir = model.join("transformer_diffusers");
+        let manifest = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?
+            .minimax_h3_image_manifest(&image_spec)?;
+        let device = Device::new(0)?;
+        let sm = cubin::capability(&device.ctx)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-image-2048-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(true, "MiniMax-H3-Image 2048 admission".into())),
+        )?;
+        let visits = crate::prefill::placement_visits(schedule.timesteps.len(), 1)?;
+        let table = AdalnTable::build(&device, &mut blas, &dir, &manifest, &spec, &row_plan)?;
+        let mut dit = ImageDit::new(
+            &device,
+            &mut blas,
+            (&spec, &image_spec),
+            &layout,
+            &dir,
+            &manifest,
+            (Placement::Streamed, visits),
+        )?;
+        let host_budget = dit.placement.host_budget;
+        let plan = dit
+            .tier
+            .as_ref()
+            .context("2048 streamed tier missing")?
+            .dense
+            .plan
+            .clone();
+        let host_pins = plan.host.iter().filter(|flag| **flag).count();
+        let disk_layers = plan
+            .slots
+            .iter()
+            .zip(&plan.host)
+            .filter(|(slot, flag)| slot.is_some() && !**flag)
+            .count();
+        let resident = plan.slots.iter().filter(|slot| slot.is_none()).count();
+        let slot_n = plan
+            .slots
+            .iter()
+            .flatten()
+            .copied()
+            .max()
+            .map(|index| index + 1)
+            .context("2048 streamed slots missing")?;
+        let reread = disk_layers
+            .checked_mul(plan.slot_bytes)
+            .and_then(|bytes| bytes.checked_mul(steps))
+            .context("2048 re-read bytes overflow")?;
+        println!(
+            "H3_IMAGE_2048_PLACEMENT sm={sm} resident={resident} resident_bytes={} host_pins={host_pins} disk_layers={disk_layers} slot_bytes={} slot_count={slot_n} host_bytes={} disk_bytes={} host_budget={host_budget} visits={visits} reread_bytes={reread}",
+            plan.resident_bytes, plan.slot_bytes, plan.host_bytes, plan.disk_bytes
+        );
+        ensure!(
+            plan.slot_bytes == 770_703_360
+                && plan.resident_bytes == 0
+                && resident == 0
+                && slot_n == 2
+                && host_pins + disk_layers == spec.layers,
+            "2048 streamed placement slot_bytes={} resident_bytes={} resident={resident} slots={slot_n} host_pins={host_pins} disk_layers={disk_layers}",
+            plan.slot_bytes,
+            plan.resident_bytes
+        );
+        let kernels = BlockKernels::new(&device.ctx)?;
+        let context = BlockContext {
+            s,
+            blas: &blas,
+            kernels: &kernels,
+            spec: &spec,
+            lora_scale: 1.0,
+        };
+        let counts = (
+            u32::try_from(row_plan.pairs.len())?,
+            u32::try_from(row_plan.timesteps.len())?,
+        );
+        let rows_d = s.clone_htod(&rows_host)?;
+        let text_d = s.clone_htod(&text)?;
+        let row_pairs = s.clone_htod(&row_plan.row_pairs[0])?;
+        let row_timesteps = s.clone_htod(&row_plan.row_timesteps[0])?;
+        dit.step(
+            &context,
+            &table,
+            counts,
+            0,
+            &ImageStepInputs {
+                image: &rows_d,
+                text: &text_d,
+                row_pairs: &row_pairs,
+                row_timesteps: &row_timesteps,
+            },
+        )?;
+        let velocity = s.clone_dtoh(&dit.velocity)?;
+        drop(dit);
+        fs::remove_dir_all(&runtime)?;
+        ensure!(
+            velocity.len() == image_rows * width && velocity.iter().all(|value| value.is_finite()),
+            "2048 velocity length {} or a non-finite value",
+            velocity.len()
+        );
+        println!("H3_IMAGE_2048_ADMISSION finite=true rows={image_rows} width={width} sm={sm}");
         Ok(())
     }
 
@@ -16326,8 +16919,13 @@ mod tests {
             vector(&bias, s)?,
             mode,
         )?;
-        let x = s.clone_htod(&x_host)?;
-        let rotary = s.clone_htod(&rotary_host)?;
+        let x = upload_runtime_half(s, fp16_stored_half(&device.info.arch), "adaln", &x_host)?;
+        let rotary = upload_runtime_half(
+            s,
+            fp16_stored_half(&device.info.arch),
+            "rotary",
+            &rotary_host,
+        )?;
         let index = s.clone_htod(&adaln)?;
         let swapped = s.clone_htod(&swap_video_pair(&adaln))?;
         for (block, tau, reference_out) in [
@@ -16471,7 +17069,12 @@ mod tests {
         let mut work = BlockWork::new(s, &spec, 0, RAGGED_ROWS)?;
         work.plan_rotation(&device, &spec)?;
         work.prepare::<false>(&blas, &spec)?;
-        let ragged_rotary = s.clone_htod(&ragged_rotary_host)?;
+        let ragged_rotary = upload_runtime_half(
+            s,
+            fp16_stored_half(&device.info.arch),
+            "rotary",
+            &ragged_rotary_host,
+        )?;
         let ragged_index = s.clone_htod(&ragged_adaln)?;
         let ragged_swapped = s.clone_htod(&swap_video_pair(&ragged_adaln))?;
         for (block, tau, reference_out) in [
@@ -18036,6 +18639,30 @@ mod h3_direct_batch_tests {
     }
 
     #[test]
+    fn width2_finite_mask_follows_the_element() {
+        let word = |bits: u16| bits.to_le_bytes();
+        assert!(!runtime_half_finite(&word(0x7c00), Dtype::F16));
+        assert!(!runtime_half_finite(&word(0x7f80), Dtype::BF16));
+        let finite_fp16 = 0x7bffu16;
+        assert_eq!(finite_fp16 & 0x7f80, 0x7b80);
+        assert!(runtime_half_finite(&word(finite_fp16), Dtype::F16));
+        assert!(runtime_half_finite(&word(0x7c00), Dtype::BF16));
+        assert_eq!(
+            fill_element_dtype(FillCast::F32ToFp16, Dtype::F32),
+            Dtype::F16
+        );
+        assert_eq!(
+            fill_element_dtype(FillCast::Bf16ToFp16, Dtype::BF16),
+            Dtype::F16
+        );
+        assert_eq!(
+            fill_element_dtype(FillCast::F32ToBf16, Dtype::F32),
+            Dtype::BF16
+        );
+        assert_eq!(fill_element_dtype(FillCast::Raw, Dtype::BF16), Dtype::BF16);
+    }
+
+    #[test]
     fn converted_fill_narrows_f32_to_bf16_and_rejects_overflow() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("ff-h3-fillcast-{}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
@@ -18189,6 +18816,73 @@ mod h3_direct_batch_tests {
         assert!(!bf16_preferred_for_device(
             &sm89, &spec, &geometry, need, weights
         )?);
+        Ok(())
+    }
+
+    #[test]
+    fn bf16_to_fp16_fill_flushes_and_rejects_overflow() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("ff-h3-fp16-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let align = 4096usize;
+        let name = "model.language_model.layers.1.mlp.gate_proj.weight";
+        let mut source = vec![0u8; 2 * align];
+        let store = |source: &mut [u8], index: usize, bits: u16| {
+            let bytes = bits.to_le_bytes();
+            source[2 * index] = bytes[0];
+            source[2 * index + 1] = bytes[1];
+        };
+        store(&mut source, 0, 142 << 7);
+        store(&mut source, 1, (1 << 15) | (102 << 7) | 127);
+        store(&mut source, 2, 103 << 7);
+        store(&mut source, 3, 1 << 15);
+        std::fs::write(dir.join("shard.bin"), &source)?;
+        let entry = TensorEntry {
+            dtype: Dtype::BF16,
+            shape: vec![source.len() / 2],
+            shard: "shard.bin".into(),
+            bytes: source.len(),
+            load: true,
+            data_start: 0,
+            data_offsets: [0, 0],
+            scope: crate::checkpoint::TensorScope::Text,
+            layer: None,
+            role: String::new(),
+            scale_name: None,
+            quant: None,
+            swap_halves: false,
+        };
+        let nbytes = source.len();
+        let read = |arena: &mut AlignedBytes, cast: FillCast| {
+            OwnedRead::new(name, &entry, arena.as_mut().as_mut_ptr(), nbytes, cast)
+        };
+        let mut raw = AlignedBytes::new(source.len(), align)?;
+        let mut raw_thread = FillThread::spawn(&dir, vec![read(&mut raw, FillCast::Raw)])?;
+        raw_thread.join()?;
+        ensure!(
+            u16::from_le_bytes([raw.as_mut()[2], raw.as_mut()[3]]) == (1 << 15) | (102 << 7) | 127,
+            "raw fill rewrote BF16 bits"
+        );
+        let mut arena = AlignedBytes::new(source.len(), align)?;
+        let mut thread = FillThread::spawn(&dir, vec![read(&mut arena, FillCast::Bf16ToFp16)])?;
+        thread.join()?;
+        let word = |bytes: &[u8], index: usize| {
+            u16::from_le_bytes([bytes[2 * index], bytes[2 * index + 1]])
+        };
+        let got = arena.as_mut();
+        ensure!(word(got, 0) == 0x7800, "exponent 142");
+        ensure!(word(got, 1) == 0, "exponent 102");
+        ensure!(word(got, 2) == 1, "exponent 103");
+        ensure!(word(got, 3) == 0x8000, "negative zero");
+        store(&mut source, 0, 143 << 7);
+        std::fs::write(dir.join("shard.bin"), &source)?;
+        let mut overflow = AlignedBytes::new(source.len(), align)?;
+        let mut thread = FillThread::spawn(&dir, vec![read(&mut overflow, FillCast::Bf16ToFp16)])?;
+        let error = thread.join().expect_err("BF16 exponent 143");
+        ensure!(
+            format!("{error:#}").contains(name),
+            "overflow error lacks the tensor name: {error:#}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 }

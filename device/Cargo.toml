@@ -11,3 +11,7 @@ panic = "abort"
 opt-level = 3
 
 [workspace]
+
+# ff_sm75 is passed in RUSTFLAGS for sm below 80.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(ff_sm75)"] }

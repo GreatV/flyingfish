@@ -1877,6 +1877,27 @@ pub(crate) fn quant_source_finite(name: &str, entry: &TensorEntry, bytes: &[u8])
     Ok(())
 }
 
+/// Rewrites BF16 entries in a disk-tier layer. F32, I8, U8, and quantized entries stay.
+#[cfg(feature = "cuda")]
+fn rewrite_fp16_weights(layer: &DenseLayer, bytes: &mut [u8], report: bool) -> Result<()> {
+    for entry in &layer.entries {
+        if entry.narrow_f32 || entry.entry.quant.is_some() || entry.entry.dtype != Dtype::BF16 {
+            continue;
+        }
+        let end = entry
+            .source_offset
+            .checked_add(entry.entry.bytes)
+            .context("FP16 weight span")?;
+        ensure!(end <= bytes.len(), "{}: FP16 weight span", entry.name);
+        crate::tensors::bf16_weight_to_fp16(
+            &entry.name,
+            &mut bytes[entry.source_offset..end],
+            report,
+        )?;
+    }
+    Ok(())
+}
+
 /// Finiteness of a streamed layer's quantized source, over every entry's stored bytes.
 fn check_layer_source(layer: &DenseLayer, source: &[u8]) -> Result<()> {
     for entry in &layer.entries {
@@ -1926,6 +1947,9 @@ pub(crate) struct DenseStreaming {
     quant: Option<QuantKernels>,
     narrow_f32: Option<CudaFunction>,
     pub plan: crate::prefill::DensePlacement,
+    /// sm below 80. Disk reads of BF16 weights are rewritten to FP16 before the copy.
+    fp16_weights: bool,
+    fp16_scratch: Vec<u8>,
     #[cfg(test)]
     skip_reclaim: bool,
 }
@@ -1989,6 +2013,7 @@ impl DenseStreaming {
         narrow: Option<fn(&str) -> bool>,
     ) -> Result<Self> {
         use crate::experts::{catalogue::NativeRange, disk::DiskReader};
+        let fp16_weights = super::cubin::capability(&d.ctx)? < 80;
         let mut layers: Vec<_> = plan
             .slots
             .iter()
@@ -2203,10 +2228,8 @@ impl DenseStreaming {
             .then(|| QuantKernels::new(&d.ctx))
             .transpose()?;
         let narrow_f32 = if entries().any(|entry| entry.narrow_f32) {
-            Some(
-                super::cubin::module(&d.ctx, "vision_ops")?
-                    .load_function("vision_downcast_f32_to_bf16_checked")?,
-            )
+            let symbol = d.info.arch.decoder_f32_narrow_symbol();
+            Some(super::cubin::module(&d.ctx, "vision_ops")?.load_function(symbol)?)
         } else {
             None
         };
@@ -2224,6 +2247,8 @@ impl DenseStreaming {
             quant,
             narrow_f32,
             plan,
+            fp16_weights,
+            fp16_scratch: Vec::new(),
             #[cfg(test)]
             skip_reclaim: false,
         })
@@ -2446,8 +2471,33 @@ impl DenseStreaming {
             if check_source {
                 check_layer_source(&self.layers[index], raw)?;
             }
+            let fp16 = self.fp16_weights;
+            if fp16 {
+                // The previous HtoD from fp16_scratch has finished before that buffer is reused.
+                self.upload.synchronize()?;
+            }
+            let mut scratch = if fp16 {
+                std::mem::take(&mut self.fp16_scratch)
+            } else {
+                Vec::new()
+            };
+            if fp16 {
+                if scratch.len() < source_bytes {
+                    scratch.resize(source_bytes, 0);
+                }
+                scratch[..source_bytes].copy_from_slice(raw);
+                rewrite_fp16_weights(
+                    &self.layers[index],
+                    &mut scratch[..source_bytes],
+                    check_source,
+                )?;
+            }
+            let payload = if fp16 { &scratch[..source_bytes] } else { raw };
             unsafe {
-                super::copy::htod_async(source_pointer, raw, &self.upload)?;
+                super::copy::htod_async(source_pointer, payload, &self.upload)?;
+            }
+            if fp16 {
+                self.fp16_scratch = scratch;
             }
             #[cfg(test)]
             if self.skip_reclaim {

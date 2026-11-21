@@ -12,6 +12,60 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     }
 }
 
+#[cfg(ff_sm75)]
+const SM75_F16: bool = true;
+#[cfg(not(ff_sm75))]
+const SM75_F16: bool = false;
+
+// bytes other than 16 stores four zero words and does not load.
+#[cfg(ff_sm75)]
+#[inline(always)]
+unsafe fn stage16(shared: u32, shared_offset: u32, src: *const u16, src_offset: u32, bytes: u32) {
+    unsafe {
+        let mut x = 0u32;
+        let mut y = 0u32;
+        let mut z = 0u32;
+        let mut w = 0u32;
+        if bytes == 16 {
+            let p = src.cast::<u8>().wrapping_add(src_offset as usize);
+            asm!(
+                "ld.global.cg.v4.u32 {{{x}, {y}, {z}, {w}}}, [{s}];",
+                x = out(reg32) x,
+                y = out(reg32) y,
+                z = out(reg32) z,
+                w = out(reg32) w,
+                s = in(reg64) p
+            );
+        }
+        asm!(
+            "st.shared.v4.u32 [{d}], {{{x}, {y}, {z}, {w}}};",
+            d = in(reg32) shared.wrapping_add(shared_offset),
+            x = in(reg32) x,
+            y = in(reg32) y,
+            z = in(reg32) z,
+            w = in(reg32) w
+        );
+    }
+}
+
+// m16n8k16 A is (a0, a1) then (a2, a3). B is b0 then b1.
+#[cfg(ff_sm75)]
+#[inline(always)]
+unsafe fn mma_k8(a0: u32, a1: u32, b0: u32, c: &mut [f32; 4]) {
+    unsafe {
+        asm!(
+            "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {{{c0},{c1},{c2},{c3}}}, {{{a0},{a1}}}, {{{b0}}}, {{{c0},{c1},{c2},{c3}}};",
+            c0 = inout(reg32) c[0],
+            c1 = inout(reg32) c[1],
+            c2 = inout(reg32) c[2],
+            c3 = inout(reg32) c[3],
+            a0 = in(reg32) a0,
+            a1 = in(reg32) a1,
+            b0 = in(reg32) b0
+        );
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Attention {
@@ -48,6 +102,11 @@ fn address(base: u32, row: u32, col: u32, stride: u32) -> u32 {
 
 #[inline(always)]
 unsafe fn copy(dst: u32, src: *const u16, valid: bool) {
+    #[cfg(ff_sm75)]
+    unsafe {
+        stage16(dst, 0, src, 0, if valid { 16 } else { 0 });
+    }
+    #[cfg(not(ff_sm75))]
     unsafe {
         asm!("cp.async.cg.shared.global [{d}], [{s}], 16, {n};",
             d = in(reg32) dst, s = in(reg64) src, n = in(reg32) if valid { 16u32 } else { 0u32 });
@@ -56,12 +115,22 @@ unsafe fn copy(dst: u32, src: *const u16, valid: bool) {
 
 #[inline(always)]
 unsafe fn commit() {
+    #[cfg(ff_sm75)]
+    unsafe {
+        asm!("");
+    }
+    #[cfg(not(ff_sm75))]
     unsafe {
         asm!("cp.async.commit_group;");
     }
 }
 #[inline(always)]
 unsafe fn wait() {
+    #[cfg(ff_sm75)]
+    unsafe {
+        asm!("bar.sync 0;");
+    }
+    #[cfg(not(ff_sm75))]
     unsafe {
         asm!("cp.async.wait_group 0; bar.sync 0;");
     }
@@ -97,10 +166,22 @@ unsafe fn ld4_trans<const OFFSET: u32>(p: u32) -> [u32; 4] {
 unsafe fn mma<const F16: bool>(a: [u32; 4], b: [u32; 2], mut c: [f32; 4]) -> [f32; 4] {
     unsafe {
         if F16 {
+            #[cfg(ff_sm75)]
+            {
+                mma_k8(a[0], a[1], b[0], &mut c);
+                mma_k8(a[2], a[3], b[1], &mut c);
+            }
+            #[cfg(not(ff_sm75))]
             asm!("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{{c0},{c1},{c2},{c3}}}, {{{a0},{a1},{a2},{a3}}}, {{{b0},{b1}}}, {{{c0},{c1},{c2},{c3}}};",
                 c0=inout(reg32) c[0],c1=inout(reg32) c[1],c2=inout(reg32) c[2],c3=inout(reg32) c[3],
                 a0=in(reg32) a[0],a1=in(reg32) a[1],a2=in(reg32) a[2],a3=in(reg32) a[3],b0=in(reg32) b[0],b1=in(reg32) b[1]);
         } else {
+            #[cfg(ff_sm75)]
+            {
+                mma_k8(a[0], a[1], b[0], &mut c);
+                mma_k8(a[2], a[3], b[1], &mut c);
+            }
+            #[cfg(not(ff_sm75))]
             asm!("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {{{c0},{c1},{c2},{c3}}}, {{{a0},{a1},{a2},{a3}}}, {{{b0},{b1}}}, {{{c0},{c1},{c2},{c3}}};",
                 c0=inout(reg32) c[0],c1=inout(reg32) c[1],c2=inout(reg32) c[2],c3=inout(reg32) c[3],
                 a0=in(reg32) a[0],a1=in(reg32) a[1],a2=in(reg32) a[2],a3=in(reg32) a[3],b0=in(reg32) b[0],b1=in(reg32) b[1]);
@@ -165,6 +246,13 @@ unsafe fn reciprocal(a: f32) -> f32 {
 unsafe fn pack<const F16: bool>(a: f32, b: f32) -> u32 {
     let x;
     unsafe {
+        #[cfg(ff_sm75)]
+        {
+            let _ = F16;
+            asm!("{{.reg .f16 low, high; cvt.rn.f16.f32 low, {a}; cvt.rn.f16.f32 high, {b}; mov.b32 {x}, {{low, high}};}}",
+                x=out(reg32) x,a=in(reg32) a,b=in(reg32) b);
+        }
+        #[cfg(not(ff_sm75))]
         if F16 {
             asm!("cvt.rn.f16x2.f32 {x}, {b}, {a};",x=out(reg32) x,a=in(reg32) a,b=in(reg32) b);
         } else {
@@ -178,6 +266,10 @@ unsafe fn pack_residual<const F16: bool>(a: f32, b: f32, high: u32) -> u32 {
     let ah: f32;
     let bh: f32;
     unsafe {
+        #[cfg(ff_sm75)]
+        asm!("{{ .reg .b16 lo, hi; mov.b32 {{lo, hi}}, {high}; cvt.f32.f16 {ah}, lo; cvt.f32.f16 {bh}, hi; }}",
+            high=in(reg32) high,ah=out(reg32) ah,bh=out(reg32) bh);
+        #[cfg(not(ff_sm75))]
         if F16 {
             asm!("{{ .reg .b16 lo, hi; mov.b32 {{lo, hi}}, {high}; cvt.f32.f16 {ah}, lo; cvt.f32.f16 {bh}, hi; }}",
                 high=in(reg32) high,ah=out(reg32) ah,bh=out(reg32) bh);
@@ -283,6 +375,25 @@ unsafe fn copy_kv<const D: usize, const L: usize, const MASK: bool>(
     unsafe {
         macro_rules! transfer {
             ($i:expr) => {
+                #[cfg(ff_sm75)]
+                {
+                    if D == 96 {
+                        let bytes: u32 = if !MASK || row + ($i % 2) * 32 < rows { 16 } else { 0 };
+                        let src_off = (($i % 2) * 32 * L + ($i / 2) * 32) * 2;
+                        stage16(dst[0], ($i as u32) * 2048, src, src_off as u32, bytes);
+                    } else {
+                        let bytes: u32 = if (!MASK || row + $i * (1024 / D as u32) < rows)
+                            && col < L as u32
+                        {
+                            16
+                        } else {
+                            0
+                        };
+                        let src_off = $i * (1024 / D) * L * 2;
+                        stage16(dst[$i % 2], ($i as u32) / 2 * 4096, src, src_off as u32, bytes);
+                    }
+                }
+                #[cfg(not(ff_sm75))]
                 if D == 96 {
                     asm!("cp.async.cg.shared.global [{dst}+{shared_offset}], [{src}+{global_offset}], 16, {bytes};",
                         dst=in(reg32) dst[0],src=in(reg64) src,
@@ -312,6 +423,12 @@ unsafe fn copy_kv<const D: usize, const L: usize, const MASK: bool>(
 /// Launch uses 128 threads, 98304 shared bytes, disjoint BF16 Q/K/V/output and F32 LSE buffers covering the declared extents.
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
+    #[cfg(ff_sm75)]
+    unsafe {
+        let _ = p;
+        asm!("trap;", options(noreturn));
+    }
+    #[cfg(not(ff_sm75))]
     unsafe {
         let p = resolve_position(p);
         attention::<256, 32, 0, 256, false, true, false>(
@@ -332,7 +449,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128(p: Attention) {
     unsafe {
         let p = resolve_position(p);
-        attention::<128, 16, 0, 128, false, true, false>(
+        attention::<128, 16, 0, 128, SM75_F16, true, false>(
             p,
             p.start + p.rows,
             0,
@@ -348,6 +465,12 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d128(p: Attention) {
 /// All keys below `keys` are populated in this sequence; launch uses 128 threads and 98304 shared bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d256_bidirectional(p: Attention, keys: u32) {
+    #[cfg(ff_sm75)]
+    unsafe {
+        let _ = (p, keys);
+        asm!("trap;", options(noreturn));
+    }
+    #[cfg(not(ff_sm75))]
     unsafe {
         attention::<256, 32, 1, 256, false, true, false>(
             resolve_position(p),
@@ -371,6 +494,12 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_symmetric(
     right: u32,
     scale: f32,
 ) {
+    #[cfg(ff_sm75)]
+    unsafe {
+        let _ = (p, keys, left, right, scale);
+        asm!("trap;", options(noreturn));
+    }
+    #[cfg(not(ff_sm75))]
     unsafe {
         attention::<256, 32, 6, 256, false, true, false>(
             resolve_position(p),
@@ -392,6 +521,12 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_bidirectional_scored(
     keys: u32,
     scale: f32,
 ) {
+    #[cfg(ff_sm75)]
+    unsafe {
+        let _ = (p, keys, scale);
+        asm!("trap;", options(noreturn));
+    }
+    #[cfg(not(ff_sm75))]
     unsafe {
         let p = resolve_position(p);
         attention::<256, 32, 1, 256, false, true, false>(
@@ -410,6 +545,12 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_bidirectional_scored(
 /// Launch uses 128 threads, 98304 shared bytes, disjoint BF16 Q/K/V/output and F32 LSE buffers covering the declared extents.
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d256_scored(p: Attention, scale: f32) {
+    #[cfg(ff_sm75)]
+    unsafe {
+        let _ = (p, scale);
+        asm!("trap;", options(noreturn));
+    }
+    #[cfg(not(ff_sm75))]
     unsafe {
         let p = resolve_position(p);
         attention::<256, 32, 0, 256, false, true, false>(
@@ -430,7 +571,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_scored(p: Attention, sc
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_bidirectional(p: Attention, keys: u32) {
     unsafe {
         let p = resolve_position(p);
-        attention::<128, 16, 1, 128, false, true, false>(
+        attention::<128, 16, 1, 128, SM75_F16, true, false>(
             p,
             keys,
             0,
@@ -449,6 +590,12 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d128_bidirectional_single_pv
     p: Attention,
     keys: u32,
 ) {
+    #[cfg(ff_sm75)]
+    unsafe {
+        let _ = (p, keys);
+        asm!("trap;", options(noreturn));
+    }
+    #[cfg(not(ff_sm75))]
     unsafe {
         attention::<128, 16, 1, 128, false, false, false>(
             resolve_position(p),
@@ -470,6 +617,12 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d64_bidirectional(
     keys: u32,
     scale: f32,
 ) {
+    #[cfg(ff_sm75)]
+    unsafe {
+        let _ = (p, keys, scale);
+        asm!("trap;", options(noreturn));
+    }
+    #[cfg(not(ff_sm75))]
     unsafe {
         let p = resolve_position(p);
         attention::<64, 8, 1, 64, false, true, false>(p, keys, 0, 0, scale, core::ptr::null(), 0);
@@ -568,7 +721,15 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d64_bidirectional_windows(
         if tile * 64 >= p.rows {
             return;
         }
-        attention::<64, 8, 1, 64, false, true, false>(p, p.rows, 0, 0, scale, core::ptr::null(), 0);
+        attention::<64, 8, 1, 64, SM75_F16, true, false>(
+            p,
+            p.rows,
+            0,
+            0,
+            scale,
+            core::ptr::null(),
+            0,
+        );
     }
 }
 
@@ -643,6 +804,12 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d72_bidirectional(
     keys: u32,
     scale: f32,
 ) {
+    #[cfg(ff_sm75)]
+    unsafe {
+        let _ = (p, keys, scale);
+        asm!("trap;", options(noreturn));
+    }
+    #[cfg(not(ff_sm75))]
     unsafe {
         attention::<128, 16, 1, 72, false, true, false>(
             resolve_position(p),
@@ -667,6 +834,12 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_blocks(
     blocks: *const u32,
     origin: u32,
 ) {
+    #[cfg(ff_sm75)]
+    unsafe {
+        let _ = (p, keys, window, scale, blocks, origin);
+        asm!("trap;", options(noreturn));
+    }
+    #[cfg(not(ff_sm75))]
     unsafe {
         let p = resolve_position(p);
         attention::<256, 32, 5, 256, false, true, false>(p, keys, window, 0, scale, blocks, origin);
@@ -698,6 +871,12 @@ unsafe fn block_bounds(
 /// All prefix keys are populated; launch uses 128 threads and 49152 shared bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_prefix(p: Attention, prefix: u32) {
+    #[cfg(ff_sm75)]
+    unsafe {
+        let _ = (p, prefix);
+        asm!("trap;", options(noreturn));
+    }
+    #[cfg(not(ff_sm75))]
     unsafe {
         let p = resolve_position(p);
         attention::<128, 16, 2, 128, false, true, false>(
@@ -720,6 +899,12 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_window(
     window: u32,
     scale: f32,
 ) {
+    #[cfg(ff_sm75)]
+    unsafe {
+        let _ = (p, window, scale);
+        asm!("trap;", options(noreturn));
+    }
+    #[cfg(not(ff_sm75))]
     unsafe {
         let p = resolve_position(p);
         attention::<256, 32, 3, 256, false, true, false>(
@@ -740,7 +925,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_window(
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_window(p: Attention, window: u32) {
     unsafe {
         let p = resolve_position(p);
-        attention::<128, 16, 3, 128, false, true, false>(
+        attention::<128, 16, 3, 128, SM75_F16, true, false>(
             p,
             p.start + p.rows,
             window,
@@ -1314,6 +1499,12 @@ unsafe fn attention<
 /// Launch uses 128 threads, 90112 shared bytes and buffers covering the declared extents.
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d512(p: Attention, scale: f32) {
+    #[cfg(ff_sm75)]
+    unsafe {
+        let _ = (p, scale);
+        asm!("trap;", options(noreturn));
+    }
+    #[cfg(not(ff_sm75))]
     unsafe {
         let p = resolve_position(p);
         attention_d512::<false, false>(p, 0, scale, core::ptr::null_mut(), 1, 0)
@@ -1328,6 +1519,12 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d512_bidirectional(
     keys: u32,
     scale: f32,
 ) {
+    #[cfg(ff_sm75)]
+    unsafe {
+        let _ = (p, keys, scale);
+        asm!("trap;", options(noreturn));
+    }
+    #[cfg(not(ff_sm75))]
     unsafe {
         let p = resolve_position(p);
         attention_d512::<false, true>(p, keys, scale, core::ptr::null_mut(), 1, 0)
@@ -1344,6 +1541,12 @@ pub unsafe extern "ptx-kernel" fn attention_partial_d512(
     parts: u32,
     chunk: u32,
 ) {
+    #[cfg(ff_sm75)]
+    unsafe {
+        let _ = (p, scale, partials, parts, chunk);
+        asm!("trap;", options(noreturn));
+    }
+    #[cfg(not(ff_sm75))]
     unsafe {
         let p = resolve_position(p);
         attention_d512::<true, false>(p, 0, scale, partials, parts, chunk)
@@ -1663,6 +1866,12 @@ pub unsafe extern "ptx-kernel" fn attention_merge_d512(
     partials: *const f32,
     parts: u32,
 ) {
+    #[cfg(ff_sm75)]
+    unsafe {
+        let _ = (p, partials, parts);
+        asm!("trap;", options(noreturn));
+    }
+    #[cfg(not(ff_sm75))]
     unsafe {
         let (tid, row, head): (u32, u32, u32);
         asm!("mov.u32 {t}, %tid.x; mov.u32 {r}, %ctaid.x; mov.u32 {h}, %ctaid.y;",

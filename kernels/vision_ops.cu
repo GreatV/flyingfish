@@ -1,4 +1,7 @@
 #include "gpu_compat.cuh"
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+#include "ff_sm75_f16.cuh"
+#endif
 #include <stdint.h>
 #include <math.h>
 
@@ -185,8 +188,13 @@ extern "C" __global__ void vision_affine_cast_bf16(
     for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
          i += uint64_t(gridDim.x) * 256) {
         const float value = __fmul_rn(__fadd_rn(input[i], shift), scale);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+        const __nv_bfloat16 rounded = ff_f16_from_f32<__nv_bfloat16>(value);
+        if (!isfinite(value) || !isfinite(ff_f32_from_f16(rounded))) { __trap(); return; }
+#else
         const __nv_bfloat16 rounded = __float2bfloat16_rn(value);
         if (!isfinite(value) || !isfinite(__bfloat162float(rounded))) { __trap(); return; }
+#endif
         output[i] = rounded;
     }
 }
@@ -406,7 +414,14 @@ __device__ __forceinline__ void vision_upcast(
 }
 extern "C" __global__ void vision_upcast_f32(
     const __nv_bfloat16* input, float* output, uint32_t count) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+    if (!vision_flat_launch() || !input || !output || !count) { __trap(); return; }
+    for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
+        output[i] = ff_f32_from_f16(input[i]);
+    }
+#else
     vision_upcast(input, output, count);
+#endif
 }
 
 extern "C" __global__ void vision_bias_f32(
@@ -479,7 +494,13 @@ __device__ __forceinline__ void vision_rms_scale(
         float normalized = __fmul_rn(float(input[uint64_t(row) * width + i]), rstd);
         float scaled = __fmul_rn(normalized, scale[i * scale_stride]);
         if (output_f32) output_f32[uint64_t(row) * width + i] = scaled;
-        if (output_bf16) output_bf16[uint64_t(row) * width + i] = __float2bfloat16_rn(scaled);
+        if (output_bf16) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+            output_bf16[uint64_t(row) * width + i] = ff_f16_from_f32<__nv_bfloat16>(scaled);
+#else
+            output_bf16[uint64_t(row) * width + i] = __float2bfloat16_rn(scaled);
+#endif
+        }
     }
 }
 
@@ -510,8 +531,13 @@ extern "C" __global__ __launch_bounds__(256, 6) void scaled_residual_rms_f32(
         const uint32_t i = threadIdx.x + k * kResidualRmsThreads;
         if (i < width) {
             const uint64_t idx = row_off + i;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+            const float x = __fadd_rn(residual[idx],
+                                      __fmul_rn(ff_f32_from_f16(delta[idx]), res_scale[i]));
+#else
             const float x = __fadd_rn(residual[idx],
                                       __fmul_rn(__bfloat162float(delta[idx]), res_scale[i]));
+#endif
             residual[idx] = x;
             r[k] = x;
             sum = __fadd_rn(sum, __fmul_rn(x, x));
@@ -525,7 +551,13 @@ extern "C" __global__ __launch_bounds__(256, 6) void scaled_residual_rms_f32(
             const uint64_t idx = row_off + i;
             const float scaled = __fmul_rn(__fmul_rn(r[k], rstd), norm_scale[i]);
             if (output_f32) output_f32[idx] = scaled;
-            if (output_bf16) output_bf16[idx] = __float2bfloat16_rn(scaled);
+            if (output_bf16) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+                output_bf16[idx] = ff_f16_from_f32<__nv_bfloat16>(scaled);
+#else
+                output_bf16[idx] = __float2bfloat16_rn(scaled);
+#endif
+            }
         }
     }
 }
@@ -603,7 +635,11 @@ extern "C" __global__ void scaled_residual_f32(
         count % width) { __trap(); return; }
     for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
          i += uint64_t(gridDim.x) * 256)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+        residual[i] = __fadd_rn(residual[i], __fmul_rn(ff_f32_from_f16(delta[i]), scale[i % width]));
+#else
         residual[i] = __fadd_rn(residual[i], __fmul_rn(__bfloat162float(delta[i]), scale[i % width]));
+#endif
 }
 
 // Token rows [frames * height * width, channels * pt * p * p] -> pixels [channels, frames * pt, height * p, width * p].
@@ -653,8 +689,13 @@ extern "C" __global__ void tile_rows_f32_to_bf16(
         const uint32_t y0 = grid[tile / grid_cols] / ratio, x0 = col_start[tile % grid_cols] / ratio;
         if (y0 + tile_h > height || x0 + tile_w > width) { __trap(); return; }
         const uint32_t y = y0 + (pixel % pixels) / tile_w, x = x0 + pixel % tile_w;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+        output[i] = ff_f16_from_f32<__nv_bfloat16>(__fadd_rn(
+            __fmul_rn(input[(uint64_t(channel) * height + y) * width + x], scale[channel]), bias[channel]));
+#else
         output[i] = __float2bfloat16_rn(__fadd_rn(
             __fmul_rn(input[(uint64_t(channel) * height + y) * width + x], scale[channel]), bias[channel]));
+#endif
     }
 }
 
@@ -670,8 +711,13 @@ __device__ __forceinline__ void append_register_rows(
          i += uint64_t(gridDim.x) * 256) {
         const uint32_t channel = i % width;
         const uint64_t row = i / width, token = row % tokens;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+        output[i] = token < rows ? ff_f32_from_f16(input[(row / tokens * rows + token) * width + channel])
+            : (token < rows + suffix ? ff_f32_from_f16(registers[(token - rows) * width + channel]) : 0.0f);
+#else
         output[i] = token < rows ? float(input[(row / tokens * rows + token) * width + channel])
             : (token < rows + suffix ? float(registers[(token - rows) * width + channel]) : 0.0f);
+#endif
     }
 }
 
@@ -687,6 +733,8 @@ extern "C" __global__ void append_register_rows_bf16_to_f32(
 __device__ __forceinline__ __nv_bfloat16 bf16_mul_round(__nv_bfloat16 a, __nv_bfloat16 b) {
 #if defined(__HIP__)
     return __float2bfloat16_rn(__fmul_rn(float(a), float(b)));
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+    return ff_hmul(a, b);
 #else
     return __hmul_rn(a, b);
 #endif
@@ -695,6 +743,8 @@ __device__ __forceinline__ __nv_bfloat16 bf16_mul_round(__nv_bfloat16 a, __nv_bf
 __device__ __forceinline__ __nv_bfloat16 bf16_add_round(__nv_bfloat16 a, __nv_bfloat16 b) {
 #if defined(__HIP__)
     return __float2bfloat16_rn(__fadd_rn(float(a), float(b)));
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+    return ff_hadd(a, b);
 #else
     return __hadd_rn(a, b);
 #endif
@@ -703,6 +753,8 @@ __device__ __forceinline__ __nv_bfloat16 bf16_add_round(__nv_bfloat16 a, __nv_bf
 __device__ __forceinline__ __nv_bfloat16 bf16_sub_round(__nv_bfloat16 a, __nv_bfloat16 b) {
 #if defined(__HIP__)
     return __float2bfloat16_rn(__fsub_rn(float(a), float(b)));
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+    return ff_hsub(a, b);
 #else
     return __hsub_rn(a, b);
 #endif
@@ -727,7 +779,11 @@ __device__ __forceinline__ void head_pack_smem_q_or_k(
     const uint32_t active_warps = min(8u, (dim + 31u) >> 5);
     for (uint32_t w = 0u; w < active_warps; ++w) {
         const uint32_t i = w * 32u + lane;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+        const float x = i < dim ? ff_f32_from_f16(warp_smem[i]) : 0.0f;
+#else
         const float x = i < dim ? float(warp_smem[i]) : 0.0f;
+#endif
         float acc = __fmul_rn(x, x);
         for (int delta = 16; delta; delta >>= 1)
             acc = __fadd_rn(acc, __shfl_down_sync(FF_WARP_MASK, acc, delta));
@@ -738,15 +794,25 @@ __device__ __forceinline__ void head_pack_smem_q_or_k(
         my_p = __fadd_rn(my_p, __shfl_down_sync(FF_WARP_MASK, my_p, delta));
     const float rstd = __shfl_sync(FF_WARP_MASK, rsqrtf(__fadd_rn(my_p / float(dim), eps)), 0);
     for (uint32_t i = lane; i < dim; i += 32u) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+        const float normalized = __fmul_rn(ff_f32_from_f16(warp_smem[i]), rstd);
+        warp_smem[i] = ff_f16_from_f32<__nv_bfloat16>(__fmul_rn(normalized, 1.0f));
+#else
         const float normalized = __fmul_rn(float(warp_smem[i]), rstd);
         warp_smem[i] = __float2bfloat16_rn(__fmul_rn(normalized, 1.0f));
+#endif
     }
     __syncwarp();
     for (uint32_t pair = lane; pair < half; pair += 32u) {
         const auto a = warp_smem[pair];
         const auto b = warp_smem[pair + half];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+        const auto c = ff_f16_from_f32<__nv_bfloat16>(t_row[pair]);
+        const auto s = ff_f16_from_f32<__nv_bfloat16>(t_row[pair + half]);
+#else
         const auto c = __float2bfloat16_rn(t_row[pair]);
         const auto s = __float2bfloat16_rn(t_row[pair + half]);
+#endif
         warp_smem[pair] = bf16_sub_round(bf16_mul_round(a, c), bf16_mul_round(b, s));
         warp_smem[pair + half] = bf16_add_round(bf16_mul_round(b, c), bf16_mul_round(a, s));
     }
@@ -797,7 +863,11 @@ extern "C" __global__ void planar_bf16_affine_rows_f32(
     for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < pixels * channels;
          i += uint64_t(gridDim.x) * 256) {
         const uint32_t channel = i % channels;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+        output[i] = __fadd_rn(__fmul_rn(ff_f32_from_f16(input[uint64_t(channel) * pixels + i / channels]), scale[channel]), bias[channel]);
+#else
         output[i] = __fadd_rn(__fmul_rn(__bfloat162float(input[uint64_t(channel) * pixels + i / channels]), scale[channel]), bias[channel]);
+#endif
     }
 }
 
@@ -814,10 +884,17 @@ __device__ __forceinline__ float linear_blend(float a, float b, uint32_t positio
 
 __device__ __forceinline__ __nv_bfloat16 linear_blend(
     __nv_bfloat16 a, __nv_bfloat16 b, uint32_t position, uint32_t extent) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+    const float p = ff_f32_from_f16(ff_f16_from_f32<__nv_bfloat16>(float(position)));
+    const auto w = ff_f16_from_f32<__nv_bfloat16>(__fdiv_rn(p, float(extent)));
+    const auto inv = bf16_sub_round(ff_f16_from_f32<__nv_bfloat16>(1.0f), w);
+    return bf16_add_round(bf16_mul_round(a, inv), bf16_mul_round(b, w));
+#else
     const float p = __bfloat162float(__float2bfloat16_rn(float(position)));
     const auto w = __float2bfloat16_rn(__fdiv_rn(p, float(extent)));
     const auto inv = bf16_sub_round(__float2bfloat16_rn(1.0f), w);
     return bf16_add_round(bf16_mul_round(a, inv), bf16_mul_round(b, w));
+#endif
 }
 
 // Raw tiles [rows * cols, planes, tile_h, tile_w] -> canvas [planes, canvas_h, canvas_w]. grid holds the row starts,
@@ -875,6 +952,7 @@ extern "C" __global__ void tile_stitch_bf16(
 
 // out[c, out_first + k, :] = linear blend of a[c, a_first + k, :] and b[c, b_first + k, :] at position k of extent
 // frames; a, b and out are [channels, frames, plane] with their own frame counts.
+// Below sm80, a and b hold FP16 bits and linear_blend loads them with cvt.f32.f16.
 extern "C" __global__ void frame_blend_bf16(
     const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out, uint32_t channels,
     uint32_t extent, uint64_t plane, uint32_t a_frames, uint32_t a_first, uint32_t b_frames,

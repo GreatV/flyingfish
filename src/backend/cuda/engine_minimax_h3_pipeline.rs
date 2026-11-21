@@ -153,7 +153,8 @@ fn condition_prompt(
     let manifest = MappedCheckpoint::open_component(&encoder, "model")?
         .minimax_h3_conditioner_manifest(&spec, TEXT_ENCODER_LAYER)?;
     let hidden = spec.hidden as usize;
-    let table = conditioner_table(&encoder, &manifest, prompt, image_token, hidden)?;
+    let fp16 = cubin::capability(&device.ctx)? < 80;
+    let table = conditioner_table(&encoder, &manifest, prompt, image_token, hidden, fp16)?;
     let runs = image_runs(&prompt.tokens, image_token);
     ensure!(
         runs.is_empty() == prompt.grids.is_empty()
@@ -231,6 +232,7 @@ fn conditioner_table(
     prompt: &ConditionerPrompt,
     image_token: u32,
     hidden: usize,
+    fp16: bool,
 ) -> Result<std::collections::BTreeMap<u32, Vec<bf16>>> {
     let ids: Vec<u32> = prompt
         .tokens
@@ -245,6 +247,7 @@ fn conditioner_table(
         "model.language_model.embed_tokens.weight",
         hidden,
         &ids,
+        fp16,
     )?;
     Ok(ids
         .iter()
@@ -779,7 +782,7 @@ fn run_mode<const SETUP_ONLY: bool>(
         let text = s.clone_htod(&text)?;
         let hoist = {
             let disk_tier = !dit.hoist_ready()?;
-            super::vae::hoist_video_vae(model, disk_tier)?
+            super::vae::hoist_video_vae(model, disk_tier, &device.info.arch)?
         };
         dit.sample(
             &context,
@@ -1370,12 +1373,14 @@ impl ConditionerStage {
             runs.is_empty() == self.vision.is_none(),
             "resident vision input changed"
         );
+        let fp16 = cubin::capability(&device.ctx)? < 80;
         let table = conditioner_table(
             &self.dir,
             &self.manifest,
             prompt,
             self.image_token,
             self.spec.hidden as usize,
+            fp16,
         )?;
         let encoded = self
             .vision

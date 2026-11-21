@@ -369,12 +369,18 @@ __device__ __forceinline__ void nvfp4_mma_bf16_impl(
                 #pragma unroll
                 for (int ns = 0; ns < N_SUB; ++ns) {
                     float* d = accum[ns][ms];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+                    asm volatile("trap;" ::"f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3]),
+                                 "r"(a[ns][0]), "r"(a[ns][1]), "r"(a[ns][2]), "r"(a[ns][3]),
+                                 "r"(b0), "r"(b1));
+#else
                     asm volatile(
                         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                         : "r"(a[ns][0]), "r"(a[ns][1]), "r"(a[ns][2]), "r"(a[ns][3]),
                           "r"(b0), "r"(b1));
+#endif
                 }
             }
         }
@@ -402,29 +408,67 @@ __device__ __forceinline__ void nvfp4_mma_bf16_impl(
                 const int x_bytes = x_live ? 16 : 0;
                 const unsigned x_dst =
                     (unsigned)__cvta_generic_to_shared(&smem.pipe.x[stage][xr][x_col]);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+                {
+                  unsigned x0 = 0u, y0 = 0u, z0 = 0u, w0 = 0u;
+                  if (x_bytes == 16) {
+                    asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];"
+                                 : "=r"(x0), "=r"(y0), "=r"(z0), "=r"(w0)
+                                 : "l"(x_src));
+                  }
+                  asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" ::"r"(x_dst), "r"(x0),
+                               "r"(y0), "r"(z0), "r"(w0));
+                }
+#else
                 asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;"
                     :: "r"(x_dst), "l"(x_src), "r"(x_bytes) : "memory");
+#endif
             }
             const uint8_t* w_src = w_live ? (w_base + uint64_t(k0 >> 1)) : w;
             const unsigned w_dst =
                 (unsigned)__cvta_generic_to_shared(&smem.pipe.w_codes[stage][w_row][w_swz_col]);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+            {
+              unsigned x0 = 0u, y0 = 0u, z0 = 0u, w0 = 0u;
+              if (w_bytes == 16) {
+                asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];"
+                             : "=r"(x0), "=r"(y0), "=r"(z0), "=r"(w0)
+                             : "l"(w_src));
+              }
+              asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" ::"r"(w_dst), "r"(x0),
+                           "r"(y0), "r"(z0), "r"(w0));
+            }
+#else
             asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;"
                 :: "r"(w_dst), "l"(w_src), "r"(w_bytes) : "memory");
+#endif
             if (tid < BN) {
                 smem.pipe.w_scales[stage][tid] = (n0 + tid < n)
                     ? __ldg(reinterpret_cast<const uint32_t*>(
                           scales + uint64_t(n0 + tid) * uint64_t(k >> 4) + uint64_t(k0 >> 4)))
                     : 0u;
             }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+            asm volatile("" ::: "memory");
+#else
             asm volatile("cp.async.commit_group;" ::: "memory");
+#endif
         };
         stage_tile(0, 0);
         for (int k0 = 0, stage = 0; k0 < k; k0 += BK, stage ^= 1) {
             if (k0 + BK < k) {
                 stage_tile(stage ^ 1, k0 + BK);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+                __syncthreads();
+#else
                 asm volatile("cp.async.wait_group 1;" ::: "memory");
+#endif
             } else {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+                __syncthreads();
+#else
                 asm volatile("cp.async.wait_group 0;" ::: "memory");
+#endif
             }
             __syncthreads();
             consume_stage(stage, 4);

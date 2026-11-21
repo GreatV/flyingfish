@@ -164,26 +164,15 @@ impl Plan {
         input: usize,
         workspace: usize,
         algo_index: u32,
-    ) -> Result<Self> {
-        Self::new_with_bias(handle, rows, output, input, workspace, algo_index, None)
-    }
-
-    fn new_with_bias(
-        handle: sys::cublasLtHandle_t,
-        rows: usize,
-        output: usize,
-        input: usize,
-        workspace: usize,
-        algo_index: u32,
-        bias: Option<u64>,
+        ab: sys::cudaDataType_t,
     ) -> Result<Self> {
         Self::build(
             handle,
             (rows, output, input, input),
             workspace,
-            bias,
-            sys::cudaDataType_t::CUDA_R_16BF,
-            sys::cudaDataType_t::CUDA_R_16BF,
+            None,
+            ab,
+            ab,
             PlanAlgo::Heuristic(algo_index),
         )
     }
@@ -260,7 +249,7 @@ impl Plan {
         };
         p.desc = lt::create_matmul_desc(
             sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            sys::cudaDataType_t::CUDA_R_32F,
+            cuda_lt_dtype(crate::backend::setup::lt_compute_operand()),
         )?;
         let transpose = 1i32;
         unsafe {
@@ -501,6 +490,19 @@ impl Drop for RouteLogits {
 
 type LinearPlans = RefCell<BTreeMap<(usize, usize, usize, u32, bool), Plan>>;
 
+fn biased_group_dtypes(half: sys::cudaDataType_t) -> (sys::cudaDataType_t, sys::cudaDataType_t) {
+    (half, half)
+}
+
+fn cuda_lt_dtype(operand: crate::backend::setup::LtOperand) -> sys::cudaDataType_t {
+    use crate::backend::setup::LtOperand;
+    match operand {
+        LtOperand::F32 => sys::cudaDataType_t::CUDA_R_32F,
+        LtOperand::F16 => sys::cudaDataType_t::CUDA_R_16F,
+        LtOperand::Bf16 => sys::cudaDataType_t::CUDA_R_16BF,
+    }
+}
+
 pub struct Blas {
     choices: RefCell<BTreeMap<LinearShape, (LinearChoice, u32)>>,
     coverage: Option<(usize, std::collections::BTreeSet<(usize, usize)>)>,
@@ -520,6 +522,7 @@ pub struct Blas {
     bias_add: Option<CudaFunction>,
     bias_fill_f16: Option<CudaFunction>,
     handle: sys::cublasLtHandle_t,
+    half_dtype: sys::cudaDataType_t,
     decode: CudaBlas,
     workspace: RefCell<CudaSlice<u8>>,
     stream: Arc<CudaStream>,
@@ -699,6 +702,11 @@ impl Blas {
         closure: Rc<super::closure::Closure>,
     ) -> Result<Self> {
         device.info.require_cuda_tensor_ops("gemm_skinny")?;
+        let half_dtype = cuda_lt_dtype(device.info.arch.published_bf16_lt());
+        ensure!(
+            cuda_lt_dtype(device.info.arch.published_f32_lt()) == sys::cudaDataType_t::CUDA_R_32F,
+            "published F32 Lt operand is CUDA_R_32F"
+        );
         let stream = device.stream.clone();
         let calibration =
             linear_calibrate::Environment::new(device, ops, runtime, closure.clone())?;
@@ -731,6 +739,7 @@ impl Blas {
             bias_add: None,
             bias_fill_f16: None,
             handle,
+            half_dtype,
             decode,
             workspace: RefCell::new(workspace),
             stream,
@@ -793,6 +802,7 @@ impl Blas {
                 input,
                 self.workspace.borrow().len(),
                 algo_index,
+                self.half_dtype,
             )
             .with_context(|| format!("Lt plan rows={rows} output={output} input={input}"))?;
             p.describe(rows, output, input)?;
@@ -1221,8 +1231,8 @@ impl Blas {
                 (key.0, key.1, key.2, key.3),
                 self.workspace.borrow().len(),
                 None,
-                sys::cudaDataType_t::CUDA_R_16BF,
-                sys::cudaDataType_t::CUDA_R_16BF,
+                self.half_dtype,
+                self.half_dtype,
                 PlanAlgo::Heuristic(0),
             )?;
             self.pitched_b.borrow_mut().insert(key, plan);
@@ -1244,6 +1254,7 @@ impl Blas {
             shape.input,
             self.workspace.borrow().len(),
             0,
+            self.half_dtype,
         )?;
         let algo = plan.algo.context("canonical Lt algorithm missing")?;
         self.row_families
@@ -1268,8 +1279,8 @@ impl Blas {
                 (shape.rows, shape.output, shape.input, shape.input),
                 self.workspace.borrow().len(),
                 None,
-                sys::cudaDataType_t::CUDA_R_16BF,
-                sys::cudaDataType_t::CUDA_R_16BF,
+                self.half_dtype,
+                self.half_dtype,
                 PlanAlgo::Fixed(algo),
             )?;
             self.plans.borrow_mut().insert(key, plan);
@@ -1337,6 +1348,7 @@ impl Blas {
             shape.input,
             self.workspace.borrow().len(),
             1,
+            self.half_dtype,
         )?;
         let index = lower_wave_index(&[waves, f64::from(alternative.waves)])?;
         if crate::backend::diagnostics_enabled() {
@@ -1392,6 +1404,7 @@ impl Blas {
                     shape.input,
                     original_workspace,
                     0,
+                    self.half_dtype,
                 )?;
                 if crate::backend::diagnostics_enabled() {
                     eprintln!(
@@ -1437,6 +1450,7 @@ impl Blas {
                 key.2,
                 self.workspace.borrow().len(),
                 0,
+                self.half_dtype,
             )?;
             self.plans.borrow_mut().insert(key, p);
         }
@@ -2131,14 +2145,14 @@ impl Blas {
         let key = (shape, bias.ptr, mode);
         let mut plans = self.biased_plans.borrow_mut();
         if let std::collections::btree_map::Entry::Vacant(entry) = plans.entry(key) {
-            let plan = Plan::new_with_bias(
+            let plan = Plan::build(
                 self.handle,
-                shape.rows,
-                shape.output,
-                shape.input,
+                (shape.rows, shape.output, shape.input, shape.input),
                 self.workspace.borrow().len(),
-                0,
                 (mode == super::linear::LinearBiasMode::BeforeOutputRound).then_some(bias.ptr),
+                self.half_dtype,
+                self.half_dtype,
+                PlanAlgo::Heuristic(0),
             )?;
             plan.describe(shape.rows, shape.output, shape.input)?;
             entry.insert(plan);
@@ -2178,14 +2192,14 @@ impl Blas {
             plans.entry((shape, bias.ptr, mode))
         {
             let workspace = self.workspace.borrow().len();
-            let dtype = sys::cudaDataType_t::CUDA_R_16BF;
+            let (ab, c) = biased_group_dtypes(self.half_dtype);
             let plan = Plan::build(
                 self.handle,
                 (rows, shape.output, shape.input, shape.input),
                 workspace,
                 Some(bias.ptr),
-                dtype,
-                dtype,
+                ab,
+                c,
                 PlanAlgo::Fixed(algo),
             )?;
             ensure!(
@@ -2227,14 +2241,14 @@ impl Blas {
         let key = (shape, bias.ptr, mode);
         let mut plans = self.biased_plans.borrow_mut();
         if let std::collections::btree_map::Entry::Vacant(entry) = plans.entry(key) {
-            let plan = Plan::new_with_bias(
+            let plan = Plan::build(
                 self.handle,
-                shape.rows,
-                shape.output,
-                shape.input,
+                (shape.rows, shape.output, shape.input, shape.input),
                 1 << 20,
-                0,
                 (mode == super::linear::LinearBiasMode::BeforeOutputRound).then_some(bias.ptr),
+                self.half_dtype,
+                self.half_dtype,
+                PlanAlgo::Heuristic(0),
             )?;
             plan.describe(shape.rows, shape.output, shape.input)?;
             entry.insert(plan);
@@ -2490,6 +2504,36 @@ impl Blas {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use half::f16;
+
+    #[test]
+    fn lt_operand_maps_to_cublas_data_type() {
+        use crate::backend::setup::{LtOperand, lt_compute_operand};
+        assert_eq!(
+            cuda_lt_dtype(LtOperand::F16),
+            sys::cudaDataType_t::CUDA_R_16F
+        );
+        assert_eq!(
+            cuda_lt_dtype(LtOperand::Bf16),
+            sys::cudaDataType_t::CUDA_R_16BF
+        );
+        assert_eq!(
+            cuda_lt_dtype(LtOperand::F32),
+            sys::cudaDataType_t::CUDA_R_32F
+        );
+        assert_eq!(
+            cuda_lt_dtype(lt_compute_operand()),
+            sys::cudaDataType_t::CUDA_R_32F
+        );
+    }
+
+    #[test]
+    fn grouped_biased_plan_keeps_the_fp16_operand() {
+        let fp16 = sys::cudaDataType_t::CUDA_R_16F;
+        assert_eq!(biased_group_dtypes(fp16), (fp16, fp16));
+        let bf16 = sys::cudaDataType_t::CUDA_R_16BF;
+        assert_eq!(biased_group_dtypes(bf16), (bf16, bf16));
+    }
 
     #[test]
     #[ignore = "exclusive CUDA window and an empty FLYINGFISH_RUNTIME_DIR"]
@@ -2697,5 +2741,388 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    struct Floor {
+        name: &'static str,
+        m: i32,
+        out: i32,
+        k: i32,
+        tiny: i32,
+        pad_k: i32,
+        tile: bool,
+        max_abs: f64,
+        rmse: f64,
+    }
+
+    // Twice the 2026-11-19T10:35:51Z floor. eps_min 1e-6 / 1e-7 does not bind.
+    const FLOOR: &[Floor] = &[
+        Floor {
+            name: "tiny1",
+            m: 1,
+            out: 8,
+            k: 32,
+            tiny: 1,
+            pad_k: 0,
+            tile: false,
+            max_abs: 0.015625,
+            rmse: 0.0126576966,
+        },
+        Floor {
+            name: "tiny7",
+            m: 7,
+            out: 16,
+            k: 128,
+            tiny: 1,
+            pad_k: 0,
+            tile: false,
+            max_abs: 0.5,
+            rmse: 0.123593084,
+        },
+        Floor {
+            name: "full16",
+            m: 16,
+            out: 48,
+            k: 256,
+            tiny: 0,
+            pad_k: 0,
+            tile: false,
+            max_abs: 1.0,
+            rmse: 0.167570942,
+        },
+        Floor {
+            name: "m1",
+            m: 1,
+            out: 48,
+            k: 256,
+            tiny: 0,
+            pad_k: 0,
+            tile: false,
+            max_abs: 0.375,
+            rmse: 0.142660596,
+        },
+        Floor {
+            name: "m17",
+            m: 17,
+            out: 32,
+            k: 256,
+            tiny: 0,
+            pad_k: 0,
+            tile: true,
+            max_abs: 0.5,
+            rmse: 0.154278528,
+        },
+        Floor {
+            name: "m64",
+            m: 64,
+            out: 64,
+            k: 512,
+            tiny: 0,
+            pad_k: 0,
+            tile: true,
+            max_abs: 1.0,
+            rmse: 0.2326228,
+        },
+        Floor {
+            name: "prod64",
+            m: 64,
+            out: 5376,
+            k: 5376,
+            tiny: 0,
+            pad_k: 0,
+            tile: true,
+            max_abs: 4.0,
+            rmse: 0.73971736,
+        },
+        Floor {
+            name: "tail12",
+            m: 8,
+            out: 32,
+            k: 12,
+            tiny: 0,
+            pad_k: 256,
+            tile: true,
+            max_abs: 0.125,
+            rmse: 0.037559314,
+        },
+    ];
+
+    struct Draw(u32);
+
+    impl Draw {
+        fn next(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(1664525).wrapping_add(1013904223);
+            (self.0 >> 8) as f32 * (1.0 / 16777216.0) * 6.0 - 3.0
+        }
+    }
+
+    struct Row {
+        w: u64,
+        x: u64,
+        y: u64,
+        out: i32,
+        k: i32,
+        m: i32,
+        tiny: i32,
+    }
+
+    fn launch_row(stream: &Arc<CudaStream>, function: &CudaFunction, row: Row) -> Result<()> {
+        let (grid_x, grid_y, smem) = if row.tiny != 0 {
+            (row.out as u32, row.m as u32, 16)
+        } else {
+            ((row.out as u32).div_ceil(16), 1, 40960)
+        };
+        unsafe {
+            stream
+                .launch_builder(function)
+                .arg(&row.w)
+                .arg(&row.x)
+                .arg(&row.y)
+                .arg(&row.out)
+                .arg(&row.k)
+                .arg(&(i64::from(row.k)))
+                .arg(&row.m)
+                .arg(&row.tiny)
+                .launch(LaunchConfig {
+                    grid_dim: (grid_x, grid_y, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: smem,
+                })?;
+        }
+        Ok(())
+    }
+
+    fn rounded_pair(draw: &mut Draw, rows: i32, cols: i32, live: i32) -> (Vec<bf16>, Vec<f16>) {
+        let mut b = Vec::with_capacity((rows as usize) * (cols as usize));
+        let mut f = Vec::with_capacity((rows as usize) * (cols as usize));
+        for _row in 0..rows {
+            for col in 0..cols {
+                let v = if col < live { draw.next() } else { 0.0 };
+                let bits = bf16::from_f32(v);
+                b.push(bits);
+                f.push(f16::from_f32(bits.to_f32()));
+            }
+        }
+        (b, f)
+    }
+
+    fn distance(fp: &[f16], bf: &[bf16]) -> (f64, f64) {
+        let mut max_abs = 0.0f64;
+        let mut sse = 0.0f64;
+        for (a, b) in fp.iter().zip(bf) {
+            let d = f64::from(a.to_f32()) - f64::from(b.to_f32());
+            max_abs = max_abs.max(d.abs());
+            sse += d * d;
+        }
+        (max_abs, (sse / fp.len() as f64).sqrt())
+    }
+
+    fn score_cell(
+        stream: &Arc<CudaStream>,
+        bf16_fn: &CudaFunction,
+        fp16_fn: &CudaFunction,
+        draw: &mut Draw,
+        cell: &Floor,
+    ) -> Result<bool> {
+        let bf_k = if cell.pad_k > 0 { cell.pad_k } else { cell.k };
+        let y_n = (cell.m as usize)
+            .checked_mul(cell.out as usize)
+            .context("output extent")?;
+        let (hw, fw) = rounded_pair(draw, cell.out, bf_k, cell.k);
+        let (hx, fx) = rounded_pair(draw, cell.m, bf_k, cell.k);
+        let dw = stream.clone_htod(&hw)?;
+        let dx = stream.clone_htod(&hx)?;
+        let mut dy = stream.alloc_zeros::<bf16>(y_n)?;
+        {
+            let (wp, _wg) = dw.device_ptr(stream);
+            let (xp, _xg) = dx.device_ptr(stream);
+            let (yp, _yg) = dy.device_ptr_mut(stream);
+            if cell.tile {
+                let mut m0 = 0i32;
+                while m0 < cell.m {
+                    let mt = (cell.m - m0).min(16);
+                    launch_row(
+                        stream,
+                        bf16_fn,
+                        Row {
+                            w: wp,
+                            x: xp + (m0 as u64) * (bf_k as u64) * 2,
+                            y: yp + (m0 as u64) * (cell.out as u64) * 2,
+                            out: cell.out,
+                            k: bf_k,
+                            m: mt,
+                            tiny: 0,
+                        },
+                    )?;
+                    m0 += 16;
+                }
+            } else {
+                launch_row(
+                    stream,
+                    bf16_fn,
+                    Row {
+                        w: wp,
+                        x: xp,
+                        y: yp,
+                        out: cell.out,
+                        k: bf_k,
+                        m: cell.m,
+                        tiny: cell.tiny,
+                    },
+                )?;
+            }
+        }
+        let (ew, ex, fp_k) = if cell.pad_k > 0 {
+            let mut pw = Vec::new();
+            let mut px = Vec::new();
+            for row in 0..cell.out as usize {
+                let start = row * bf_k as usize;
+                pw.extend_from_slice(&fw[start..start + cell.k as usize]);
+            }
+            for row in 0..cell.m as usize {
+                let start = row * bf_k as usize;
+                px.extend_from_slice(&fx[start..start + cell.k as usize]);
+            }
+            (stream.clone_htod(&pw)?, stream.clone_htod(&px)?, cell.k)
+        } else {
+            (stream.clone_htod(&fw)?, stream.clone_htod(&fx)?, bf_k)
+        };
+        let mut ey = stream.alloc_zeros::<f16>(y_n)?;
+        {
+            let (ewp, _ewg) = ew.device_ptr(stream);
+            let (exp, _exg) = ex.device_ptr(stream);
+            let (eyp, _eyg) = ey.device_ptr_mut(stream);
+            launch_row(
+                stream,
+                fp16_fn,
+                Row {
+                    w: ewp,
+                    x: exp,
+                    y: eyp,
+                    out: cell.out,
+                    k: fp_k,
+                    m: cell.m,
+                    tiny: cell.tiny,
+                },
+            )?;
+        }
+        let hy = stream.clone_dtoh(&dy)?;
+        let fy = stream.clone_dtoh(&ey)?;
+        ensure!(
+            hy.iter().all(|v| v.is_finite()) && fy.iter().all(|v| v.is_finite()),
+            "non-finite output {}",
+            cell.name
+        );
+        let (max_abs, rmse) = distance(&fy, &hy);
+        let pass = max_abs <= cell.max_abs && rmse <= cell.rmse;
+        println!(
+            "CASE {} m={} out={} in={} tiny={} max_abs={max_abs:.8} rmse={rmse:.8} n={y_n} bound_abs={} bound_rmse={} {}",
+            cell.name,
+            cell.m,
+            cell.out,
+            cell.k,
+            cell.tiny,
+            cell.max_abs,
+            cell.rmse,
+            if pass { "PASS" } else { "DEFECT" }
+        );
+        Ok(pass)
+    }
+
+    #[test]
+    #[ignore = "4090 FP16 skinny GEMM against the production BF16 kernel"]
+    fn gemm_skinny_fp16_matches_bf16_floor_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let device = Device::new(0)?;
+        let sm = cubin::capability(&device.ctx)?;
+        let path = PathBuf::from(env!("OUT_DIR")).join(format!("gemm_skinny_fp16_sm{sm}.cubin"));
+        let bytes = std::fs::read(&path).with_context(|| format!("missing fp16 cubin sm_{sm}"))?;
+        let fp16_module = device
+            .ctx
+            .load_module(cudarc::nvrtc::Ptx::from_binary(bytes))?;
+        let fp16 = fp16_module.load_function("gemm_skinny_bf16")?;
+        let bf16_module = cubin::module(&device.ctx, "gemm_skinny")?;
+        let bf16_fn = bf16_module.load_function("gemm_skinny_bf16")?;
+        let stream = &device.stream;
+        println!("GPU sm_{sm}");
+        let mut draw = Draw(1);
+        let mut defects = 0usize;
+        for cell in FLOOR {
+            if !score_cell(stream, &bf16_fn, &fp16, &mut draw, cell)? {
+                defects += 1;
+            }
+        }
+        let (m, out, k) = (16i32, 32i32, 256i32);
+        let mut flip = Draw(99);
+        let mut fw = Vec::new();
+        for _ in 0..(out as usize) * (k as usize) {
+            fw.push(f16::from_f32(flip.next()));
+        }
+        let mut fx = Vec::new();
+        for _ in 0..(m as usize) * (k as usize) {
+            fx.push(f16::from_f32(flip.next()));
+        }
+        let mut ew = stream.clone_htod(&fw)?;
+        let ex = stream.clone_htod(&fx)?;
+        let y_n = (m as usize) * (out as usize);
+        let mut ey = stream.alloc_zeros::<f16>(y_n)?;
+        {
+            let (ewp, _ewg) = ew.device_ptr(stream);
+            let (exp, _exg) = ex.device_ptr(stream);
+            let (eyp, _eyg) = ey.device_ptr_mut(stream);
+            launch_row(
+                stream,
+                &fp16,
+                Row {
+                    w: ewp,
+                    x: exp,
+                    y: eyp,
+                    out,
+                    k,
+                    m,
+                    tiny: 0,
+                },
+            )?;
+        }
+        let fy0 = stream.clone_dtoh(&ey)?;
+        let before = fw[3].to_bits();
+        fw[3] = f16::from_f32(fw[3].to_f32() + 1.0);
+        ensure!(
+            fw[3].to_bits() != before,
+            "bit flip did not change the input"
+        );
+        stream.memcpy_htod(&fw, &mut ew)?;
+        {
+            let (ewp, _ewg) = ew.device_ptr(stream);
+            let (exp, _exg) = ex.device_ptr(stream);
+            let (eyp, _eyg) = ey.device_ptr_mut(stream);
+            launch_row(
+                stream,
+                &fp16,
+                Row {
+                    w: ewp,
+                    x: exp,
+                    y: eyp,
+                    out,
+                    k,
+                    m,
+                    tiny: 0,
+                },
+            )?;
+        }
+        let fy1 = stream.clone_dtoh(&ey)?;
+        let changed = fy0
+            .iter()
+            .zip(&fy1)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        println!("FLIP full16 changed={changed} of {y_n}");
+        ensure!(changed > 0, "bit flip left the output unchanged");
+        ensure!(defects == 0, "FP16_GEMM defects={defects}");
+        println!("FP16_GEMM cells={} defects={defects}", FLOOR.len());
+        Ok(())
     }
 }

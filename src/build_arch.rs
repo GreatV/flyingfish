@@ -18,7 +18,7 @@ pub fn parse(text: &str) -> Result<Vec<u32>, String> {
             let minor: u32 = minor
                 .parse()
                 .map_err(|_| format!("invalid architecture {token}"))?;
-            if !(8..=99).contains(&major) || minor > 9 {
+            if !((major == 7 && minor == 5) || ((8..=99).contains(&major) && minor <= 9)) {
                 return Err(format!("unsupported architecture {token}"));
             }
             major * 10 + minor
@@ -27,10 +27,8 @@ pub fn parse(text: &str) -> Result<Vec<u32>, String> {
                 .parse::<u32>()
                 .map_err(|_| format!("invalid architecture {token}"))?
         };
-        if !(80..=999).contains(&value) {
-            return Err(format!(
-                "FA2 requires compute capability >= 8.0; found {token}"
-            ));
+        if !(value == 75 || (80..=999).contains(&value)) {
+            return Err(format!("unsupported architecture {token}"));
         }
         result.push(value);
     }

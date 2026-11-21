@@ -3,6 +3,26 @@ use std::{env, fs, path::PathBuf, process::Command};
 #[path = "src/build_arch.rs"]
 mod build_arch;
 
+// A build list with no sm80+ architecture has no FA2 image.
+// ff_profile_push and ff_profile_pop are empty in that build.
+const FA2_ABSENT_CU: &str = r#"extern "C" {
+const char* ff_fa2_error() { return "FA2 is sm80+"; }
+
+int ff_fa2_run(void*, void*, void*, void*, void*, int, int, int, int, int, int, long long, int,
+               void*) {
+    return -1;
+}
+
+int ff_fa2_run_window(void*, void*, void*, void*, void*, int, int, int, int, int, int, long long,
+                      int, int, void*) {
+    return -1;
+}
+
+void ff_profile_push(const char*) {}
+void ff_profile_pop() {}
+}
+"#;
+
 fn compile_device(
     out: &std::path::Path,
     nvcc: &std::path::Path,
@@ -47,9 +67,14 @@ fn compile_device(
         ] {
             command.env_remove(key);
         }
+        let rustflags = if sm < 80 {
+            format!("-C target-cpu=sm_{sm} --cfg ff_sm75")
+        } else {
+            format!("-C target-cpu=sm_{sm}")
+        };
         let result = command
             .env("CARGO_TARGET_DIR", &target)
-            .env("RUSTFLAGS", format!("-C target-cpu=sm_{sm}"))
+            .env("RUSTFLAGS", rustflags)
             .output()
             .expect("cannot run the installed device toolchain; see README prerequisites");
         assert!(
@@ -675,6 +700,32 @@ fn main() {
                     String::from_utf8_lossy(&result.stderr)
                 );
                 index.push_str(&format!("({name:?}, {sm}) => Some(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/\", {filename:?}))),\n"));
+                if name == "gemm_skinny" {
+                    let fp16_filename = format!("gemm_skinny_fp16_sm{sm}.cubin");
+                    let fp16 = out.join(&fp16_filename);
+                    let result = Command::new(&nvcc)
+                        .env("TMPDIR", &temp)
+                        .args([
+                            "--cubin",
+                            "--threads=1",
+                            "-O3",
+                            "--std=c++17",
+                            "-DFF_FP16_GEMM_BODY",
+                        ])
+                        .arg(format!("-arch=sm_{sm}"))
+                        .arg(&file)
+                        .arg("-o")
+                        .arg(&fp16)
+                        .output()
+                        .expect("cannot compile FP16 skinny cubin");
+                    assert!(
+                        result.status.success(),
+                        "nvcc failed for {} sm_{sm} FP16 body:\n{}\n{}",
+                        file.display(),
+                        String::from_utf8_lossy(&result.stdout),
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                }
             }
         }
     }
@@ -685,29 +736,41 @@ fn main() {
     println!("cargo:rerun-if-changed=third_party/flash-attention/src");
     println!("cargo:rerun-if-changed=third_party/cutlass/include");
     let archive = out.join("libff_fa2.a");
+    let fa_archs: Vec<u32> = archs.iter().copied().filter(|sm| *sm >= 80).collect();
     let mut command = Command::new(&nvcc);
-    command.env("TMPDIR", &temp).args([
-        "--lib",
-        "--threads=1",
-        "-O3",
-        "--std=c++17",
-        "--expt-relaxed-constexpr",
-        "--expt-extended-lambda",
-        "-Xcompiler=-fPIC",
-        "--use_fast_math",
-        "-DFLASHATTENTION_DISABLE_DROPOUT",
-        "-DFLASHATTENTION_DISABLE_ALIBI",
-        "-DFLASHATTENTION_DISABLE_UNEVEN_K",
-        "-DFLASHATTENTION_DISABLE_SOFTCAP",
-        "-Ithird_party/cutlass/include",
-    ]);
-    for sm in &archs {
+    command.env("TMPDIR", &temp);
+    if fa_archs.is_empty() {
+        println!("cargo:warning=FA2 has no sm80+ architecture; calls return an error");
+        let stub = out.join("ff_fa2_absent.cu");
+        fs::write(&stub, FA2_ABSENT_CU).expect("cannot write the FA2 stub");
         command
-            .arg("--generate-code")
-            .arg(format!("arch=compute_{sm},code=sm_{sm}"));
+            .args(["--lib", "--threads=1", "-O3", "--std=c++17"])
+            .arg(&stub);
+    } else {
+        command.args([
+            "--lib",
+            "--threads=1",
+            "-O3",
+            "--std=c++17",
+            "--expt-relaxed-constexpr",
+            "--expt-extended-lambda",
+            "-Xcompiler=-fPIC",
+            "--use_fast_math",
+            "-DFLASHATTENTION_DISABLE_DROPOUT",
+            "-DFLASHATTENTION_DISABLE_ALIBI",
+            "-DFLASHATTENTION_DISABLE_UNEVEN_K",
+            "-DFLASHATTENTION_DISABLE_SOFTCAP",
+            "-Ithird_party/cutlass/include",
+        ]);
+        for sm in &fa_archs {
+            command
+                .arg("--generate-code")
+                .arg(format!("arch=compute_{sm},code=sm_{sm}"));
+        }
+        command.arg("third_party/flash-attention/adapter.cu");
     }
     let result = command
-        .args(["third_party/flash-attention/adapter.cu", "-o"])
+        .arg("-o")
         .arg(&archive)
         .output()
         .expect("cannot compile FA2");

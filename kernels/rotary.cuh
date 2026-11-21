@@ -1,5 +1,8 @@
 #include "gpu_compat.cuh"
 #include "q38_contract.cuh"
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+#include "ff_sm75_f16.cuh"
+#endif
 
 template<typename T>
 __device__ __forceinline__ void rotary_pair(T a, T b, T c, T s, T* lo, T* hi) {
@@ -11,8 +14,17 @@ __device__ __forceinline__ void rotary_pair(T a, T b, T c, T s, T* lo, T* hi) {
         *lo = __hsub_rn(__hmul_rn(a, c), __hmul_rn(b, s));
         *hi = __hadd_rn(__hmul_rn(b, c), __hmul_rn(a, s));
 #else
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+        const float af = ff_f32_from_f16(a);
+        const float bf = ff_f32_from_f16(b);
+        const float cf = ff_f32_from_f16(c);
+        const float sf = ff_f32_from_f16(s);
+        *lo = ff_f16_from_f32<T>(af * cf - bf * sf);
+        *hi = ff_f16_from_f32<T>(bf * cf + af * sf);
+#else
         *lo = __hsub(__hmul(a, c), __hmul(b, s));
         *hi = __hadd(__hmul(b, c), __hmul(a, s));
+#endif
 #endif
     }
 }

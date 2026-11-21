@@ -1,5 +1,8 @@
 use crate::backend::gpu::{CudaFunction, LaunchConfig, PushKernelArg};
 use crate::backend::gpu::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr};
+use crate::backend::setup::{CONDITIONER_D128, IMAGE_D128_RESIDUAL, VAE_D64_WINDOWS};
+#[cfg(feature = "cuda")]
+use crate::backend::setup::{DeviceArchitecture, IMAGE_D128_SINGLE_PV};
 use anyhow::Context;
 use anyhow::{Result, ensure};
 use half::bf16;
@@ -453,11 +456,11 @@ impl Flash {
         let mut this = self;
         #[cfg(feature = "cuda")]
         {
-            use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
+            use cudarc::driver::sys::CUfunction_attribute as F;
             let ctx = this.stream.context();
-            let major = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
-            if major >= 8 {
-                let name = "attention_prefill_d128_bidirectional_single_pv";
+            let sm = super::cubin::capability(ctx)?;
+            let name = DeviceArchitecture::Cuda(sm).image_d128_full_symbol();
+            if name == IMAGE_D128_SINGLE_PV {
                 let module = super::cubin::module(ctx, "attention_native")?;
                 let function = module.load_function(name)?;
                 let registers = function.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
@@ -500,16 +503,13 @@ impl Flash {
                     );
                 }
                 this.native[1] = function;
-            } else {
-                if crate::backend::diagnostics_enabled() {
-                    eprintln!(
-                        "{}",
-                        serde_json::json!({"attention_probability": {
-                            "symbol":"attention_prefill_d128_bidirectional",
-                            "capability":[major,ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?],"form":"residual"
-                        }})
-                    );
-                }
+            } else if crate::backend::diagnostics_enabled() {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"attention_probability": {
+                        "symbol":name,"capability":sm,"form":"residual"
+                    }})
+                );
             }
         }
         #[cfg(feature = "cuda")]
@@ -696,11 +696,11 @@ impl Flash {
                         "attention_prefill_d256_blocks",
                     ]
                 } else if (heads, kv_heads) == (32, 4) {
-                    &["attention_prefill_d128", "attention_prefill_d128_window"]
+                    &[CONDITIONER_D128, "attention_prefill_d128_window"]
                 } else {
                     &[
-                        "attention_prefill_d128",
-                        "attention_prefill_d128_bidirectional",
+                        CONDITIONER_D128,
+                        IMAGE_D128_RESIDUAL,
                         "attention_prefill_d128_prefix",
                     ]
                 };
@@ -756,15 +756,15 @@ impl Flash {
                     "attention_prefill_d256_symmetric",
                 ]
             } else if (heads, kv_heads) == (32, 4) {
-                &["attention_prefill_d128", "attention_prefill_d128_window"]
+                &[CONDITIONER_D128, "attention_prefill_d128_window"]
             } else {
                 ensure!(
                     native_d128(heads, kv_heads, head_dim),
                     "HIP native D128 prefill geometry is not bound"
                 );
                 &[
-                    "attention_prefill_d128",
-                    "attention_prefill_d128_bidirectional",
+                    CONDITIONER_D128,
+                    IMAGE_D128_RESIDUAL,
                     "attention_prefill_d128_prefix",
                 ]
             };
@@ -928,11 +928,7 @@ impl Flash {
                 && self.position == 0,
             "grouped BF16 windows require an unmasked fixed score"
         );
-        self.bind_windows(
-            offsets,
-            i32::MAX as u32,
-            "attention_prefill_d64_bidirectional_windows",
-        )
+        self.bind_windows(offsets, i32::MAX as u32, VAE_D64_WINDOWS)
     }
 
     fn window_geometry(

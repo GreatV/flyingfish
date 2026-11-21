@@ -7,12 +7,20 @@ struct AFrag { uint32_t r[4]; };
 struct BFrag { uint32_t r[2]; };
 
 // C and D alias: the accumulator is both the mma input and its output.
+// sm75: mma.m16n8k16 traps.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+#define CW_MMA(d, a, b)                                                        \
+    asm volatile("trap;" ::"f"(d[0]), "f"(d[1]), "f"(d[2]), "f"(d[3]),         \
+                 "r"(a.r[0]), "r"(a.r[1]), "r"(a.r[2]), "r"(a.r[3]),            \
+                 "r"(b.r[0]), "r"(b.r[1]))
+#else
 #define CW_MMA(d, a, b)                                                        \
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "        \
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"     \
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])              \
                  : "r"(a.r[0]), "r"(a.r[1]), "r"(a.r[2]), "r"(a.r[3]),         \
                    "r"(b.r[0]), "r"(b.r[1]))
+#endif
 
 // Fragment geometry (PTX ISA 9.7.16.5.8, mma.m16n8k16), groupID = laneid >> 2, tig = laneid & 3: A row groupID (a0,a1) / groupID+8 (a2,a3) at column 2*tig+(i&1), +8 for a2,a3; B column groupID, row 2*tig+(i&1) for b0 and +8 for b1; C/D row groupID (c0,c1) / groupID+8 (c2,c3) at column 2*tig+(i&1); register i holds element 2i in its LOW half.
 #define CW_GID(l) ((l) >> 2)
