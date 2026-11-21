@@ -777,8 +777,26 @@ impl Blas {
                 serde_json::json!({"dense_lt":{"filled":filled,"setup_seconds":setup_start.elapsed().as_secs_f64(),"selection":choice}})
             );
         }
-        *plan = bound;
+        let original = std::mem::replace(plan, bound);
+        #[cfg(test)]
+        self.dense_parents.borrow_mut().insert(shape, original);
+        #[cfg(not(test))]
+        drop(original);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn swap_dense_parents(&self) -> Result<usize> {
+        self.stream.synchronize()?;
+        let mut parents = self.dense_parents.borrow_mut();
+        let mut plans = self.plans.borrow_mut();
+        for (s, old) in parents.iter_mut() {
+            let current = plans
+                .get_mut(&(s.rows, s.output, s.input, 0, false))
+                .context("dense test binding missing")?;
+            std::mem::swap(current, old);
+        }
+        Ok(parents.len())
     }
 }
 

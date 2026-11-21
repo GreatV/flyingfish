@@ -518,6 +518,8 @@ pub struct Blas {
     skinny_plans: RefCell<BTreeMap<(usize, usize), (LaunchConfig, bool)>>,
     invariant_rows: usize,
     plans: LinearPlans,
+    #[cfg(test)]
+    dense_parents: RefCell<BTreeMap<LinearShape, Plan>>,
     pitched_b: RefCell<BTreeMap<(usize, usize, usize, usize), Plan>>,
     row_families: RefCell<BTreeMap<(usize, usize), (sys::cublasLtMatmulAlgo_t, usize)>>,
     biased_plans: RefCell<BTreeMap<(LinearShape, u64, super::linear::LinearBiasMode), Plan>>,
@@ -735,6 +737,8 @@ impl Blas {
             skinny_plans: RefCell::new(BTreeMap::new()),
             invariant_rows: 0,
             plans: RefCell::new(BTreeMap::new()),
+            #[cfg(test)]
+            dense_parents: RefCell::default(),
             pitched_b: RefCell::new(BTreeMap::new()),
             row_families: RefCell::new(BTreeMap::new()),
             biased_plans: RefCell::new(BTreeMap::new()),

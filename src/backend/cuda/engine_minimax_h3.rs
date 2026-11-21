@@ -12137,7 +12137,7 @@ mod tests {
                     !within(c_video, video_threshold)? || !within(c_audio, audio_threshold)?;
             }
         }
-        fs::remove_dir(&runtime)?;
+        fs::remove_dir_all(&runtime)?;
         ensure!(control_failed, "DiT control stayed within the thresholds");
         ensure!(
             defects.is_empty(),
@@ -12357,11 +12357,47 @@ mod tests {
         println!(
             "H3_CHAIN video={d_video:?} audio={d_audio:?} thresholds={video_threshold} {audio_threshold}"
         );
+        #[cfg(feature = "cuda")]
+        if !device.info.arch.fp16_stored_half() {
+            let bound = blas.swap_dense_parents()?;
+            ensure!(
+                bound > 0,
+                "dense trajectory gate did not qualify a projection"
+            );
+            let parent = chain((&video_grid, &audio_grid))?;
+            blas.swap_dense_parents()?;
+            for (name, a, b, tau) in [
+                (
+                    "video",
+                    &candidate[0][condition..],
+                    &parent[0][condition..],
+                    video_threshold,
+                ),
+                (
+                    "audio",
+                    candidate[1].as_slice(),
+                    parent[1].as_slice(),
+                    audio_threshold,
+                ),
+            ] {
+                let d = distance(a, b)?;
+                let energy = |values: &[f64]| values.iter().map(|x| x * x).sum::<f64>();
+                let amplitude = (0.5 * (energy(a) / energy(b)).ln()).abs();
+                println!(
+                    "H3_DENSE_TRAJECTORY cell={cell} component={name} bound_shapes={bound} max_abs={} rel_rms={} cosine={} log_rms_ratio={amplitude}",
+                    d[0], d[1], d[2]
+                );
+                ensure!(
+                    amplitude.is_finite() && within(d, tau)?,
+                    "DEFECT dense trajectory {cell} {name} {d:?}"
+                );
+            }
+        }
         let control = chain((&audio_grid, &video_grid))?;
         let c_video = distance(&control[0][condition..], &final_video_rows)?;
         let c_audio = distance(&control[1], &final_audio_rows)?;
         println!("H3_CHAIN swapped-grid control video={c_video:?} audio={c_audio:?}");
-        fs::remove_dir(&runtime)?;
+        fs::remove_dir_all(&runtime)?;
         ensure!(
             !within(c_video, video_threshold)? || !within(c_audio, audio_threshold)?,
             "swapped-grid control stayed within the thresholds"
