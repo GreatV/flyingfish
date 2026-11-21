@@ -3500,20 +3500,48 @@ struct ModulateRows {
     entries: u32,
 }
 
+// sm >= 80 cubins do not define ff_fp16_store_fault.
+fn prepare_fp16_store_at(sm: u32, s: &Arc<CudaStream>, module: &Arc<CudaModule>) -> Result<()> {
+    if sm >= 80 {
+        return Ok(());
+    }
+    let mut symbol = module.get_global("ff_fp16_store_fault", s)?;
+    ensure!(
+        symbol.len() == 4,
+        "ff_fp16_store_fault is {} bytes",
+        symbol.len()
+    );
+    s.memcpy_htod(&[0u8; 4], &mut symbol)?;
+    Ok(())
+}
+
+fn finish_fp16_store_at(
+    sm: u32,
+    s: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    tensor: &str,
+) -> Result<()> {
+    if sm >= 80 {
+        return Ok(());
+    }
+    let mut symbol = module.get_global("ff_fp16_store_fault", s)?;
+    ensure!(
+        symbol.len() == 4,
+        "ff_fp16_store_fault is {} bytes",
+        symbol.len()
+    );
+    let bytes = s.clone_dtoh(&symbol)?;
+    s.memcpy_htod(&[0u8; 4], &mut symbol)?;
+    ensure!(
+        bytes == [0u8; 4],
+        "FP16 store of {tensor} is non-finite or above 65504"
+    );
+    Ok(())
+}
+
 impl BlockKernels {
-    // sm >= 80 cubins do not define ff_fp16_store_fault.
     fn prepare_fp16_store(&self, s: &Arc<CudaStream>, module: &Arc<CudaModule>) -> Result<()> {
-        if self.sm >= 80 {
-            return Ok(());
-        }
-        let mut symbol = module.get_global("ff_fp16_store_fault", s)?;
-        ensure!(
-            symbol.len() == 4,
-            "ff_fp16_store_fault is {} bytes",
-            symbol.len()
-        );
-        s.memcpy_htod(&[0u8; 4], &mut symbol)?;
-        Ok(())
+        prepare_fp16_store_at(self.sm, s, module)
     }
 
     fn finish_fp16_store(
@@ -3522,22 +3550,7 @@ impl BlockKernels {
         module: &Arc<CudaModule>,
         tensor: &str,
     ) -> Result<()> {
-        if self.sm >= 80 {
-            return Ok(());
-        }
-        let mut symbol = module.get_global("ff_fp16_store_fault", s)?;
-        ensure!(
-            symbol.len() == 4,
-            "ff_fp16_store_fault is {} bytes",
-            symbol.len()
-        );
-        let bytes = s.clone_dtoh(&symbol)?;
-        s.memcpy_htod(&[0u8; 4], &mut symbol)?;
-        ensure!(
-            bytes == [0u8; 4],
-            "FP16 store of {tensor} is non-finite or above 65504"
-        );
-        Ok(())
+        finish_fp16_store_at(self.sm, s, module, tensor)
     }
 
     #[cfg(test)]
@@ -3887,10 +3900,13 @@ fn cast_rows(
     source: u64,
     target: u64,
     count: usize,
+    sm: u32,
+    module: &Arc<CudaModule>,
 ) -> Result<()> {
     if count == 0 {
         return Ok(());
     }
+    prepare_fp16_store_at(sm, s, module)?;
     unsafe {
         s.launch_builder(kernel)
             .arg(&source)
@@ -3900,7 +3916,7 @@ fn cast_rows(
             .arg(&1f32)
             .launch(flat(count))?;
     }
-    Ok(())
+    finish_fp16_store_at(sm, s, module, "affine")
 }
 
 /// `y [rows, n] = x [rows, k] * w^T + b` in F32 on rows starting at element `x_offset` of `x`.
@@ -3957,6 +3973,7 @@ fn round_into(
     source: u64,
     target: usize,
     count: usize,
+    store: (u32, &Arc<CudaModule>),
 ) -> Result<()> {
     cast_rows(
         s,
@@ -3964,6 +3981,8 @@ fn round_into(
         source,
         pointer(hidden, s) + 2 * target as u64,
         count,
+        store.0,
+        store.1,
     )
 }
 
@@ -3975,7 +3994,10 @@ fn upcast_from(
     scratch: &CudaSlice<f32>,
     source: usize,
     count: usize,
+    store: (u32, &Arc<CudaModule>),
 ) -> Result<()> {
+    let (sm, module) = store;
+    prepare_fp16_store_at(sm, s, module)?;
     unsafe {
         s.launch_builder(kernel)
             .arg(&(pointer(normed, s) + 2 * source as u64))
@@ -3983,7 +4005,7 @@ fn upcast_from(
             .arg(&u32::try_from(count)?)
             .launch(flat(count))?;
     }
-    Ok(())
+    finish_fp16_store_at(sm, s, module, "upcast")
 }
 
 fn image_fill_rate(dir: &Path, manifest: &TensorManifest) -> Result<(usize, f64)> {
@@ -5103,6 +5125,7 @@ pub(crate) struct Dit {
     upcast: crate::backend::gpu::CudaFunction,
     bias: crate::backend::gpu::CudaFunction,
     round: crate::backend::gpu::CudaFunction,
+    vision_ops: Arc<CudaModule>,
     euler: crate::backend::gpu::CudaFunction,
     /// Velocity of the generated video rows, `[generated rows, 96]`.
     pub video: CudaSlice<f32>,
@@ -5550,6 +5573,7 @@ impl Dit {
             )?;
         }
         let vision = cubin::module(s.context(), "vision_ops")?;
+        let vision_ops = Arc::clone(&vision);
         #[cfg(test)]
         if let Some((layout, buffer)) = &base.vectors {
             let expected = base
@@ -5593,6 +5617,7 @@ impl Dit {
             upcast: vision.load_function("vision_upcast_f32")?,
             bias: vision.load_function("vision_bias_f32")?,
             round: vision.load_function("vision_affine_cast_bf16")?,
+            vision_ops,
             euler: cubin::module(s.context(), "flow")?.load_function("euler_blend_f32")?,
             video,
             audio,
@@ -5810,6 +5835,7 @@ impl Dit {
             scratch,
             r.text * h,
             r.condition * h,
+            (c.kernels.sm, &self.vision_ops),
         )?;
         round_into(
             s,
@@ -5818,6 +5844,7 @@ impl Dit {
             scratch + 4 * (r.condition * h) as u64,
             r.video_start * h,
             (video_rows - r.condition) * h,
+            (c.kernels.sm, &self.vision_ops),
         )?;
         projection(
             c.s,
@@ -5834,6 +5861,7 @@ impl Dit {
             scratch,
             r.audio_start * h,
             r.audio * h,
+            (c.kernels.sm, &self.vision_ops),
         )?;
 
         let block_rows = 6 * h * pairs as usize;
@@ -5938,6 +5966,7 @@ impl Dit {
             &self.scratch,
             r.video_start * h,
             generated * h,
+            (c.kernels.sm, &self.vision_ops),
         )?;
         projection(
             c.s,
@@ -5954,6 +5983,7 @@ impl Dit {
             &self.scratch,
             r.audio_start * h,
             r.audio * h,
+            (c.kernels.sm, &self.vision_ops),
         )?;
         projection(
             c.s,
@@ -6034,6 +6064,7 @@ pub(crate) struct ImageDit {
     upcast: crate::backend::gpu::CudaFunction,
     bias: crate::backend::gpu::CudaFunction,
     round: crate::backend::gpu::CudaFunction,
+    vision_ops: Arc<CudaModule>,
     euler: crate::backend::gpu::CudaFunction,
 }
 
@@ -6306,6 +6337,7 @@ impl ImageDit {
             );
         }
         let vision = cubin::module(s.context(), "vision_ops")?;
+        let vision_ops = Arc::clone(&vision);
         require_resident_norms(s, &blocks, &norm_out, h)?;
         Ok(Self {
             text_rows,
@@ -6334,6 +6366,7 @@ impl ImageDit {
             upcast: vision.load_function("vision_upcast_f32")?,
             bias: vision.load_function("vision_bias_f32")?,
             round: vision.load_function("vision_affine_cast_bf16")?,
+            vision_ops,
             euler: cubin::module(s.context(), "flow")?.load_function("euler_blend_f32")?,
         })
     }
@@ -6469,6 +6502,7 @@ impl ImageDit {
             pointer(&self.scratch, s),
             text_rows * h,
             image_rows * h,
+            (c.kernels.sm, &self.vision_ops),
         )?;
         let block_rows = 6 * h * pairs as usize;
         let sources = Scale2Sources {
@@ -6558,6 +6592,7 @@ impl ImageDit {
             &self.scratch,
             text_rows * h,
             image_rows * h,
+            (c.kernels.sm, &self.vision_ops),
         )?;
         projection(
             c.s,
@@ -9363,24 +9398,51 @@ mod tests {
     fn cast_rows_skips_an_empty_conditioning_range_gpu() -> Result<()> {
         let device = Device::new(0)?;
         let s = &device.stream;
-        let kernel =
-            cubin::module(s.context(), "vision_ops")?.load_function("vision_affine_cast_bf16")?;
+        let module = cubin::module(s.context(), "vision_ops")?;
+        let kernel = module.load_function("vision_affine_cast_bf16")?;
+        #[cfg(feature = "cuda")]
+        let sm = cubin::capability(s.context())?;
+        #[cfg(not(feature = "cuda"))]
+        let sm = 80u32;
         let values: Vec<f32> = (0..16).map(|i| 1.0 + i as f32 / 3.0).collect();
         let source = s.clone_htod(&values)?;
         let target = s.alloc_zeros::<bf16>(16)?;
-        cast_rows(s, &kernel, pointer(&source, s), pointer(&target, s), 0)?;
+        cast_rows(
+            s,
+            &kernel,
+            pointer(&source, s),
+            pointer(&target, s),
+            0,
+            sm,
+            &module,
+        )?;
         s.synchronize()?;
         ensure!(
             s.clone_dtoh(&target)?.iter().all(|v| v.to_bits() == 0),
             "empty range wrote"
         );
-        cast_rows(s, &kernel, pointer(&source, s), pointer(&target, s), 16)?;
+        cast_rows(
+            s,
+            &kernel,
+            pointer(&source, s),
+            pointer(&target, s),
+            16,
+            sm,
+            &module,
+        )?;
+        let rounded = |v: f32| {
+            if sm >= 80 {
+                bf16::from_f32(v).to_bits()
+            } else {
+                half::f16::from_f32(v).to_bits()
+            }
+        };
         ensure!(
             s.clone_dtoh(&target)?
                 .iter()
                 .zip(&values)
-                .all(|(got, &v)| got.to_bits() == bf16::from_f32(v).to_bits()),
-            "cast differs from BF16 rounding"
+                .all(|(got, &v)| got.to_bits() == rounded(v)),
+            "cast differs from the device 16-bit rounding"
         );
         Ok(())
     }

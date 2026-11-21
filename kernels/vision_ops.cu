@@ -1,4 +1,7 @@
 #include "gpu_compat.cuh"
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+#include "ff_sm75_f16.cuh"
+#endif
 #include <stdint.h>
 #include <math.h>
 
@@ -185,8 +188,13 @@ extern "C" __global__ void vision_affine_cast_bf16(
     for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
          i += uint64_t(gridDim.x) * 256) {
         const float value = __fmul_rn(__fadd_rn(input[i], shift), scale);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+        const __nv_bfloat16 rounded = ff_f16_from_f32<__nv_bfloat16>(value);
+        if (!isfinite(value) || !isfinite(ff_f32_from_f16(rounded))) { __trap(); return; }
+#else
         const __nv_bfloat16 rounded = __float2bfloat16_rn(value);
         if (!isfinite(value) || !isfinite(__bfloat162float(rounded))) { __trap(); return; }
+#endif
         output[i] = rounded;
     }
 }
@@ -406,7 +414,14 @@ __device__ __forceinline__ void vision_upcast(
 }
 extern "C" __global__ void vision_upcast_f32(
     const __nv_bfloat16* input, float* output, uint32_t count) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && !defined(__HIP__)
+    if (!vision_flat_launch() || !input || !output || !count) { __trap(); return; }
+    for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
+        output[i] = ff_f32_from_f16(input[i]);
+    }
+#else
     vision_upcast(input, output, count);
+#endif
 }
 
 extern "C" __global__ void vision_bias_f32(
