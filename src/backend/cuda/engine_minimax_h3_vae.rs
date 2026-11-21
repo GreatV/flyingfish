@@ -38,13 +38,13 @@ impl ImageWork {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 enum DecoderRows<'a> {
     Bf16(&'a CudaSlice<bf16>),
     F32(&'a CudaSlice<f32>),
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 type ImageRows<'a> = (DecoderRows<'a>, usize, usize, usize);
 
 struct ImageDecoder {
@@ -267,7 +267,7 @@ impl ImageDecoder {
             blas,
             &mut w,
             input,
-            #[cfg(all(test, feature = "cuda"))]
+            #[cfg(test)]
             |_, _, _, _| Ok(()),
         )?;
         s.synchronize()?;
@@ -280,12 +280,7 @@ impl ImageDecoder {
         blas: &Blas,
         w: &mut ImageWork,
         input: &CudaSlice<f32>,
-        #[cfg(all(test, feature = "cuda"))] mut observe: impl FnMut(
-            &str,
-            usize,
-            usize,
-            ImageRows<'_>,
-        ) -> Result<()>,
+        #[cfg(test)] mut observe: impl FnMut(&str, usize, usize, ImageRows<'_>) -> Result<()>,
     ) -> Result<()> {
         let spec = &self.core.spec;
         let [height, width] = w.canvas;
@@ -321,7 +316,7 @@ impl ImageDecoder {
                 &mut w.core,
                 active,
                 (&w.raw, first),
-                #[cfg(all(test, feature = "cuda"))]
+                #[cfg(test)]
                 |role, rows| observe(role, first, active, rows),
             )?;
         }
@@ -511,7 +506,7 @@ impl ImageDecodeStage {
             blas,
             &mut self.work,
             &input,
-            #[cfg(all(test, feature = "cuda"))]
+            #[cfg(test)]
             |_, _, _, _| Ok(()),
         )?;
         s.synchronize()?;
@@ -2018,7 +2013,7 @@ impl VideoDecoder {
         blas: &Blas,
         w: &mut TileWork,
         (layer, active): (usize, usize),
-        #[cfg(all(test, feature = "cuda"))] observe: &mut impl FnMut(&str, ImageRows<'_>) -> Result<()>,
+        #[cfg(test)] observe: &mut impl FnMut(&str, ImageRows<'_>) -> Result<()>,
     ) -> Result<()> {
         let b = &self.blocks[layer];
         let spec = &self.spec;
@@ -2077,7 +2072,7 @@ impl VideoDecoder {
                 rows_view(&w.ff, s, j * n, rows, dim, dim)?,
             )?;
         }
-        #[cfg(all(test, feature = "cuda"))]
+        #[cfg(test)]
         if layer == 0 {
             observe("q0", (DecoderRows::Bf16(&w.ff), 0, w.tokens, dim))?;
             observe("k0", (DecoderRows::Bf16(&w.ff), n, w.tokens, dim))?;
@@ -2193,7 +2188,7 @@ impl VideoDecoder {
             w,
             active,
             (raw, slot),
-            #[cfg(all(test, feature = "cuda"))]
+            #[cfg(test)]
             |_, _| Ok(()),
         )
     }
@@ -2204,7 +2199,7 @@ impl VideoDecoder {
         w: &mut TileWork,
         active: usize,
         (raw, slot): (&CudaSlice<bf16>, usize),
-        #[cfg(all(test, feature = "cuda"))] mut observe: impl FnMut(&str, ImageRows<'_>) -> Result<()>,
+        #[cfg(test)] mut observe: impl FnMut(&str, ImageRows<'_>) -> Result<()>,
     ) -> Result<()> {
         let spec = &self.spec;
         let p = w.patches;
@@ -2225,7 +2220,7 @@ impl VideoDecoder {
             latent(&w.latent_q)?,
             rows_view(&w.o, s, 0, active * p, spec.dim, spec.dim)?,
         )?;
-        #[cfg(all(test, feature = "cuda"))]
+        #[cfg(test)]
         observe("proj_in", (DecoderRows::Bf16(&w.o), 0, p, spec.dim))?;
         #[cfg(test)]
         if self.prefix_only {
@@ -2252,10 +2247,10 @@ impl VideoDecoder {
                 blas,
                 w,
                 (layer, active),
-                #[cfg(all(test, feature = "cuda"))]
+                #[cfg(test)]
                 &mut observe,
             )?;
-            #[cfg(all(test, feature = "cuda"))]
+            #[cfg(test)]
             if layer == 0 || layer + 1 == spec.layers {
                 let role = if layer == 0 { "block0" } else { "block_last" };
                 observe(role, (DecoderRows::F32(&w.x), 0, w.tokens, spec.dim))?;
@@ -3582,7 +3577,6 @@ pub(crate) mod image_tests {
             .collect())
     }
 
-    #[cfg(feature = "cuda")]
     fn score(
         label: &str,
         actual: &[f32],
@@ -3926,7 +3920,6 @@ pub(crate) mod image_tests {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     fn input(root: &Path, name: &str, shape: [usize; 2]) -> Result<Vec<f32>> {
         let bytes = fs::read(root.join(format!("inputs/decode-{name}.safetensors")))?;
         let file = SafeTensors::deserialize(&bytes)?;
@@ -3972,7 +3965,6 @@ pub(crate) mod image_tests {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     fn reference_gate(root: &Path, model: &Path, runtime: &Path, capture: &Path) -> Result<()> {
         let spec = geometry()?;
         let component = model.join("vae_diffusers");
@@ -4001,8 +3993,15 @@ pub(crate) mod image_tests {
             "RUNNER_FAIL decoder floor formula"
         );
         let device = Device::new(0)?;
-        let sm = cubin::capability(&device.ctx)?;
-        ensure!(sm == 89, "RUNNER_FAIL VAE fixture has no sm{sm} arm");
+        #[cfg(feature = "cuda")]
+        let sm = {
+            let sm = cubin::capability(&device.ctx)?;
+            ensure!(sm == 89, "RUNNER_FAIL VAE fixture has no sm{sm} arm");
+            sm
+        };
+        #[cfg(feature = "rocm")]
+        // Cross-GPU gate uses the frozen sm89 reference.
+        let sm = 89u32;
         let s = &device.stream;
         let ops = Ops::new(&device.ctx)?;
         device.finish_upload()?;
@@ -4210,7 +4209,6 @@ pub(crate) mod image_tests {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_S0 frozen references, FF_H3_CAPTURE output"]
     fn image_decoder_matches_the_frozen_reference() -> Result<()> {
@@ -4432,7 +4430,6 @@ pub(crate) mod image_tests {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     fn encoder_layouts(device: &Device, encoder: &KeyframeEncoder) -> Result<usize> {
         let s = &device.stream;
         let rgb: Vec<f32> = (0..60).map(|i| ((i * 37) % 251) as f32 / 8.0).collect();
@@ -4529,15 +4526,7 @@ pub(crate) mod image_tests {
                 }
             }
         }
-        s.begin_capture(
-            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-        )?;
-        let launched = launch();
-        let graph = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
-        launched?;
-        graph?
-            .context("RUNNER_FAIL encoder layout graph empty")?
-            .launch()?;
+        super::super::capture_graph(s, false, launch)?.launch()?;
         let mut graph_bits = 0usize;
         for (buffer, before) in [&norm, &mean, &std, &latent].into_iter().zip(eager) {
             let after = s.clone_dtoh(buffer)?;
@@ -4562,14 +4551,12 @@ pub(crate) mod image_tests {
         Ok(defects)
     }
 
-    #[cfg(feature = "cuda")]
     fn encoder_reference_gate(
         root: &Path,
         model: &Path,
         runtime: &Path,
         capture: &Path,
     ) -> Result<()> {
-        use cudarc::driver::sys::CUdevice_attribute as A;
         let spec = geometry()?;
         let component = model.join("vae_diffusers");
         let published = crate::minimax_h3::ImageVaeSpec::parse(&serde_json::from_slice(
@@ -4592,17 +4579,18 @@ pub(crate) mod image_tests {
         )?;
         let encoder = KeyframeEncoder::load(&device, &spec, &component, &manifest, true)?;
         let s = &device.stream;
-        let sm = device
-            .ctx
-            .attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?
-            * 10
-            + device
-                .ctx
-                .attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
-        ensure!(
-            [86, 89].contains(&sm),
-            "RUNNER_FAIL encoder reference missing for sm{sm}"
-        );
+        #[cfg(feature = "cuda")]
+        let sm = {
+            let sm = cubin::capability(&device.ctx)?;
+            ensure!(
+                [86, 89].contains(&sm),
+                "RUNNER_FAIL encoder reference missing for sm{sm}"
+            );
+            sm
+        };
+        #[cfg(feature = "rocm")]
+        // Cross-GPU gate uses the frozen sm89 reference.
+        let sm = 89u32;
         let frozen: serde_json::Value =
             serde_json::from_slice(&fs::read(root.join("FROZEN_ENCODER_FLOORS.json"))?)?;
         let mut defects = encoder_layouts(&device, &encoder)?;
@@ -4734,7 +4722,6 @@ pub(crate) mod image_tests {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_S0 encoder references, FF_H3_CAPTURE output"]
     fn image_encoder_matches_the_frozen_reference() -> Result<()> {
