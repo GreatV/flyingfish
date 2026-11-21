@@ -1606,11 +1606,22 @@ impl Blas {
         x: super::contracts::Tensor<half::f16, 2>,
         y: &mut super::contracts::TensorMut<half::f16, 2>,
     ) -> Result<()> {
-        Self::validate_f16_bias(weight, bias, x, y)?;
         let kernel = self
             .bias_fill_f16
             .as_ref()
             .context("F16 bias fill not prepared")?;
+        self.linear_f16_biased_with_fill(kernel, weight, bias, x, y)
+    }
+
+    pub(crate) fn linear_f16_biased_with_fill(
+        &self,
+        kernel: &CudaFunction,
+        weight: super::contracts::Tensor<half::f16, 2>,
+        bias: super::contracts::Tensor<half::f16, 1>,
+        x: super::contracts::Tensor<half::f16, 2>,
+        y: &mut super::contracts::TensorMut<half::f16, 2>,
+    ) -> Result<()> {
+        Self::validate_f16_bias(weight, bias, x, y)?;
         unsafe {
             self.stream
                 .launch_builder(kernel)

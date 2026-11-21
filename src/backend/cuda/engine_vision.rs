@@ -9640,6 +9640,7 @@ pub struct IdolOctreeDecoder {
     blocks: Vec<IdolCrossOnlyBlock>,
     out_proj: BiasedWeight<f32>,
     kernels: IdolSharedKernels,
+    bias_fill: CudaFunction,
 }
 
 #[cfg(feature = "cuda")]
@@ -9768,6 +9769,8 @@ impl IdolOctreeDecoder {
                 blocks,
                 out_proj,
                 kernels,
+                bias_fill: cubin::module(&device.ctx, "q38_common")?
+                    .load_function("q38_bias_fill_f16")?,
             },
             ws,
         ))
@@ -9902,6 +9905,17 @@ impl IdolOctreeDecoder {
         let out_ptr = ws.out_f16.device_ptr(s).0;
         let norm_f16_ptr = ws.norm_f16.device_ptr(s).0;
         let mod_ptr = ws.level_mod_f16.device_ptr(s).0;
+        let project = |weight: &BiasedWeight<half::f16>,
+                       input: Tensor<half::f16, 2>,
+                       output: &mut TensorMut<half::f16, 2>| {
+            blas.linear_f16_biased_with_fill(
+                &self.bias_fill,
+                dense(&weight.weight, s, weight.shape)?,
+                dense(&weight.bias, s, [weight.shape[0]])?,
+                input,
+                output,
+            )
+        };
         for blk in &self.blocks {
             self.kernels
                 .launch_ln_f16(s, out_ptr, None, norm_f16_ptr, rows, 1e-6f32)?;
@@ -9924,17 +9938,13 @@ impl IdolOctreeDecoder {
                     .arg(&1u32)
                     .launch(row_grid(rows, c))?;
             }
-            blk.to_q.run_f16(
-                s,
-                blas,
-                &self.kernels.bias_f16,
+            project(
+                &blk.to_q,
                 stage_view(&ws.norm_f16, s, [rows, c])?,
                 &mut TensorMut(stage_view(&ws.q_f16, s, [rows, c])?),
             )?;
-            blk.to_kv.run_f16(
-                s,
-                blas,
-                &self.kernels.bias_f16,
+            project(
+                &blk.to_kv,
                 stage_view(&ws.context_f16, s, [n_ctx, 16])?,
                 &mut TensorMut(stage_view(&ws.kv_f16, s, [n_ctx, 2 * c])?),
             )?;
@@ -9986,10 +9996,8 @@ impl IdolOctreeDecoder {
                 &mut o_view,
                 (rows as usize, n_ctx as usize, n_ctx as usize),
             )?;
-            blk.to_out.run_f16(
-                s,
-                blas,
-                &self.kernels.bias_f16,
+            project(
+                &blk.to_out,
                 stage_view(&ws.attn_out_f16, s, [rows, c])?,
                 &mut TensorMut(stage_view(&ws.proj_out_f16, s, [rows, c])?),
             )?;
@@ -10020,10 +10028,8 @@ impl IdolOctreeDecoder {
                     .arg(&1u32)
                     .launch(row_grid(rows, c))?;
             }
-            blk.mlp0.run_f16(
-                s,
-                blas,
-                &self.kernels.bias_f16,
+            project(
+                &blk.mlp0,
                 stage_view(&ws.norm_f16, s, [rows, c])?,
                 &mut TensorMut(stage_view(&ws.mlp_fc1_f16, s, [rows, m_dim])?),
             )?;
@@ -10044,10 +10050,8 @@ impl IdolOctreeDecoder {
                     .arg(&1i32)
                     .launch(grid(mlp_elems.div_ceil(256).min(65535) as usize, 256))?;
             }
-            blk.mlp2.run_f16(
-                s,
-                blas,
-                &self.kernels.bias_f16,
+            project(
+                &blk.mlp2,
                 stage_view(&ws.mlp_fc1_f16, s, [rows, m_dim])?,
                 &mut TensorMut(stage_view(&ws.mlp_fc2_f16, s, [rows, c])?),
             )?;
