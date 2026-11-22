@@ -230,31 +230,55 @@ __device__ __forceinline__ float ff_mode3_product(float lower, float upper) {
     return ff_f16_roundtrip(silu) * lower;
 }
 
-__device__ __forceinline__ void ff_atomic_max_abs(float* dst, float v) {
-    atomicMax(reinterpret_cast<unsigned int*>(dst), __float_as_uint(fabsf(v)));
-}
-
-// Max-abs of the mode-3 product. Does not store and does not set ff_fp16_store_fault.
+// One atomicMax per block of the uint bits of fabsf of the mode-3 product.
+// A NaN's bits win that max. The scaled store then faults.
+// Does not store and does not set ff_fp16_store_fault.
 extern "C" __global__ void silu_mul_maxabs(const __nv_bfloat16* gu, float* max_abs,
                                           int rows, int dim) {
     if (rows <= 0 || dim <= 0 || (dim & 7) != 0 ||
         (long long)rows * dim > 2147483647LL || !gu || !max_abs ||
-        (reinterpret_cast<uintptr_t>(gu) & 15u) != 0u) {
+        (reinterpret_cast<uintptr_t>(gu) & 15u) != 0u ||
+        (blockDim.x & 31u) != 0u || blockDim.x > 1024u) {
         __trap();
         return;
     }
     const int vec = blockIdx.x * blockDim.x + threadIdx.x;
     const int vec_dim = dim >> 3;
-    if (vec >= rows * vec_dim) return;
-    const int row = vec / vec_dim;
-    const int vd = vec % vec_dim;
-    const uint4 gv = reinterpret_cast<const uint4*>(gu)[row * 2 * vec_dim + vd];
-    const uint4 uv = reinterpret_cast<const uint4*>(gu)[row * 2 * vec_dim + vec_dim + vd];
-    const __nv_bfloat16* gp = reinterpret_cast<const __nv_bfloat16*>(&gv);
-    const __nv_bfloat16* up = reinterpret_cast<const __nv_bfloat16*>(&uv);
+    const int nvec = rows * vec_dim;
+    unsigned bits = 0;
+    if (vec < nvec) {
+        const int row = vec / vec_dim;
+        const int vd = vec % vec_dim;
+        const uint4 gv = reinterpret_cast<const uint4*>(gu)[row * 2 * vec_dim + vd];
+        const uint4 uv = reinterpret_cast<const uint4*>(gu)[row * 2 * vec_dim + vec_dim + vd];
+        const __nv_bfloat16* gp = reinterpret_cast<const __nv_bfloat16*>(&gv);
+        const __nv_bfloat16* up = reinterpret_cast<const __nv_bfloat16*>(&uv);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const unsigned b = __float_as_uint(fabsf(
+                ff_mode3_product(__bfloat162float(gp[j]), __bfloat162float(up[j]))));
+            if (b > bits) bits = b;
+        }
+    }
     #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        ff_atomic_max_abs(max_abs, ff_mode3_product(__bfloat162float(gp[j]), __bfloat162float(up[j])));
+    for (int o = 16; o > 0; o >>= 1) {
+        const unsigned other = __shfl_xor_sync(FF_WARP_MASK, bits, o);
+        if (other > bits) bits = other;
+    }
+    __shared__ unsigned warp_bits[32];
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned warp = threadIdx.x >> 5;
+    if (lane == 0) warp_bits[warp] = bits;
+    __syncthreads();
+    if (warp == 0) {
+        const unsigned nwarps = blockDim.x >> 5;
+        unsigned block = lane < nwarps ? warp_bits[lane] : 0u;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const unsigned other = __shfl_xor_sync(FF_WARP_MASK, block, o);
+            if (other > block) block = other;
+        }
+        if (lane == 0) atomicMax(reinterpret_cast<unsigned int*>(max_abs), block);
     }
 }
 
