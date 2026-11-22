@@ -4033,7 +4033,7 @@ impl BlockKernels {
             ensure!(p != 0 && p.is_multiple_of(16), "F32 RMSNorm alignment");
         }
         unsafe {
-            s.launch_builder(kernel)
+            s.launch_builder(&kernel)
                 .arg(&n.input)
                 .arg(&n.weight)
                 .arg(&n.output)
