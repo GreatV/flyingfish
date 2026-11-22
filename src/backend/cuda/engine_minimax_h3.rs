@@ -2134,6 +2134,7 @@ struct WideKernels {
     silu_mul_scaled: crate::backend::gpu::CudaFunction,
     rms_f32_bf16: crate::backend::gpu::CudaFunction,
     rms_f32_modulate: crate::backend::gpu::CudaFunction,
+    #[cfg(feature = "cuda")]
     rms_f32_f32: crate::backend::gpu::CudaFunction,
     residual_f32: crate::backend::gpu::CudaFunction,
     gated_add_rms_f32: crate::backend::gpu::CudaFunction,
@@ -2181,6 +2182,7 @@ impl BlockKernels {
                 silu_mul_scaled: act_module.load_function("silu_mul_scaled")?,
                 rms_f32_bf16: norm_module.load_function("rms_f32_bf16")?,
                 rms_f32_modulate: norm_module.load_function("rms_f32_modulate")?,
+                #[cfg(feature = "cuda")]
                 rms_f32_f32: norm_module.load_function("rms_f32_f32")?,
                 residual_f32: norm_module.load_function("residual_f32")?,
                 gated_add_rms_f32: norm_module.load_function("gated_add_rms_f32")?,
@@ -4023,6 +4025,7 @@ impl BlockKernels {
         self.launch_norm_modulate(s, &kernel, &n, &m)
     }
 
+    #[cfg(feature = "cuda")]
     fn rms_f32_store(&self, s: &Arc<CudaStream>, n: NormRows) -> Result<()> {
         let kernel = self.wide_kernels()?.rms_f32_f32.clone();
         ensure!(
@@ -6495,8 +6498,10 @@ pub(crate) struct ImageStepInputs<'a> {
 /// `pdd_proj_out` heads; head `k` is evaluation `k`. The block matrices are placed by `DensePlacement`.
 struct ImageWide {
     x: CudaSlice<f32>,
+    #[cfg(feature = "cuda")]
     text: CudaSlice<f32>,
     /// `[max_abs, alpha, beta]`. Beta stays 0.
+    #[cfg(feature = "cuda")]
     scale: CudaSlice<f32>,
 }
 
@@ -6672,7 +6677,9 @@ impl ImageDit {
             text_work.wide = Some(s.alloc_zeros::<f32>(text_rows * h)?);
             Some(ImageWide {
                 x: s.alloc_zeros::<f32>(rows * h)?,
+                #[cfg(feature = "cuda")]
                 text: s.alloc_zeros::<f32>(text_rows * h)?,
+                #[cfg(feature = "cuda")]
                 scale: s.alloc_zeros::<f32>(3)?,
             })
         } else {
