@@ -541,7 +541,7 @@ fn prepare_transformer(
         device,
         blas,
         spec,
-        (rank, layout),
+        (rank, layout, &table),
         base,
         lora,
         (

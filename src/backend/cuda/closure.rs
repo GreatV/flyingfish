@@ -319,6 +319,15 @@ impl Closure {
         );
         Ok(())
     }
+    #[cfg(feature = "cuda")]
+    pub(super) fn require_setup(&self) -> Result<()> {
+        ensure!(
+            self.stage.get() == Stage::Setup,
+            "dense qualification after setup"
+        );
+        Ok(())
+    }
+
     pub fn access(&self, path: &Path) -> Result<bool> {
         ensure!(
             self.stage.get() == Stage::Setup,

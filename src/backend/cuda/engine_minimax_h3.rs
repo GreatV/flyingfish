@@ -5350,12 +5350,66 @@ type VideoPlacementChooser<'a> = dyn FnMut(
     + 'a;
 
 impl Dit {
+    #[cfg(feature = "cuda")]
+    fn qualify_projections(&self, blas: &Blas, table: &AdalnTable) -> Result<()> {
+        let work = &self.work;
+        let stream = blas.stream();
+        let block = self
+            .blocks
+            .iter()
+            .chain(&self.refiners)
+            .find(|b| b.storage.is_some())
+            .context("MiniMax dense setup requires a resident published block")?;
+        let qualify = |role: usize, rows: usize, output: Tensor<bf16, 2>| -> Result<()> {
+            let BlockLinear::Dense { weight, .. } = block.linears[role] else {
+                bail!("MiniMax qualification expected a dense projection");
+            };
+            let width = weight.shape[0] as usize;
+            let elements = rows.checked_mul(width).context("dense setup extent")?;
+            if elements > work.k_raw.len().min(work.v_raw.len()) {
+                if crate::backend::diagnostics_enabled() {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"dense_lt":{"rows":rows,"output":width,"choice":"incumbent","required_comparison_elements":elements,"available_elements":work.k_raw.len().min(work.v_raw.len())}})
+                    );
+                }
+                return Ok(());
+            }
+            let input = rows_view(
+                &work.normed,
+                stream,
+                0,
+                rows,
+                weight.shape[1] as usize,
+                weight.shape[1] as usize,
+            )?;
+            let copies = [
+                rows_view(&work.k_raw, stream, 0, rows, width, width)?,
+                rows_view(&work.v_raw, stream, 0, rows, width, width)?,
+            ];
+            blas.bind_dense_projection(
+                [weight, input, output.prefix_rows(u32::try_from(rows)?)?],
+                copies,
+                &table.blocks,
+                (role == FF_IN).then_some(work.rows % work.chunk),
+            )
+        };
+        let q = matrix(&work.q_raw, stream, work.rows, work.q_raw.len() / work.rows)?;
+        qualify(Q, work.rows, q)?;
+        qualify(FF_IN, work.chunk, work.hidden)?;
+        let tail = work.rows % work.chunk;
+        if tail > 0 {
+            qualify(FF_IN, tail, work.hidden)?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn new(
         d: &Device,
         blas: &mut Blas,
         spec: &H3Spec,
-        layout: (usize, &crate::minimax_h3::PackedLayout),
+        layout: (usize, &crate::minimax_h3::PackedLayout, &AdalnTable),
         base: Source<'_>,
         lora: Option<Source<'_>>,
         (placement, visits): (Placement, usize),
@@ -5367,7 +5421,7 @@ impl Dit {
         d: &Device,
         blas: &mut Blas,
         spec: &H3Spec,
-        (rank, layout): (usize, &crate::minimax_h3::PackedLayout),
+        (rank, layout, table): (usize, &crate::minimax_h3::PackedLayout, &AdalnTable),
         mut base: Source<'_>,
         mut lora: Option<Source<'_>>,
         (placement, visits, choose): (Placement, usize, Option<&mut VideoPlacementChooser<'_>>),
@@ -5677,7 +5731,7 @@ impl Dit {
             );
         }
         require_resident_norms(s, &blocks, &norm_out, h)?;
-        Ok(Self {
+        let dit = Self {
             ranges,
             proj_in,
             audio_proj_in,
@@ -5710,7 +5764,14 @@ impl Dit {
             trace_gate: None,
             #[cfg(test)]
             refiner_trace: None,
-        })
+        };
+        #[cfg(feature = "cuda")]
+        if !hyperflow && !d.info.arch.fp16_stored_half() {
+            dit.qualify_projections(blas, table)?;
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = table;
+        Ok(dit)
     }
 
     /// `x = r * x + (1 - r) * (x + (1 - t) * v)` over `count` F32 latents at element `offset` of `x`, from grid
@@ -11943,7 +12004,7 @@ mod tests {
             &device,
             &mut blas,
             &spec,
-            (adapter.rank, &layout),
+            (adapter.rank, &layout, &table),
             Source::new(&transformer, &manifest, device.info.arch.fp16_stored_half()),
             Some(Source::new(
                 &lora_dir,
@@ -12076,7 +12137,7 @@ mod tests {
                     !within(c_video, video_threshold)? || !within(c_audio, audio_threshold)?;
             }
         }
-        fs::remove_dir(&runtime)?;
+        fs::remove_dir_all(&runtime)?;
         ensure!(control_failed, "DiT control stayed within the thresholds");
         ensure!(
             defects.is_empty(),
@@ -12224,7 +12285,7 @@ mod tests {
             &device,
             &mut blas,
             &spec,
-            (adapter.rank, &layout),
+            (adapter.rank, &layout, &table),
             Source::new(&transformer, &manifest, device.info.arch.fp16_stored_half()),
             Some(Source::new(
                 &lora_dir,
@@ -12296,11 +12357,47 @@ mod tests {
         println!(
             "H3_CHAIN video={d_video:?} audio={d_audio:?} thresholds={video_threshold} {audio_threshold}"
         );
+        #[cfg(feature = "cuda")]
+        if !device.info.arch.fp16_stored_half() {
+            let bound = blas.swap_dense_parents()?;
+            ensure!(
+                bound > 0,
+                "dense trajectory gate did not qualify a projection"
+            );
+            let parent = chain((&video_grid, &audio_grid))?;
+            blas.swap_dense_parents()?;
+            for (name, a, b, tau) in [
+                (
+                    "video",
+                    &candidate[0][condition..],
+                    &parent[0][condition..],
+                    video_threshold,
+                ),
+                (
+                    "audio",
+                    candidate[1].as_slice(),
+                    parent[1].as_slice(),
+                    audio_threshold,
+                ),
+            ] {
+                let d = distance(a, b)?;
+                let energy = |values: &[f64]| values.iter().map(|x| x * x).sum::<f64>();
+                let amplitude = (0.5 * (energy(a) / energy(b)).ln()).abs();
+                println!(
+                    "H3_DENSE_TRAJECTORY cell={cell} component={name} bound_shapes={bound} max_abs={} rel_rms={} cosine={} log_rms_ratio={amplitude}",
+                    d[0], d[1], d[2]
+                );
+                ensure!(
+                    amplitude.is_finite() && within(d, tau)?,
+                    "DEFECT dense trajectory {cell} {name} {d:?}"
+                );
+            }
+        }
         let control = chain((&audio_grid, &video_grid))?;
         let c_video = distance(&control[0][condition..], &final_video_rows)?;
         let c_audio = distance(&control[1], &final_audio_rows)?;
         println!("H3_CHAIN swapped-grid control video={c_video:?} audio={c_audio:?}");
-        fs::remove_dir(&runtime)?;
+        fs::remove_dir_all(&runtime)?;
         ensure!(
             !within(c_video, video_threshold)? || !within(c_audio, audio_threshold)?,
             "swapped-grid control stayed within the thresholds"
@@ -18188,7 +18285,7 @@ mod tests {
             &device,
             &mut blas,
             &spec,
-            (0, &layout),
+            (0, &layout, &table),
             Source::new(&model, &manifest, device.info.arch.fp16_stored_half()),
             None,
             (
