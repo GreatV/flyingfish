@@ -73,6 +73,12 @@ enum PlanAlgo {
     Fixed(sys::cublasLtMatmulAlgo_t),
 }
 
+struct PlanOperands {
+    ab: sys::cudaDataType_t,
+    c: sys::cudaDataType_t,
+    device_alpha: bool,
+}
+
 /// Config identity of a raw Lt algorithm struct.
 fn algo_config(algo: &sys::cublasLtMatmulAlgo_t) -> Result<LtAlgorithm> {
     use sys::cublasLtMatmulAlgoConfigAttributes_t as A;
@@ -174,8 +180,11 @@ impl Plan {
             (rows, output, input, input),
             workspace,
             None,
-            ab,
-            ab,
+            PlanOperands {
+                ab,
+                c: ab,
+                device_alpha: false,
+            },
             PlanAlgo::Heuristic(algo_index),
         )
     }
@@ -195,8 +204,11 @@ impl Plan {
             (rows, output, input, input),
             workspace,
             None,
-            sys::cudaDataType_t::CUDA_R_16F,
-            sys::cudaDataType_t::CUDA_R_16F,
+            PlanOperands {
+                ab: sys::cudaDataType_t::CUDA_R_16F,
+                c: sys::cudaDataType_t::CUDA_R_16F,
+                device_alpha: false,
+            },
             PlanAlgo::Heuristic(algo_index),
         )
     }
@@ -216,8 +228,11 @@ impl Plan {
             (rows, output, input, input),
             workspace,
             None,
-            sys::cudaDataType_t::CUDA_R_16BF,
-            sys::cudaDataType_t::CUDA_R_32F,
+            PlanOperands {
+                ab: sys::cudaDataType_t::CUDA_R_16BF,
+                c: sys::cudaDataType_t::CUDA_R_32F,
+                device_alpha: false,
+            },
             PlanAlgo::Heuristic(algo_index),
         )
     }
@@ -228,8 +243,7 @@ impl Plan {
         geometry: (usize, usize, usize, usize),
         workspace: usize,
         bias: Option<u64>,
-        ab_dtype: sys::cudaDataType_t,
-        c_dtype: sys::cudaDataType_t,
+        operands: PlanOperands,
         select: PlanAlgo,
     ) -> Result<Self> {
         let (rows, output, input, b_ld) = geometry;
@@ -262,8 +276,17 @@ impl Plan {
                 (&transpose as *const i32).cast(),
                 size_of::<i32>(),
             )?;
+            if operands.device_alpha {
+                let pointer_mode = sys::cublasLtPointerMode_t::CUBLASLT_POINTER_MODE_DEVICE as i32;
+                lt::set_matmul_desc_attribute(
+                    p.desc,
+                    sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_POINTER_MODE,
+                    (&pointer_mode as *const i32).cast(),
+                    size_of::<i32>(),
+                )?;
+            }
         }
-        let dtype = ab_dtype;
+        let dtype = operands.ab;
         if let Some(ptr) = bias {
             let epilogue = sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS;
             unsafe {
@@ -289,7 +312,7 @@ impl Plan {
         }
         p.a = lt::create_matrix_layout(dtype, input as u64, output as u64, input as i64)?;
         p.b = lt::create_matrix_layout(dtype, input as u64, rows as u64, b_ld)?;
-        p.c = lt::create_matrix_layout(c_dtype, output as u64, rows as u64, output as i64)?;
+        p.c = lt::create_matrix_layout(operands.c, output as u64, rows as u64, output as i64)?;
         p.pref = lt::create_matmul_pref()?;
         unsafe {
             // Biased plans are single-pass; split-K bias epilogues round before bias.
@@ -523,6 +546,8 @@ pub struct Blas {
     pitched_b: RefCell<BTreeMap<(usize, usize, usize, usize), Plan>>,
     row_families: RefCell<BTreeMap<(usize, usize), (sys::cublasLtMatmulAlgo_t, usize)>>,
     biased_plans: RefCell<BTreeMap<(LinearShape, u64, super::linear::LinearBiasMode), Plan>>,
+    wide_plans: RefCell<BTreeMap<(LinearShape, u8), Plan>>,
+    biased_f32_out: RefCell<BTreeMap<(LinearShape, u64), Plan>>,
     f16_reference: bool,
     f16_plans: RefCell<BTreeMap<LinearShape, Plan>>,
     bias_add: Option<CudaFunction>,
@@ -742,6 +767,8 @@ impl Blas {
             pitched_b: RefCell::new(BTreeMap::new()),
             row_families: RefCell::new(BTreeMap::new()),
             biased_plans: RefCell::new(BTreeMap::new()),
+            wide_plans: RefCell::new(BTreeMap::new()),
+            biased_f32_out: RefCell::new(BTreeMap::new()),
             f16_reference: false,
             f16_plans: RefCell::new(BTreeMap::new()),
             bias_add: None,
@@ -1094,6 +1121,8 @@ impl Drop for Blas {
         drop_result("synchronize BLAS stream", self.stream.synchronize());
         self.plans.borrow_mut().clear();
         self.biased_plans.borrow_mut().clear();
+        self.wide_plans.borrow_mut().clear();
+        self.biased_f32_out.borrow_mut().clear();
         self.pitched_b.borrow_mut().clear();
         unsafe {
             drop_result("destroy Lt handle", lt::destroy_handle(self.handle));
@@ -1239,8 +1268,11 @@ impl Blas {
                 (key.0, key.1, key.2, key.3),
                 self.workspace.borrow().len(),
                 None,
-                self.half_dtype,
-                self.half_dtype,
+                PlanOperands {
+                    ab: self.half_dtype,
+                    c: self.half_dtype,
+                    device_alpha: false,
+                },
                 PlanAlgo::Heuristic(0),
             )?;
             self.pitched_b.borrow_mut().insert(key, plan);
@@ -1287,8 +1319,11 @@ impl Blas {
                 (shape.rows, shape.output, shape.input, shape.input),
                 self.workspace.borrow().len(),
                 None,
-                self.half_dtype,
-                self.half_dtype,
+                PlanOperands {
+                    ab: self.half_dtype,
+                    c: self.half_dtype,
+                    device_alpha: false,
+                },
                 PlanAlgo::Fixed(algo),
             )?;
             self.plans.borrow_mut().insert(key, plan);
@@ -2168,8 +2203,11 @@ impl Blas {
                 (shape.rows, shape.output, shape.input, shape.input),
                 self.workspace.borrow().len(),
                 (mode == super::linear::LinearBiasMode::BeforeOutputRound).then_some(bias.ptr),
-                self.half_dtype,
-                self.half_dtype,
+                PlanOperands {
+                    ab: self.half_dtype,
+                    c: self.half_dtype,
+                    device_alpha: false,
+                },
                 PlanAlgo::Heuristic(0),
             )?;
             plan.describe(shape.rows, shape.output, shape.input)?;
@@ -2216,8 +2254,11 @@ impl Blas {
                 (rows, shape.output, shape.input, shape.input),
                 workspace,
                 Some(bias.ptr),
-                ab,
-                c,
+                PlanOperands {
+                    ab,
+                    c,
+                    device_alpha: false,
+                },
                 PlanAlgo::Fixed(algo),
             )?;
             ensure!(
@@ -2264,8 +2305,11 @@ impl Blas {
                 (shape.rows, shape.output, shape.input, shape.input),
                 1 << 20,
                 (mode == super::linear::LinearBiasMode::BeforeOutputRound).then_some(bias.ptr),
-                self.half_dtype,
-                self.half_dtype,
+                PlanOperands {
+                    ab: self.half_dtype,
+                    c: self.half_dtype,
+                    device_alpha: false,
+                },
                 PlanAlgo::Heuristic(0),
             )?;
             plan.describe(shape.rows, shape.output, shape.input)?;
@@ -2362,6 +2406,266 @@ impl Blas {
         }
         Ok(())
     }
+
+    /// FP16 A/B, F32 C, host alpha 1. `device_alpha` selects the device-pointer plan.
+    pub(crate) fn prepare_wide_f32(
+        &self,
+        rows: usize,
+        output: usize,
+        input: usize,
+        device_alpha: bool,
+    ) -> Result<()> {
+        checked_dims(rows, output, input)?;
+        let shape = LinearShape {
+            rows,
+            output,
+            input,
+        };
+        let key = (shape, u8::from(device_alpha));
+        let mut plans = self.wide_plans.borrow_mut();
+        if let std::collections::btree_map::Entry::Vacant(entry) = plans.entry(key) {
+            let plan = Plan::build(
+                self.handle,
+                (rows, output, input, input),
+                self.workspace.borrow().len(),
+                None,
+                PlanOperands {
+                    ab: self.half_dtype,
+                    c: sys::cudaDataType_t::CUDA_R_32F,
+                    device_alpha,
+                },
+                PlanAlgo::Heuristic(0),
+            )?;
+            plan.describe(rows, output, input)?;
+            entry.insert(plan);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn linear_wide_f32(
+        &self,
+        weight: super::contracts::Tensor<bf16, 2>,
+        x: super::contracts::Tensor<bf16, 2>,
+        y: &mut super::contracts::TensorMut<f32, 2>,
+    ) -> Result<()> {
+        let shape = wide_f32_shape(weight, x, &y.0)?;
+        let call = {
+            let plans = self.wide_plans.borrow();
+            let plan = plans.get(&(shape, 0)).with_context(|| {
+                format!(
+                    "wide F32 Lt plan missing rows={} output={} input={}",
+                    shape.rows, shape.output, shape.input
+                )
+            })?;
+            wide_call(plan)?
+        };
+        let alpha = 1f32;
+        let beta = 0f32;
+        self.launch_wide(
+            call,
+            weight.ptr,
+            x.ptr,
+            y.0.ptr,
+            (&alpha as *const f32).cast(),
+            (&beta as *const f32).cast(),
+        )
+    }
+
+    /// Device alpha and beta. Both pointers are device addresses.
+    pub(crate) fn linear_wide_f32_device(
+        &self,
+        weight: super::contracts::Tensor<bf16, 2>,
+        x: super::contracts::Tensor<bf16, 2>,
+        y: &mut super::contracts::TensorMut<f32, 2>,
+        alpha: u64,
+        beta: u64,
+    ) -> Result<()> {
+        let shape = wide_f32_shape(weight, x, &y.0)?;
+        ensure!(
+            alpha != 0 && beta != 0 && alpha.is_multiple_of(4) && beta.is_multiple_of(4),
+            "wide device scale pointers"
+        );
+        let call = {
+            let plans = self.wide_plans.borrow();
+            let plan = plans.get(&(shape, 1)).with_context(|| {
+                format!(
+                    "wide device-alpha Lt plan missing rows={} output={} input={}",
+                    shape.rows, shape.output, shape.input
+                )
+            })?;
+            wide_call(plan)?
+        };
+        self.launch_wide(
+            call,
+            weight.ptr,
+            x.ptr,
+            y.0.ptr,
+            alpha as *const std::ffi::c_void,
+            beta as *const std::ffi::c_void,
+        )
+    }
+
+    fn launch_wide(
+        &self,
+        plan: WideCall,
+        weight: u64,
+        x: u64,
+        y: u64,
+        alpha: *const std::ffi::c_void,
+        beta: *const std::ffi::c_void,
+    ) -> Result<()> {
+        let workspace_owner = self.workspace.borrow();
+        let (workspace, _read) = workspace_owner.device_ptr(&self.stream);
+        let workspace_bytes = workspace_owner.len();
+        unsafe {
+            lt::matmul(
+                self.handle,
+                plan.desc,
+                alpha,
+                beta,
+                weight as _,
+                plan.a,
+                x as _,
+                plan.b,
+                y as _,
+                plan.c,
+                y as _,
+                plan.c,
+                &plan.algo,
+                workspace as _,
+                workspace_bytes,
+                self.stream.cu_stream() as _,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Context embedder: FP16 A/B, F32 C, bias before the F32 store.
+    pub(crate) fn prepare_biased_f32(
+        &self,
+        rows: u32,
+        output: u32,
+        input: u32,
+        bias: super::contracts::Tensor<bf16, 1>,
+    ) -> Result<()> {
+        ensure!(
+            [rows, output, input]
+                .iter()
+                .all(|&n| n > 0 && n <= i32::MAX as u32),
+            "invalid biased F32 linear dimensions"
+        );
+        bias.validate()?;
+        ensure!(
+            bias.shape == [output] && bias.stride == [1],
+            "linear bias shape mismatch"
+        );
+        let shape = LinearShape {
+            rows: rows as usize,
+            output: output as usize,
+            input: input as usize,
+        };
+        let mut plans = self.biased_f32_out.borrow_mut();
+        if let std::collections::btree_map::Entry::Vacant(entry) = plans.entry((shape, bias.ptr)) {
+            let plan = Plan::build(
+                self.handle,
+                (shape.rows, shape.output, shape.input, shape.input),
+                self.workspace.borrow().len(),
+                Some(bias.ptr),
+                PlanOperands {
+                    ab: self.half_dtype,
+                    c: sys::cudaDataType_t::CUDA_R_32F,
+                    device_alpha: false,
+                },
+                PlanAlgo::Heuristic(0),
+            )?;
+            plan.describe(shape.rows, shape.output, shape.input)?;
+            entry.insert(plan);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn linear_biased_f32(
+        &self,
+        weight: super::contracts::Tensor<bf16, 2>,
+        bias: super::contracts::Tensor<bf16, 1>,
+        x: super::contracts::Tensor<bf16, 2>,
+        y: &mut super::contracts::TensorMut<f32, 2>,
+    ) -> Result<()> {
+        weight.validate()?;
+        bias.validate()?;
+        let shape = wide_f32_shape(weight, x, &y.0)?;
+        ensure!(
+            bias.shape == [weight.shape[0]] && bias.stride == [1],
+            "biased F32 linear layout mismatch"
+        );
+        super::linear::disjoint(&bias, &y.0)?;
+        let call = {
+            let plans = self.biased_f32_out.borrow();
+            let plan = plans.get(&(shape, bias.ptr)).with_context(|| {
+                format!(
+                    "biased F32 Lt plan missing rows={} output={} input={}",
+                    shape.rows, shape.output, shape.input
+                )
+            })?;
+            wide_call(plan)?
+        };
+        let alpha = 1f32;
+        let beta = 0f32;
+        self.launch_wide(
+            call,
+            weight.ptr,
+            x.ptr,
+            y.0.ptr,
+            (&alpha as *const f32).cast(),
+            (&beta as *const f32).cast(),
+        )
+    }
+}
+
+struct WideCall {
+    desc: sys::cublasLtMatmulDesc_t,
+    a: sys::cublasLtMatrixLayout_t,
+    b: sys::cublasLtMatrixLayout_t,
+    c: sys::cublasLtMatrixLayout_t,
+    algo: sys::cublasLtMatmulAlgo_t,
+}
+
+fn wide_call(plan: &Plan) -> Result<WideCall> {
+    Ok(WideCall {
+        desc: plan.desc,
+        a: plan.a,
+        b: plan.b,
+        c: plan.c,
+        algo: *plan.algo.as_ref().context("wide Lt algo missing")?,
+    })
+}
+
+fn wide_f32_shape(
+    weight: super::contracts::Tensor<bf16, 2>,
+    x: super::contracts::Tensor<bf16, 2>,
+    y: &super::contracts::Tensor<f32, 2>,
+) -> Result<LinearShape> {
+    weight.validate()?;
+    x.validate()?;
+    y.validate()?;
+    ensure!(
+        weight.shape[0] > 0
+            && weight.shape[1] > 0
+            && weight.shape.iter().all(|&v| v <= i32::MAX as u32)
+            && weight.stride == [u64::from(weight.shape[1]), 1]
+            && x.shape[1] == weight.shape[1]
+            && y.shape == [x.shape[0], weight.shape[0]]
+            && x.stride == [u64::from(weight.shape[1]), 1]
+            && y.stride == [u64::from(weight.shape[0]), 1],
+        "wide F32 linear layout"
+    );
+    super::linear::disjoint(&weight, y)?;
+    super::linear::disjoint(&x, y)?;
+    Ok(LinearShape {
+        rows: x.shape[0] as usize,
+        output: weight.shape[0] as usize,
+        input: weight.shape[1] as usize,
+    })
 }
 
 pub(crate) fn linear_f32_on(

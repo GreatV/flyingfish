@@ -215,6 +215,116 @@ extern "C" __global__ void silu_bf16(__nv_bfloat16* __restrict__ x, long long co
     const float v = __bfloat162float(x[i]);
     x[i] = __float2bfloat16_rn(v / (1.0f + expf(-v)));
 }
+
+// Mode-3 product without the store check: fp16(silu(upper)) * lower.
+__device__ __forceinline__ float ff_f16_roundtrip(float v) {
+    unsigned short u;
+    asm volatile("cvt.rn.f16.f32 %0, %1;" : "=h"(u) : "f"(v));
+    float f;
+    asm volatile("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(u));
+    return f;
+}
+
+__device__ __forceinline__ float ff_mode3_product(float lower, float upper) {
+    const float silu = upper / (1.0f + expf(-upper));
+    return ff_f16_roundtrip(silu) * lower;
+}
+
+// One atomicMax per block of the uint bits of fabsf of the mode-3 product.
+// A NaN's bits win that max. The scaled store then faults.
+// Does not store and does not set ff_fp16_store_fault.
+extern "C" __global__ void silu_mul_maxabs(const __nv_bfloat16* gu, float* max_abs,
+                                          int rows, int dim) {
+    if (rows <= 0 || dim <= 0 || (dim & 7) != 0 ||
+        (long long)rows * dim > 2147483647LL || !gu || !max_abs ||
+        (reinterpret_cast<uintptr_t>(gu) & 15u) != 0u ||
+        (blockDim.x & 31u) != 0u || blockDim.x > 1024u) {
+        __trap();
+        return;
+    }
+    const int vec = blockIdx.x * blockDim.x + threadIdx.x;
+    const int vec_dim = dim >> 3;
+    const int nvec = rows * vec_dim;
+    unsigned bits = 0;
+    if (vec < nvec) {
+        const int row = vec / vec_dim;
+        const int vd = vec % vec_dim;
+        const uint4 gv = reinterpret_cast<const uint4*>(gu)[row * 2 * vec_dim + vd];
+        const uint4 uv = reinterpret_cast<const uint4*>(gu)[row * 2 * vec_dim + vec_dim + vd];
+        const __nv_bfloat16* gp = reinterpret_cast<const __nv_bfloat16*>(&gv);
+        const __nv_bfloat16* up = reinterpret_cast<const __nv_bfloat16*>(&uv);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const unsigned b = __float_as_uint(fabsf(
+                ff_mode3_product(__bfloat162float(gp[j]), __bfloat162float(up[j]))));
+            if (b > bits) bits = b;
+        }
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const unsigned other = __shfl_xor_sync(FF_WARP_MASK, bits, o);
+        if (other > bits) bits = other;
+    }
+    __shared__ unsigned warp_bits[32];
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned warp = threadIdx.x >> 5;
+    if (lane == 0) warp_bits[warp] = bits;
+    __syncthreads();
+    if (warp == 0) {
+        const unsigned nwarps = blockDim.x >> 5;
+        unsigned block = lane < nwarps ? warp_bits[lane] : 0u;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const unsigned other = __shfl_xor_sync(FF_WARP_MASK, block, o);
+            if (other > block) block = other;
+        }
+        if (lane == 0) atomicMax(reinterpret_cast<unsigned int*>(max_abs), block);
+    }
+}
+
+// alpha = 2^k. k is the smallest integer with max_abs / 2^k <= 32768, by halving, capped at 127.
+extern "C" __global__ void silu_pow2_alpha(const float* max_abs, float* alpha) {
+    if (threadIdx.x != 0 || blockIdx.x != 0 || !max_abs || !alpha) return;
+    float m = *max_abs;
+    int k = 0;
+    while (m > 32768.0f && k < 127) {
+        m *= 0.5f;
+        ++k;
+    }
+    *alpha = __uint_as_float(static_cast<unsigned>(127 + k) << 23);
+}
+
+// Stores product / 2^k. The silu round and the scaled store use the FP16 check.
+extern "C" __global__ void silu_mul_scaled(const __nv_bfloat16* gu, __nv_bfloat16* y,
+                                          const float* alpha, int rows, int dim) {
+    if (rows <= 0 || dim <= 0 || (dim & 7) != 0 ||
+        (long long)rows * dim > 2147483647LL || !gu || !y || !alpha ||
+        ((reinterpret_cast<uintptr_t>(gu) | reinterpret_cast<uintptr_t>(y)) & 15u) != 0u) {
+        __trap();
+        return;
+    }
+    const float scale = *alpha;
+    const int vec = blockIdx.x * blockDim.x + threadIdx.x;
+    const int vec_dim = dim >> 3;
+    if (vec >= rows * vec_dim) return;
+    const int row = vec / vec_dim;
+    const int vd = vec % vec_dim;
+    const uint4 gv = reinterpret_cast<const uint4*>(gu)[row * 2 * vec_dim + vd];
+    const uint4 uv = reinterpret_cast<const uint4*>(gu)[row * 2 * vec_dim + vec_dim + vd];
+    const __nv_bfloat16* gp = reinterpret_cast<const __nv_bfloat16*>(&gv);
+    const __nv_bfloat16* up = reinterpret_cast<const __nv_bfloat16*>(&uv);
+    uint4 yv;
+    __nv_bfloat16* yp = reinterpret_cast<__nv_bfloat16*>(&yv);
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float u = __bfloat162float(up[j]);
+        const float g = __bfloat162float(gp[j]);
+        const __nv_bfloat16 silu = __float2bfloat16(u / (1.0f + expf(-u)));
+        const float prod = __bfloat162float(silu) * g;
+        yp[j] = __float2bfloat16(prod / scale);
+    }
+    reinterpret_cast<uint4*>(y)[vec] = yv;
+}
 #else /* ff-sm80 */
 #include "gpu_compat.cuh"
 #include "q38_contract.cuh"
