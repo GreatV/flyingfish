@@ -15017,6 +15017,113 @@ mod tests {
         crate::verify::max_abs_rmse("h3.image", candidate, reference)
     }
 
+    fn residual_bit_diffs<T: Copy, B: Eq>(
+        actual: &[T],
+        baseline: &[T],
+        finite: impl Fn(T) -> bool,
+        bits: impl Fn(T) -> B,
+    ) -> Result<usize> {
+        ensure!(
+            !actual.is_empty() && !baseline.is_empty(),
+            "image residual is empty"
+        );
+        ensure!(
+            actual.len() == baseline.len() && actual.iter().chain(baseline).all(|v| finite(*v)),
+            "invalid full-block residual"
+        );
+        Ok(actual
+            .iter()
+            .zip(baseline)
+            .filter(|(a, b)| bits(**a) != bits(**b))
+            .count())
+    }
+
+    enum ImageResidual {
+        F32(Vec<f32>),
+        Bf16(Vec<bf16>),
+    }
+
+    impl ImageResidual {
+        fn len(&self) -> usize {
+            match self {
+                Self::F32(words) => words.len(),
+                Self::Bf16(words) => words.len(),
+            }
+        }
+
+        fn is_empty(&self) -> bool {
+            match self {
+                Self::F32(words) => words.is_empty(),
+                Self::Bf16(words) => words.is_empty(),
+            }
+        }
+
+        fn bit_diffs(&self, actual: &Self) -> Result<usize> {
+            match (actual, self) {
+                (Self::F32(actual), Self::F32(baseline)) => {
+                    residual_bit_diffs(actual, baseline, f32::is_finite, f32::to_bits)
+                }
+                (Self::Bf16(actual), Self::Bf16(baseline)) => {
+                    residual_bit_diffs(actual, baseline, bf16::is_finite, bf16::to_bits)
+                }
+                _ => bail!("image residual dtypes differ"),
+            }
+        }
+    }
+
+    fn image_dit_residual(
+        s: &std::sync::Arc<crate::backend::gpu::CudaStream>,
+        dit: &ImageDit,
+    ) -> Result<ImageResidual> {
+        let captured = if let Some(wide) = dit.wide.as_ref() {
+            ImageResidual::F32(s.clone_dtoh(&wide.x)?)
+        } else {
+            ImageResidual::Bf16(s.clone_dtoh(&dit.x)?)
+        };
+        ensure!(!captured.is_empty(), "image residual is empty");
+        Ok(captured)
+    }
+
+    #[test]
+    fn image_residual_capture_rejects_an_empty_buffer() -> Result<()> {
+        let empty = ImageResidual::F32(Vec::new());
+        let error = empty.bit_diffs(&empty).expect_err("empty f32 residual");
+        ensure!(
+            error.to_string().contains("image residual is empty"),
+            "{error}"
+        );
+        let empty_bf16 = ImageResidual::Bf16(Vec::new());
+        let error = empty_bf16
+            .bit_diffs(&empty_bf16)
+            .expect_err("empty bf16 residual");
+        ensure!(
+            error.to_string().contains("image residual is empty"),
+            "{error}"
+        );
+        let baseline = ImageResidual::F32(vec![1.0, 2.0]);
+        ensure!(baseline.bit_diffs(&baseline)? == 0, "equal f32 residual");
+        let shifted = ImageResidual::F32(vec![1.0, 3.0]);
+        ensure!(baseline.bit_diffs(&shifted)? == 1, "one f32 word");
+        let half = ImageResidual::Bf16(vec![bf16::from_f32(1.0), bf16::from_f32(2.0)]);
+        ensure!(half.bit_diffs(&half)? == 0, "equal bf16 residual");
+        let half_shifted = ImageResidual::Bf16(vec![bf16::from_f32(1.0), bf16::from_f32(3.0)]);
+        ensure!(half.bit_diffs(&half_shifted)? == 1, "one bf16 word");
+        let nan = ImageResidual::F32(vec![f32::NAN]);
+        let error = nan.bit_diffs(&nan).expect_err("non-finite residual");
+        ensure!(
+            error.to_string().contains("invalid full-block residual"),
+            "{error}"
+        );
+        let mixed = baseline
+            .bit_diffs(&half)
+            .expect_err("mixed residual dtypes");
+        ensure!(
+            mixed.to_string().contains("image residual dtypes differ"),
+            "{mixed}"
+        );
+        Ok(())
+    }
+
     /// Blocks placed per `FF_H3_PLACEMENT`, eager. Step 0 and step 5 are separate forwards on the same patchified
     /// rows. Euler step 0 writes generated rows only. `inputs.safetensors` supplies `t2i_rows` and `edit_rows`.
     /// Image row `i` takes the `(h, w)` of image row `i + 1`. That line is printed.
@@ -15247,7 +15354,7 @@ mod tests {
                     .context("copy DiT velocity to host")
             };
             let step0 = velocity(&context, 0, &text_d, &mut dit)?;
-            let residual = s.clone_dtoh(&dit.x)?;
+            let residual = image_dit_residual(s, &dit)?;
             let euler_rows = s.clone_htod(&t2i_rows)?;
             dit.euler(s, &euler_rows, &schedule, 0)?;
             let euler = s.clone_dtoh(&euler_rows)?;
@@ -15345,19 +15452,7 @@ mod tests {
                     lora_scale: 1.0,
                 };
                 let clean = velocity(&context, 0, &text_d, &mut streamed)?;
-                let bit_diffs = |actual: &[bf16]| -> Result<usize> {
-                    ensure!(
-                        actual.len() == residual.len()
-                            && actual.iter().chain(&residual).all(|v| v.is_finite()),
-                        "invalid full-block residual"
-                    );
-                    Ok(actual
-                        .iter()
-                        .zip(&residual)
-                        .filter(|(a, b)| a.to_bits() != b.to_bits())
-                        .count())
-                };
-                let clean_diff = bit_diffs(&s.clone_dtoh(&streamed.x)?)?;
+                let clean_diff = residual.bit_diffs(&image_dit_residual(s, &streamed)?)?;
                 let velocity_diff = clean
                     .iter()
                     .zip(&step0)
@@ -15388,7 +15483,7 @@ mod tests {
                     "wrong residency error: {error}"
                 );
                 velocity(&context, 0, &text_d, &mut streamed)?;
-                let control = bit_diffs(&s.clone_dtoh(&streamed.x)?)?;
+                let control = residual.bit_diffs(&image_dit_residual(s, &streamed)?)?;
                 ensure!(
                     control > 0,
                     "full-block residual missed the next-slot norm read"
