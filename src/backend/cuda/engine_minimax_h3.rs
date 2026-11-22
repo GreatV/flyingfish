@@ -15548,7 +15548,8 @@ mod tests {
     }
 
     /// Taus are `max(2 * pair, 1e-6)`. t2i_conditioner and t2i cell (b) are the 2026-11-13 isolated correction.
-    /// Edit cells and cell (e) stay the 2026-11-12 recapture.
+    /// Edit and RGB frozen taus are from the 2026-11-12 recapture.
+    /// 2026-11-22 erratum: CUDA conditioner max_abs allows the larger of the frozen tau and one BF16 ULP at each reference magnitude.
     /// t2i `uncross_*` is the isolated arm-A versus MATH pair. It is 0 when a cell has no uncross figure.
     /// `gate_max` is false where the max_abs tau exceeds rms(arm A).
     const IMAGE_E2E: &[ImageE2eCell] = &[
@@ -15914,7 +15915,21 @@ mod tests {
         let (max_abs, rmse) = image_max_rmse(candidate, reference)?;
         let rel = rmse / rms_a;
         ensure!(rel.is_finite(), "{label} relative rmse");
-        let within = (!cell.gate_max || max_abs <= cell.tau_max)
+        let conditioner_floor =
+            cfg!(feature = "cuda") && matches!(cell.name, "t2i_conditioner" | "edit_conditioner");
+        let within_max = !cell.gate_max
+            || max_abs <= cell.tau_max
+            || (conditioner_floor
+                && candidate
+                    .iter()
+                    .zip(reference)
+                    .all(|(&native, &reference)| {
+                        let reference = f64::from(reference);
+                        let error = (f64::from(native) - reference).abs();
+                        error <= cell.tau_max
+                            || error <= 2.0 * crate::verify::bf16_half_ulp(reference.abs())
+                    }));
+        let within = within_max
             && (!cell.gate_rmse || rmse <= cell.tau_rmse)
             && (!cell.gate_rel || rel <= cell.tau_rel);
         if cell.uncross_max != 0.0 || cell.uncross_rmse != 0.0 {
@@ -16336,6 +16351,17 @@ mod tests {
                 label_b,
                 image_e2e_judge(cell, label_b, &got, &right, rms)?,
             );
+            #[cfg(feature = "cuda")]
+            if !edit {
+                let mut planted = got;
+                planted.copy_from_slice(&left);
+                ensure!(left[1016] == 1568.0, "t2i conditioner control reference");
+                planted[1016] = 1552.0;
+                ensure!(
+                    !image_e2e_judge(cell, "t2i_conditioner_two_ulp", &planted, &left, rms)?,
+                    "t2i conditioner accepted a two-ULP error"
+                );
+            }
             let rgb_name = if edit { "edit_rgb" } else { "t2i_rgb" };
             let values = image_e2e_rgb_values(&latents.rgb, &rgb)?;
             image_e2e_judge(
