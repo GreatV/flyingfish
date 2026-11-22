@@ -3185,13 +3185,13 @@ fn wide_dense(
     };
     #[cfg(feature = "cuda")]
     {
-        return match device_scale {
+        match device_scale {
             None => c.blas.linear_wide_f32(weight, x, &mut TensorMut(y)),
             Some((alpha, beta)) => {
                 c.blas
                     .linear_wide_f32_device(weight, x, &mut TensorMut(y), alpha, beta)
             }
-        };
+        }
     }
     #[cfg(not(feature = "cuda"))]
     {
