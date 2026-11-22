@@ -1076,7 +1076,7 @@ fn png_output(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
 fn mp4_output(path: &Path) -> Result<bool> {
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("mp4") => Ok(true),
@@ -1376,7 +1376,7 @@ fn music(
     })
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 fn write_video(
     (output, wav): (PathBuf, Option<PathBuf>),
     generated: flyingfish::minimax_h3::H3Output,
@@ -1461,15 +1461,27 @@ fn write_video(
     Ok(())
 }
 
+#[cfg(any(feature = "rocm", test))]
+fn check_rocm_video(hyperflow: bool, gguf: bool, multi_request: bool) -> Result<()> {
+    ensure!(!hyperflow, "HyperFlow video requires CUDA");
+    ensure!(!gguf, "video --gguf requires CUDA");
+    ensure!(
+        !multi_request,
+        "multi-request video --requests requires CUDA"
+    );
+    Ok(())
+}
+
 fn video(cli: &Cli) -> Result<()> {
     let _ = cli;
-    #[cfg(not(feature = "cuda"))]
-    bail!("video requires CUDA");
-    #[cfg(feature = "cuda")]
+    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
+    bail!("video requires CUDA or ROCm");
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     flyingfish::backend::with_verbose(cli.verbose, || {
+        #[cfg(feature = "cuda")]
+        use flyingfish::minimax_h3::VideoSession;
         use flyingfish::minimax_h3::{
-            HyperFlowH3Request, MiniMaxH3I2vaRequest, VideoSession, run_hyperflow_h3_video,
-            run_minimax_h3_i2va,
+            HyperFlowH3Request, MiniMaxH3I2vaRequest, run_hyperflow_h3_video, run_minimax_h3_i2va,
         };
         let Command::Video {
             prompt,
@@ -1488,6 +1500,8 @@ fn video(cli: &Cli) -> Result<()> {
             bail!("video requires the video subcommand");
         };
         let hyperflow = flyingfish::minimax_h3::is_hyperflow_model(&cli.model)?;
+        #[cfg(feature = "rocm")]
+        check_rocm_video(hyperflow, gguf.is_some(), false)?;
         ensure!(
             hyperflow || (last_image.is_none() && base_model.is_none()),
             "--last-image and --base-model require HyperFlow"
@@ -1599,10 +1613,6 @@ fn video(cli: &Cli) -> Result<()> {
             };
             Ok((output, wav))
         };
-        let prepare = |request: &Request| match model_request(request)? {
-            ModelRequest::MiniMax(request) => request.prepare(),
-            ModelRequest::HyperFlow(request) => request.prepare(),
-        };
         let once = |record: Request| -> Result<()> {
             let paths = validate_output(&record.output)?;
             let generated = match model_request(&record)? {
@@ -1624,30 +1634,46 @@ fn video(cli: &Cli) -> Result<()> {
         };
         let mut inputs = read_request_lines::<Request>(path, "video")?;
         let first = inputs.next().context("video requests file is empty")??;
-        let Some(second) = inputs.next().transpose()? else {
-            return once(first);
-        };
-        let check_requests = [Ok(first), Ok(second)]
-            .into_iter()
-            .chain(inputs)
-            .map(|record| {
-                let record = record?;
-                validate_output(&record.output)?;
-                prepare(&record)
-            });
-        let mut session = VideoSession::open(
-            (&cli.model, base.as_deref()),
-            (lora.as_deref(), gguf.as_deref()),
-            &options,
-            check_requests,
-        )?;
-        for record in read_request_lines::<Request>(path, "video")? {
-            let record = record?;
-            let paths = validate_output(&record.output)?;
-            let output = session.render(&prepare(&record)?)?;
-            write_video(paths, output, record.seed, *json)?;
+        #[cfg(feature = "rocm")]
+        {
+            check_rocm_video(
+                hyperflow,
+                gguf.is_some(),
+                inputs.next().transpose()?.is_some(),
+            )?;
+            once(first)
         }
-        Ok(())
+        #[cfg(feature = "cuda")]
+        {
+            let Some(second) = inputs.next().transpose()? else {
+                return once(first);
+            };
+            let prepare = |request: &Request| match model_request(request)? {
+                ModelRequest::MiniMax(request) => request.prepare(),
+                ModelRequest::HyperFlow(request) => request.prepare(),
+            };
+            let check_requests = [Ok(first), Ok(second)]
+                .into_iter()
+                .chain(inputs)
+                .map(|record| {
+                    let record = record?;
+                    validate_output(&record.output)?;
+                    prepare(&record)
+                });
+            let mut session = VideoSession::open(
+                (&cli.model, base.as_deref()),
+                (lora.as_deref(), gguf.as_deref()),
+                &options,
+                check_requests,
+            )?;
+            for record in read_request_lines::<Request>(path, "video")? {
+                let record = record?;
+                let paths = validate_output(&record.output)?;
+                let output = session.render(&prepare(&record)?)?;
+                write_video(paths, output, record.seed, *json)?;
+            }
+            Ok(())
+        }
     })
 }
 
@@ -2755,6 +2781,17 @@ mod tests {
         assert!(mp4_output(Path::new("out.mp4"))?);
         assert!(!mp4_output(Path::new("out.y4m"))?);
         assert!(mp4_output(Path::new("out.avi")).is_err());
+        check_rocm_video(false, false, false)?;
+        for (hyperflow, gguf, multi) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let error = check_rocm_video(hyperflow, gguf, multi)
+                .expect_err("CUDA-only video mode must fail on ROCm")
+                .to_string();
+            assert!(error.contains("CUDA"), "{error}");
+        }
         assert!(
             Cli::try_parse_from([
                 "flyingfish",
