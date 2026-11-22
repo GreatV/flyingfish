@@ -2124,7 +2124,20 @@ pub(crate) struct BlockKernels {
     act_module: Arc<CudaModule>,
     rope_module: Arc<CudaModule>,
     fp16_store: bool,
+    wide: Option<WideKernels>,
     stored_launch: std::sync::OnceLock<StoredLaunch>,
+}
+
+struct WideKernels {
+    silu_mul_maxabs: crate::backend::gpu::CudaFunction,
+    silu_pow2_alpha: crate::backend::gpu::CudaFunction,
+    silu_mul_scaled: crate::backend::gpu::CudaFunction,
+    rms_f32_bf16: crate::backend::gpu::CudaFunction,
+    rms_f32_modulate: crate::backend::gpu::CudaFunction,
+    rms_f32_f32: crate::backend::gpu::CudaFunction,
+    residual_f32: crate::backend::gpu::CudaFunction,
+    gated_add_rms_f32: crate::backend::gpu::CudaFunction,
+    row_gated_add_f32: crate::backend::gpu::CudaFunction,
 }
 
 impl BlockKernels {
@@ -2161,6 +2174,21 @@ impl BlockKernels {
             gated_active >= baseline,
             "gated_add_rms_norm_modulate occupancy {gated_active} below rms_norm_bf16 {baseline}"
         );
+        let wide = if d.info.arch.fp16_stored_half() {
+            Some(WideKernels {
+                silu_mul_maxabs: act_module.load_function("silu_mul_maxabs")?,
+                silu_pow2_alpha: act_module.load_function("silu_pow2_alpha")?,
+                silu_mul_scaled: act_module.load_function("silu_mul_scaled")?,
+                rms_f32_bf16: norm_module.load_function("rms_f32_bf16")?,
+                rms_f32_modulate: norm_module.load_function("rms_f32_modulate")?,
+                rms_f32_f32: norm_module.load_function("rms_f32_f32")?,
+                residual_f32: norm_module.load_function("residual_f32")?,
+                gated_add_rms_f32: norm_module.load_function("gated_add_rms_f32")?,
+                row_gated_add_f32: modulate_module.load_function("row_gated_add_f32")?,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             norm: plain,
             norm_f32,
@@ -2185,6 +2213,7 @@ impl BlockKernels {
             act_module,
             rope_module,
             fp16_store: d.info.arch.fp16_stored_half(),
+            wide,
             stored_launch: std::sync::OnceLock::new(),
         })
     }
@@ -2240,6 +2269,18 @@ pub(crate) struct BlockWork {
     gated: Tensor<bf16, 2>,
     ffn_owned: Option<(CudaSlice<bf16>, CudaSlice<bf16>)>,
     stored: Option<StoredScratch>,
+    wide: Option<CudaSlice<f32>>,
+    wide_launch: Option<WideResidual>,
+}
+
+/// F32 residual `x`, F32 GEMM output `out`, and the device scale triple.
+#[derive(Clone, Copy)]
+struct WideResidual {
+    x: u64,
+    out: u64,
+    max_abs: u64,
+    alpha: u64,
+    beta: u64,
 }
 
 /// Convrot and low-rank scratch for one block forward. `codes` aliases `x`; `convrot` is absent when `k == 0`.
@@ -2525,7 +2566,7 @@ impl BlockWork {
         blas: &Blas,
         spec: &H3Spec,
         plan: FfnPlan,
-        x: &CudaSlice<bf16>,
+        residual: (u64, usize),
     ) -> Result<()> {
         let allocation = if plan.borrowed || plan.chunk == self.chunk {
             0
@@ -2564,8 +2605,25 @@ impl BlockWork {
         if LORA {
             overlap("LoRA", &self.lora)?;
         }
-        overlap("residual", x)?;
+        let protected =
+            unsafe { Tensor::<u8, 1>::new(residual.0, [1], [1], u64::try_from(residual.1)?)? };
+        crate::backend::cuda::contracts::no_overlap(
+            &self.hidden,
+            &protected,
+            "FFN hidden",
+            "residual",
+        )?;
+        crate::backend::cuda::contracts::no_overlap(
+            &self.gated,
+            &protected,
+            "FFN gated",
+            "residual",
+        )?;
         self.chunk = plan.chunk;
+        #[cfg(feature = "cuda")]
+        if self.wide.is_some() {
+            self.prepare_wide(blas, spec)?;
+        }
         ensure!(
             self.hidden.ptr.is_multiple_of(256) && self.gated.ptr.is_multiple_of(256),
             "FFN view alignment"
@@ -2660,7 +2718,22 @@ impl BlockWork {
             gated: gated_view,
             ffn_owned: Some((hidden, gated)),
             stored,
+            wide: None,
+            wide_launch: None,
         })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn prepare_wide(&self, blas: &Blas, spec: &H3Spec) -> Result<()> {
+        ensure!(self.wide.is_some(), "sm75 F32 output buffer");
+        let width = spec.heads * spec.head_dim;
+        blas.prepare_wide_f32(self.rows, spec.hidden, width, false)?;
+        for rows in [self.chunk, self.rows % self.chunk] {
+            if rows > 0 {
+                blas.prepare_wide_f32(rows, spec.hidden, spec.ffn, true)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -3081,6 +3154,50 @@ fn apply_low_rank(
     }
 }
 
+fn f32_matrix(ptr: u64, rows: usize, cols: usize) -> Result<Tensor<f32, 2>> {
+    let bytes = (rows as u64)
+        .checked_mul(cols as u64)
+        .and_then(|n| n.checked_mul(4))
+        .context("F32 view bytes")?;
+    unsafe {
+        Tensor::new(
+            ptr,
+            [u32::try_from(rows)?, u32::try_from(cols)?],
+            [u64::try_from(cols)?, 1],
+            bytes,
+        )
+    }
+}
+
+fn wide_dense(
+    c: &BlockContext<'_>,
+    linear: &BlockLinear,
+    x: Tensor<bf16, 2>,
+    y: Tensor<f32, 2>,
+    device_scale: Option<(u64, u64)>,
+) -> Result<()> {
+    let weight = match linear {
+        BlockLinear::Dense { weight, .. } => *weight,
+        BlockLinear::Int8 { .. } => bail!("sm75 F32 residual has no int8 down"),
+        BlockLinear::LowRank { .. } => bail!("sm75 F32 residual requires a dense projection"),
+    };
+    #[cfg(feature = "cuda")]
+    {
+        return match device_scale {
+            None => c.blas.linear_wide_f32(weight, x, &mut TensorMut(y)),
+            Some((alpha, beta)) => {
+                c.blas
+                    .linear_wide_f32_device(weight, x, &mut TensorMut(y), alpha, beta)
+            }
+        };
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (c, weight, x, y, device_scale);
+        bail!("sm75 F32 residual is CUDA-only");
+    }
+}
+
 /// One MiniMax-H3 transformer or token refiner block over `x [rows, hidden]` in place, BF16. The `LORA` monomorph
 /// applies LoRA online at `c.lora_scale`; the other monomorph launches no LoRA GEMM. A modulated block's `rotary`
 /// is `[rows, 6 * rope_freq_dim]` from `rotary_table`. A dropped block returns `x`.
@@ -3121,7 +3238,13 @@ fn block_forward_tail<const LORA: bool>(
         }
         Conditioning::Plain => (0, pointer(&work.q, s), None),
     };
-    ensure!(x.len() == rows * h, "block rows differ from the work rows");
+    let wide = work.wide_launch;
+    if LORA && wide.is_some() {
+        bail!("sm75 F32 residual has no LoRA down");
+    }
+    if wide.is_none() {
+        ensure!(x.len() == rows * h, "block rows differ from the work rows");
+    }
     if w.dropped {
         return Ok(());
     }
@@ -3146,8 +3269,12 @@ fn block_forward_tail<const LORA: bool>(
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let xp = pointer(x, s);
     let normed = pointer(&work.normed, s);
+    let xp = match wide {
+        Some(wide) => wide.x,
+        None => pointer(x, s),
+    };
+    let y_out = wide.map(|wide| wide.out).unwrap_or(normed);
     let hidden_norm = |weight: &VectorWeight<bf16>, shift: usize, scale: usize| -> Result<()> {
         let n = NormRows {
             input: xp,
@@ -3169,12 +3296,34 @@ fn block_forward_tail<const LORA: bool>(
                 stride,
                 entries,
             };
-            kernels.rms_norm_modulate_f32(s, n, m)
+            if wide.is_some() {
+                kernels.rms_wide_mod(s, n, m)
+            } else {
+                kernels.rms_norm_modulate_f32(s, n, m)
+            }
+        } else if wide.is_some() {
+            kernels.rms_wide(s, n)
         } else {
             kernels.rms_norm_f32(s, n)
         }
     };
     let gated_add = |residual: u64, update: u64, gate: usize| -> Result<()> {
+        if wide.is_some() {
+            let kernel = kernels.wide_kernels()?.row_gated_add_f32.clone();
+            unsafe {
+                s.launch_builder(&kernel)
+                    .arg(&residual)
+                    .arg(&update)
+                    .arg(&chunk(gate))
+                    .arg(&index)
+                    .arg(&rows_i)
+                    .arg(&i32::try_from(h)?)
+                    .arg(&(stride as u64))
+                    .arg(&entries)
+                    .launch(row_grid)?;
+            }
+            return Ok(());
+        }
         kernels.prepare_fp16_store(s, &kernels.modulate_module)?;
         unsafe {
             s.launch_builder(&kernels.gated_add)
@@ -3191,6 +3340,9 @@ fn block_forward_tail<const LORA: bool>(
         kernels.finish_fp16_store(s, &kernels.modulate_module, "gated_add")
     };
     let residual = |residual: u64, update: u64| -> Result<()> {
+        if wide.is_some() {
+            return kernels.residual_wide(s, residual, update, rows * h);
+        }
         kernels.prepare_fp16_store(s, &kernels.norm_module)?;
         unsafe {
             s.launch_builder(&kernels.residual)
@@ -3309,11 +3461,21 @@ fn block_forward_tail<const LORA: bool>(
             window_left: None,
         },
     )?;
-    base(
-        OUT,
-        rows_view(&work.v_raw, s, 0, rows, width, width)?,
-        rows_view(&work.normed, s, 0, rows, h, h)?,
-    )?;
+    if let Some(wide) = wide {
+        wide_dense(
+            c,
+            &w.linears[OUT],
+            rows_view(&work.v_raw, s, 0, rows, width, width)?,
+            f32_matrix(wide.out, rows, h)?,
+            None,
+        )?;
+    } else {
+        base(
+            OUT,
+            rows_view(&work.v_raw, s, 0, rows, width, width)?,
+            rows_view(&work.normed, s, 0, rows, h, h)?,
+        )?;
+    }
     if LORA {
         lora_pair(
             c,
@@ -3325,27 +3487,29 @@ fn block_forward_tail<const LORA: bool>(
         )?;
     }
     let fuse_norm = |gate_chunk: usize, tail: NormTail| -> Result<()> {
-        kernels.gated_add_rms(
-            s,
-            &GatedAddRms {
-                x: xp,
-                y: normed,
-                gate: chunk(gate_chunk),
-                gate_index: index,
-                gate_stride: stride,
-                gate_entries: entries,
-                weight: tail.weight,
-                output: normed,
-                shift: tail.shift,
-                scale: tail.scale,
-                norm_index: tail.index,
-                norm_stride: tail.stride,
-                norm_entries: tail.entries,
-                rows,
-                dim: h,
-                eps: tail.eps,
-            },
-        )
+        let add = GatedAddRms {
+            x: xp,
+            y: y_out,
+            gate: chunk(gate_chunk),
+            gate_index: index,
+            gate_stride: stride,
+            gate_entries: entries,
+            weight: tail.weight,
+            output: normed,
+            shift: tail.shift,
+            scale: tail.scale,
+            norm_index: tail.index,
+            norm_stride: tail.stride,
+            norm_entries: tail.entries,
+            rows,
+            dim: h,
+            eps: tail.eps,
+        };
+        if wide.is_some() {
+            kernels.gated_add_rms_wide(s, &add)
+        } else {
+            kernels.gated_add_rms(s, &add)
+        }
     };
     if modulation.is_some() && !serial_norm {
         fuse_norm(
@@ -3362,10 +3526,10 @@ fn block_forward_tail<const LORA: bool>(
             },
         )?;
     } else if modulation.is_some() {
-        gated_add(xp, normed, 2)?;
+        gated_add(xp, y_out, 2)?;
         hidden_norm(&w.norm2, 3, 4)?;
     } else {
-        residual(xp, normed)?;
+        residual(xp, y_out)?;
         hidden_norm(&w.norm2, 3, 4)?;
     }
     #[cfg(test)]
@@ -3378,9 +3542,9 @@ fn block_forward_tail<const LORA: bool>(
         fuse_norm(5, tail)?;
         work.skip_norm1 = arms_norm1;
     } else if modulation.is_some() {
-        gated_add(xp, normed, 5)?;
+        gated_add(xp, y_out, 5)?;
     } else {
-        residual(xp, normed)?;
+        residual(xp, y_out)?;
     }
     Ok(())
 }
@@ -3396,11 +3560,18 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
     let chunk = work.chunk;
     let products = &work.product;
     let rotate_32 = work.rotate_32;
+    let wide = work.wide_launch;
     let fused_down = if !LORA && !SHIFT_INPUT {
         int8_linear(&w.linears[FF_OUT])
     } else {
         None
     };
+    if wide.is_some() && fused_down.is_some() {
+        bail!("sm75 F32 residual has no int8 down");
+    }
+    if LORA && wide.is_some() {
+        bail!("sm75 F32 residual has no LoRA down");
+    }
     let base = |index: usize, x: Tensor<bf16, 2>, y: Tensor<bf16, 2>| -> Result<()> {
         let scratch = scratch.map(|mut ptrs| {
             let tail = usize::from(x.shape[0] as usize != chunk);
@@ -3456,6 +3627,18 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
         }
         let hidden = work.hidden.ptr + if SHIFT_INPUT { 256 } else { 0 };
         let gated = work.gated.ptr;
+        if let Some(scale) = wide {
+            c.kernels.swiglu_scaled(s, scale, hidden, gated, n, f)?;
+            let y = f32_matrix(scale.out + (start * h * 4) as u64, n, h)?;
+            wide_dense(
+                c,
+                &w.linears[FF_OUT],
+                work.gated.prefix_rows(u32::try_from(n)?)?,
+                y,
+                Some((scale.alpha, scale.beta)),
+            )?;
+            continue;
+        }
         let cfg = ops::silu_mul_grid(n, f, hidden, gated)?;
         c.kernels.prepare_fp16_store(s, &c.kernels.act_module)?;
         unsafe {
@@ -3823,6 +4006,118 @@ impl BlockKernels {
                 })?;
         }
         self.finish_fp16_store(s, &self.norm_module, "rms_norm")
+    }
+
+    fn wide_kernels(&self) -> Result<&WideKernels> {
+        self.wide.as_ref().context("sm75 wide kernels")
+    }
+
+    fn rms_wide(&self, s: &Arc<CudaStream>, n: NormRows) -> Result<()> {
+        let kernel = self.wide_kernels()?.rms_f32_bf16.clone();
+        self.launch_rms_norm(s, &kernel, n)
+    }
+
+    fn rms_wide_mod(&self, s: &Arc<CudaStream>, n: NormRows, m: ModulateRows) -> Result<()> {
+        self.prepare_norm_modulate(&n, &m)?;
+        let kernel = self.wide_kernels()?.rms_f32_modulate.clone();
+        self.launch_norm_modulate(s, &kernel, &n, &m)
+    }
+
+    fn rms_f32_store(&self, s: &Arc<CudaStream>, n: NormRows) -> Result<()> {
+        let kernel = self.wide_kernels()?.rms_f32_f32.clone();
+        ensure!(
+            n.rows > 0 && n.dim > 0 && n.dim.is_multiple_of(8) && n.threads == HIDDEN_NORM_THREADS,
+            "F32 RMSNorm launch extent"
+        );
+        for p in [n.input, n.weight, n.output] {
+            ensure!(p != 0 && p.is_multiple_of(16), "F32 RMSNorm alignment");
+        }
+        unsafe {
+            s.launch_builder(kernel)
+                .arg(&n.input)
+                .arg(&n.weight)
+                .arg(&n.output)
+                .arg(&i32::try_from(n.rows)?)
+                .arg(&i32::try_from(n.dim)?)
+                .arg(&n.eps)
+                .launch(LaunchConfig {
+                    grid_dim: (u32::try_from(n.rows)?, 1, 1),
+                    block_dim: (n.threads, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    fn gated_add_rms_wide(&self, s: &Arc<CudaStream>, g: &GatedAddRms) -> Result<()> {
+        let kernel = self.wide_kernels()?.gated_add_rms_f32.clone();
+        self.launch_gated_add_rms(s, &kernel, g)
+    }
+
+    fn residual_wide(&self, s: &Arc<CudaStream>, x: u64, y: u64, n: usize) -> Result<()> {
+        ensure!(
+            n > 0 && n.is_multiple_of(4) && x != 0 && y != 0 && x != y,
+            "F32 residual launch extent"
+        );
+        ensure!(
+            x.is_multiple_of(16) && y.is_multiple_of(16),
+            "F32 residual alignment"
+        );
+        let count = i32::try_from(n)?;
+        let kernel = self.wide_kernels()?.residual_f32.clone();
+        unsafe {
+            s.launch_builder(&kernel)
+                .arg(&x)
+                .arg(&y)
+                .arg(&count)
+                .launch(flat(n / 4))?;
+        }
+        Ok(())
+    }
+
+    fn swiglu_scaled(
+        &self,
+        s: &Arc<CudaStream>,
+        wide: WideResidual,
+        gu: u64,
+        y: u64,
+        rows: usize,
+        dim: usize,
+    ) -> Result<()> {
+        unsafe { crate::backend::cuda::copy::memset_bytes(wide.max_abs, 0, 4, s) }?;
+        let cfg = ops::silu_mul_grid(rows, dim, gu, y)?;
+        let rows_i = i32::try_from(rows)?;
+        let dim_i = i32::try_from(dim)?;
+        let maxabs = self.wide_kernels()?.silu_mul_maxabs.clone();
+        let alpha_k = self.wide_kernels()?.silu_pow2_alpha.clone();
+        unsafe {
+            s.launch_builder(&maxabs)
+                .arg(&gu)
+                .arg(&wide.max_abs)
+                .arg(&rows_i)
+                .arg(&dim_i)
+                .launch(cfg)?;
+            s.launch_builder(&alpha_k)
+                .arg(&wide.max_abs)
+                .arg(&wide.alpha)
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        self.prepare_fp16_store(s, &self.act_module)?;
+        let scaled = self.wide_kernels()?.silu_mul_scaled.clone();
+        unsafe {
+            s.launch_builder(&scaled)
+                .arg(&gu)
+                .arg(&y)
+                .arg(&wide.alpha)
+                .arg(&rows_i)
+                .arg(&dim_i)
+                .launch(cfg)?;
+        }
+        self.finish_fp16_store(s, &self.act_module, "ffn")
     }
 
     #[cfg(test)]
@@ -5293,7 +5588,16 @@ fn bind_video_ffn(
     }
     blas.bind_workspace(chosen.workspace)?;
     if hyperflow {
-        work.bind_ffn::<false>(s, blas, spec, chosen, x)?;
+        work.bind_ffn::<false>(
+            s,
+            blas,
+            spec,
+            chosen,
+            (
+                pointer(x, s),
+                x.len().checked_mul(2).context("residual bytes")?,
+            ),
+        )?;
         if spec.int8_convrot.is_some() {
             work.product[FF_IN] = crate::convrot::gate_up_product_order(
                 d,
@@ -5324,7 +5628,16 @@ fn bind_video_ffn(
             }
         }
     } else {
-        work.bind_ffn::<true>(s, blas, spec, chosen, x)?;
+        work.bind_ffn::<true>(
+            s,
+            blas,
+            spec,
+            chosen,
+            (
+                pointer(x, s),
+                x.len().checked_mul(2).context("residual bytes")?,
+            ),
+        )?;
     }
     s.synchronize()?;
     if crate::backend::diagnostics_enabled() {
@@ -6180,11 +6493,19 @@ pub(crate) struct ImageStepInputs<'a> {
 
 /// Image transformer over one `[text | reference | generated]` layout. No audio projection and no LoRA. Six F32
 /// `pdd_proj_out` heads; head `k` is evaluation `k`. The block matrices are placed by `DensePlacement`.
+struct ImageWide {
+    x: CudaSlice<f32>,
+    text: CudaSlice<f32>,
+    /// `[max_abs, alpha, beta]`. Beta stays 0.
+    scale: CudaSlice<f32>,
+}
+
 pub(crate) struct ImageDit {
     text_rows: usize,
     image_rows: usize,
     reference_rows: usize,
     row_width: usize,
+    wide: Option<ImageWide>,
     proj_in: [CudaSlice<f32>; 2],
     heads: Vec<[CudaSlice<f32>; 2]>,
     context: [CudaSlice<bf16>; 2],
@@ -6332,23 +6653,37 @@ impl ImageDit {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        blas.prepare_biased(
-            u32::try_from(text_rows)?,
-            u32::try_from(h)?,
-            u32::try_from(spec.text_dim)?,
-            vector(&context[1], s)?,
-            LinearBiasMode::BeforeOutputRound,
-        )?;
+        let wide_residual = d.info.arch.fp16_stored_half();
+        if !wide_residual {
+            blas.prepare_biased(
+                u32::try_from(text_rows)?,
+                u32::try_from(h)?,
+                u32::try_from(spec.text_dim)?,
+                vector(&context[1], s)?,
+                LinearBiasMode::BeforeOutputRound,
+            )?;
+        }
         let mut work = BlockWork::new(s, spec, 0, rows)?;
         work.prepare::<false>(blas, spec)?;
-        let text_work = BlockWork::new(s, spec, 0, text_rows)?;
+        let mut text_work = BlockWork::new(s, spec, 0, text_rows)?;
         text_work.prepare::<false>(blas, spec)?;
+        let wide_storage = if wide_residual {
+            work.wide = Some(s.alloc_zeros::<f32>(rows * h)?);
+            text_work.wide = Some(s.alloc_zeros::<f32>(text_rows * h)?);
+            Some(ImageWide {
+                x: s.alloc_zeros::<f32>(rows * h)?,
+                text: s.alloc_zeros::<f32>(text_rows * h)?,
+                scale: s.alloc_zeros::<f32>(3)?,
+            })
+        } else {
+            None
+        };
         let flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
             .with_full_single_probability()?;
         let text_flash = Flash::new(s.clone(), text_rows, spec.heads, spec.heads, spec.head_dim)?
             .with_full_single_probability()?;
-        let x = s.alloc_zeros::<bf16>(rows * h)?;
-        let text = s.alloc_zeros::<bf16>(text_rows * h)?;
+        let x = s.alloc_zeros::<bf16>(if wide_residual { 0 } else { rows * h })?;
+        let text = s.alloc_zeros::<bf16>(if wide_residual { 0 } else { text_rows * h })?;
         let scratch = s.alloc_zeros::<f32>(image_rows * h)?;
         let velocity = s.alloc_zeros::<f32>(image_rows * row_width)?;
         let rotary = upload_runtime_half(
@@ -6367,7 +6702,17 @@ impl ImageDit {
             let aliases = work.alias_choices::<false>(blas, spec, owned_plan)?;
             let plan = FfnPlan::select(&aliases, budget)?;
             blas.bind_workspace(plan.workspace)?;
-            work.bind_ffn::<false>(s, blas, spec, plan, &x)?;
+            let residual = match &wide_storage {
+                Some(wide) => (
+                    pointer(&wide.x, s),
+                    wide.x.len().checked_mul(4).context("residual bytes")?,
+                ),
+                None => (
+                    pointer(&x, s),
+                    x.len().checked_mul(2).context("residual bytes")?,
+                ),
+            };
+            work.bind_ffn::<false>(s, blas, spec, plan, residual)?;
             Ok(plan)
         };
         let (placed, device_after, prepared_ffn) = match placement {
@@ -6484,11 +6829,22 @@ impl ImageDit {
         let vision = cubin::module(s.context(), "vision_ops")?;
         let vision_ops = Arc::clone(&vision);
         require_resident_norms(s, &blocks, &norm_out, h)?;
+        #[cfg(feature = "cuda")]
+        if wide_residual {
+            blas.prepare_biased_f32(
+                u32::try_from(text_rows)?,
+                u32::try_from(h)?,
+                u32::try_from(spec.text_dim)?,
+                vector(&context[1], s)?,
+            )?;
+            text_work.prepare_wide(blas, spec)?;
+        }
         Ok(Self {
             text_rows,
             image_rows,
             reference_rows,
             row_width,
+            wide: wide_storage,
             proj_in,
             heads,
             context,
@@ -6585,6 +6941,14 @@ impl ImageDit {
         head: usize,
         inputs: &ImageStepInputs<'_>,
     ) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if self.wide.is_some() {
+            return self.step_wide(c, adaln, (pairs, timesteps), head, inputs);
+        }
+        #[cfg(not(feature = "cuda"))]
+        if self.wide.is_some() {
+            bail!("sm75 F32 residual is CUDA-only");
+        }
         if let Some(tier) = self.tier.as_mut() {
             tier.ready()?;
         }
@@ -6711,6 +7075,208 @@ impl ImageDit {
                 s,
                 NormRows {
                     input: pointer(&self.x, s),
+                    weight: pointer(&self.norm_out, s),
+                    output: normed,
+                    rows,
+                    dim: h,
+                    threads: HIDDEN_NORM_THREADS,
+                    eps: spec.final_norm_eps,
+                },
+                ModulateRows {
+                    data: normed,
+                    shift: table,
+                    scale: table + 2 * h as u64,
+                    index: pointer(inputs.row_timesteps, s),
+                    rows,
+                    dim: h,
+                    stride: 2 * h,
+                    entries: timesteps,
+                },
+            )?;
+        }
+        upcast_from(
+            s,
+            &self.upcast,
+            &self.work.normed,
+            &self.scratch,
+            text_rows * h,
+            image_rows * h,
+            (c.kernels.fp16_store, &self.vision_ops),
+        )?;
+        projection(
+            c.s,
+            c.blas,
+            &self.bias,
+            &self.heads[head],
+            (&self.scratch, 0),
+            (&self.velocity, image_rows),
+        )?;
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn step_wide(
+        &mut self,
+        c: &BlockContext<'_>,
+        adaln: &AdalnTable,
+        (pairs, timesteps): (u32, u32),
+        head: usize,
+        inputs: &ImageStepInputs<'_>,
+    ) -> Result<()> {
+        if let Some(tier) = self.tier.as_mut() {
+            tier.ready()?;
+        }
+        let (s, spec) = (c.s, c.spec);
+        let h = spec.hidden;
+        let (text_rows, image_rows, rows) = (
+            self.text_rows,
+            self.image_rows,
+            self.text_rows + self.image_rows,
+        );
+        ensure!(
+            head < self.heads.len()
+                && inputs.image.len() == image_rows * self.row_width
+                && inputs.text.len() == text_rows * spec.text_dim
+                && inputs.row_pairs.len() == rows
+                && inputs.row_timesteps.len() == rows,
+            "image evaluation inputs differ from the layout"
+        );
+        let (text_residual, packed, scale) = {
+            let wide = self.wide.as_ref().context("sm75 F32 residual")?;
+            (
+                pointer(&wide.text, s),
+                pointer(&wide.x, s),
+                pointer(&wide.scale, s),
+            )
+        };
+        let arm = |work: &mut BlockWork, residual: u64| -> Result<()> {
+            let out = pointer(work.wide.as_ref().context("sm75 F32 output buffer")?, s);
+            work.wide_launch = Some(WideResidual {
+                x: residual,
+                out,
+                max_abs: scale,
+                alpha: scale + 4,
+                beta: scale + 8,
+            });
+            Ok(())
+        };
+        arm(&mut self.text_work, text_residual)?;
+        c.blas.linear_biased_f32(
+            matrix(&self.context[0], s, h, spec.text_dim)?,
+            vector(&self.context[1], s)?,
+            matrix(inputs.text, s, text_rows, spec.text_dim)?,
+            &mut TensorMut(f32_matrix(text_residual, text_rows, h)?),
+        )?;
+        for refiner in &self.refiners {
+            block_forward::<false>(
+                c,
+                &mut self.text_flash,
+                refiner,
+                &Conditioning::Plain,
+                &mut self.text,
+                &mut self.text_work,
+            )?;
+        }
+        c.kernels.rms_f32_store(
+            s,
+            NormRows {
+                input: text_residual,
+                weight: pointer(&self.final_norm, s),
+                output: packed,
+                rows: text_rows,
+                dim: h,
+                threads: HIDDEN_NORM_THREADS,
+                eps: spec.final_norm_eps,
+            },
+        )?;
+        projection(
+            c.s,
+            c.blas,
+            &self.bias,
+            &self.proj_in,
+            (inputs.image, 0),
+            (&self.scratch, image_rows),
+        )?;
+        {
+            let count = image_rows
+                .checked_mul(h)
+                .context("image residual elements")?;
+            let bytes = count.checked_mul(4).context("image residual bytes")?;
+            let dst = packed
+                .checked_add(u64::try_from(
+                    text_rows
+                        .checked_mul(h)
+                        .and_then(|n| n.checked_mul(4))
+                        .context("packed image offset")?,
+                )?)
+                .context("packed image pointer")?;
+            let src = pointer(&self.scratch, s);
+            ensure!(self.scratch.len() == count, "image residual copy extent");
+            unsafe { crate::backend::cuda::copy::dtod_raw(dst, src, bytes, s) }?;
+        }
+        arm(&mut self.work, packed)?;
+        let block_rows = 6 * h * pairs as usize;
+        let sources = Scale2Sources {
+            hidden: h,
+            block_rows,
+            pairs,
+            timesteps,
+            norm_eps: spec.norm_eps,
+            final_eps: spec.final_norm_eps,
+            table: pointer(&adaln.blocks, s),
+            block_table_len: adaln.blocks.len(),
+            norm_out_weight: pointer(&self.norm_out, s),
+            norm_out_table: pointer(&adaln.norm_out, s),
+            norm_table_len: adaln.norm_out.len(),
+            row_pairs: pointer(inputs.row_pairs, s),
+            row_timesteps: pointer(inputs.row_timesteps, s),
+        };
+        let fuse = fuse_cross_block(c.kernels);
+        let mut fused_norm_out = false;
+        self.work.skip_norm1 = false;
+        for layer in 0..self.blocks.len() {
+            if let Some(tier) = self.tier.as_mut() {
+                tier.ready()?.begin(layer, s)?;
+            }
+            let modulation = Modulation {
+                table: &adaln.blocks,
+                offset: layer * block_rows,
+                entries: pairs,
+                index: inputs.row_pairs,
+            };
+            let tail = if fuse {
+                scale2_tail(&self.blocks, layer, &sources)?
+            } else {
+                None
+            };
+            fused_norm_out |= tail.as_ref().is_some_and(|tail| !tail.arms_norm1);
+            block_forward_tail::<false>(
+                c,
+                &mut self.flash,
+                &self.blocks[layer],
+                &Conditioning::Modulated {
+                    rotary: &self.rotary,
+                    modulation: &modulation,
+                },
+                &mut self.x,
+                &mut self.work,
+                tail,
+            )?;
+            if let Some(tier) = self.tier.as_mut() {
+                tier.ready()?.end(layer, s)?;
+            }
+        }
+        if !fused_norm_out {
+            let normed = pointer(&self.work.normed, s);
+            ensure!(
+                adaln.norm_out.len() == timesteps as usize * 2 * h,
+                "output-norm table extent"
+            );
+            let table = pointer(&adaln.norm_out, s);
+            c.kernels.rms_wide_mod(
+                s,
+                NormRows {
+                    input: packed,
                     weight: pointer(&self.norm_out, s),
                     output: normed,
                     rows,
@@ -10732,7 +11298,11 @@ mod tests {
             let plan = owned.ffn_cost::<true>(&blas, &spec, chunk, false)?;
             blas.bind_workspace(plan.workspace)?;
             let mut x = s.clone_htod(&input)?;
-            owned.bind_ffn::<true>(s, &blas, &spec, plan, &x)?;
+            let span = (
+                pointer(&x, s),
+                x.len().checked_mul(2).context("residual bytes")?,
+            );
+            owned.bind_ffn::<true>(s, &blas, &spec, plan, span)?;
             borrowed.bind_ffn::<true>(
                 s,
                 &blas,
@@ -10742,7 +11312,7 @@ mod tests {
                     allocation: 0,
                     ..plan
                 },
-                &x,
+                span,
             )?;
             ensure!(
                 borrowed.hidden.ptr == pointer(&borrowed.q_raw, s)
@@ -19216,5 +19786,38 @@ mod h3_direct_batch_tests {
         );
         std::fs::remove_dir_all(&dir).ok();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sm75_swiglu_scale {
+    fn swiglu_pow2_k(max_abs: f32) -> i32 {
+        let mut m = max_abs;
+        let mut k = 0;
+        while m > 32768.0 && k < 127 {
+            m *= 0.5;
+            k += 1;
+        }
+        k
+    }
+
+    fn sm75_fp16_store_faults(v: f32) -> bool {
+        !v.is_finite() || v > 65504.0 || v < -65504.0
+    }
+
+    #[test]
+    fn pow2_k_selects_the_boundary_and_the_k7_set() {
+        assert_eq!(swiglu_pow2_k(32768.0), 0);
+        assert_eq!(swiglu_pow2_k(65504.0), 1);
+        assert_eq!(swiglu_pow2_k(2_097_153.0), 7);
+        assert_eq!(swiglu_pow2_k(4_194_304.0), 7);
+    }
+
+    #[test]
+    fn unscaled_product_trips_the_fp16_store_check() {
+        assert!(sm75_fp16_store_faults(108_032.0));
+        assert!(!sm75_fp16_store_faults(108_032.0 / 4.0));
+        assert!(!sm75_fp16_store_faults(65504.0));
+        assert!(!sm75_fp16_store_faults(-65504.0));
     }
 }

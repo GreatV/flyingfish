@@ -151,6 +151,21 @@ extern "C" __global__ void add_row_f16_f32(const __half* x, const float* row, fl
          i < count; i += (unsigned long long)gridDim.x * blockDim.x)
         y[i] = __fadd_rn(__half2float(x[i]), row[i % width]);
 }
+
+// x[r][d] = x[r][d] + gate[p][d] * y[r][d], all in f32. Gate is the BF16 table entry.
+extern "C" __global__ void row_gated_add_f32(float* x, const float* y,
+                                            const __nv_bfloat16* gate, const unsigned* index,
+                                            int rows, int dim, unsigned long long stride,
+                                            unsigned entries) {
+    const int row = blockIdx.x;
+    const int d = blockIdx.y * blockDim.x + threadIdx.x;
+    if (row >= rows || d >= dim) return;
+    const unsigned p = index[row];
+    if (p >= entries) __trap();
+    const size_t at = (size_t)row * dim + d;
+    const float g = __bfloat162float(gate[(size_t)p * stride + d]);
+    x[at] = x[at] + g * y[at];
+}
 #else /* ff-sm80 */
 // Row-indexed modulation from a parameter table. Row r of [rows, dim] BF16 activations reads table row
 // index[r]; table row p starts at table + p * stride, so one table holds several parameter vectors per row.
