@@ -508,8 +508,11 @@ impl Blas {
             (rows, shape.output, shape.input, shape.input),
             desc.workspace,
             None,
-            self.half_dtype,
-            self.half_dtype,
+            super::PlanOperands {
+                ab: self.half_dtype,
+                c: self.half_dtype,
+                device_alpha: false,
+            },
             super::PlanAlgo::Fixed(algo),
         );
         let p = match smaller {
@@ -598,8 +601,11 @@ impl Blas {
             ),
             desc.workspace,
             None,
-            self.half_dtype,
-            self.half_dtype,
+            super::PlanOperands {
+                ab: self.half_dtype,
+                c: self.half_dtype,
+                device_alpha: false,
+            },
             super::PlanAlgo::Fixed(legal[index]),
         )?;
         Ok(Selection {
@@ -772,8 +778,11 @@ impl Blas {
             (shape.rows, shape.output, shape.input, shape.input),
             desc.workspace,
             None,
-            self.half_dtype,
-            self.half_dtype,
+            super::PlanOperands {
+                ab: self.half_dtype,
+                c: self.half_dtype,
+                device_alpha: false,
+            },
             super::PlanAlgo::Fixed(algo),
         )?;
         ensure!(
