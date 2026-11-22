@@ -116,13 +116,112 @@ extern "C" int ff_hip_lt_algo_names(hipblasLtHandle_t handle,
     return HIPBLAS_STATUS_SUCCESS;
 }
 
-extern "C" int ff_hip_allocation_granularity(int device, size_t* out) {
-    if (!out) return hipErrorInvalidValue;
+static hipError_t measure_probe_delta(
+    size_t bytes,
+    size_t* delta_out,
+    const char** failure,
+    const char* no_drop_msg,
+    const char* changed_msg
+) {
+    size_t free_before = 0, total_before = 0;
+    auto status = hipMemGetInfo(&free_before, &total_before);
+    if (status != hipSuccess) return status;
+    if (free_before < bytes) {
+        if (failure) *failure = "insufficient free VRAM for granularity probe";
+        return hipErrorOutOfMemory;
+    }
+
+    void* ptr = nullptr;
+    status = hipMalloc(&ptr, bytes);
+    if (status != hipSuccess) return status;
+    size_t free_during = 0, total_during = 0;
+    status = hipMemGetInfo(&free_during, &total_during);
+    auto free_status = hipFree(ptr);
+    if (status != hipSuccess) return status;
+    if (free_status != hipSuccess) return free_status;
+    if (free_during >= free_before) {
+        if (failure) *failure = no_drop_msg;
+        return hipErrorUnknown;
+    }
+
+    size_t free_after = 0, total_after = 0;
+    status = hipMemGetInfo(&free_after, &total_after);
+    if (status != hipSuccess) return status;
+    if (free_after != free_before) {
+        if (failure) *failure = changed_msg;
+        return hipErrorUnknown;
+    }
+
+    *delta_out = free_before - free_during;
+    return hipSuccess;
+}
+
+extern "C" int ff_hip_allocation_granularity(int device, size_t* out, const char** failure) {
+    if (failure) *failure = nullptr;
+    if (!out) {
+        if (failure) *failure = "null allocation granularity output pointer";
+        return hipErrorInvalidValue;
+    }
+    auto status = hipSetDevice(device);
+    if (status != hipSuccess) return status;
     hipMemAllocationProp prop{};
     prop.type = hipMemAllocationTypePinned;
     prop.location.type = hipMemLocationTypeDevice;
     prop.location.id = device;
-    return hipMemGetAllocationGranularity(out, &prop, hipMemAllocationGranularityRecommended);
+    size_t vmm_gran = 0;
+    status = hipMemGetAllocationGranularity(&vmm_gran, &prop, hipMemAllocationGranularityRecommended);
+    if (status != hipSuccess) return status;
+    if (vmm_gran == 0) {
+        if (failure) *failure = "VMM allocation granularity is zero";
+        return hipErrorInvalidValue;
+    }
+
+    // Sense physical hipMalloc backing chunk granularity (2 MiB on gfx1100 vs 4 KiB VMM query).
+    size_t chunk = 0;
+    status = measure_probe_delta(
+        vmm_gran,
+        &chunk,
+        failure,
+        "first hipMalloc probe did not reduce free VRAM (pool reuse or external free)",
+        "free memory changed during probe (another allocation on the device)"
+    );
+    if (status != hipSuccess) return status;
+    if (chunk < vmm_gran) {
+        if (failure) *failure = "chunk below VMM granularity";
+        return hipErrorUnknown;
+    }
+    if ((chunk % vmm_gran) != 0) {
+        if (failure) *failure = "chunk not a multiple of VMM granularity";
+        return hipErrorUnknown;
+    }
+
+    size_t free_avail = 0, total_avail = 0;
+    status = hipMemGetInfo(&free_avail, &total_avail);
+    if (status != hipSuccess) return status;
+    if (chunk <= SIZE_MAX - vmm_gran && free_avail >= chunk + vmm_gran) {
+        size_t delta2 = 0;
+        status = measure_probe_delta(
+            chunk + vmm_gran,
+            &delta2,
+            failure,
+            "second hipMalloc probe did not reduce free VRAM (pool reuse or external free)",
+            "free memory changed during second probe (another allocation on the device)"
+        );
+        if (status != hipSuccess) return status;
+        if (delta2 <= chunk) {
+            if (failure) *failure = "two-step probe allocation did not exceed single chunk";
+            return hipErrorUnknown;
+        }
+        size_t step = delta2 - chunk;
+        if ((step % vmm_gran) != 0) {
+            if (failure) *failure = "second-step allocation increment not a multiple of VMM granularity";
+            return hipErrorUnknown;
+        }
+        if (step > chunk) chunk = step;
+    }
+
+    *out = chunk;
+    return hipSuccess;
 }
 
 extern "C" int ff_hip_default_mem_pool_usage(int device, uint64_t* reserved, uint64_t* used) {
@@ -133,4 +232,22 @@ extern "C" int ff_hip_default_mem_pool_usage(int device, uint64_t* reserved, uin
     status = hipMemPoolGetAttribute(pool, hipMemPoolAttrReservedMemCurrent, reserved);
     if (status != hipSuccess) return status;
     return hipMemPoolGetAttribute(pool, hipMemPoolAttrUsedMemCurrent, used);
+}
+
+extern "C" int ff_hip_reset_default_mem_pool_peak(int device) {
+    hipMemPool_t pool = nullptr;
+    auto status = hipDeviceGetDefaultMemPool(&pool, device);
+    if (status != hipSuccess) return status;
+    uint64_t zero = 0;
+    return hipMemPoolSetAttribute(pool, hipMemPoolAttrUsedMemHigh, &zero);
+}
+
+extern "C" int ff_hip_default_mem_pool_peak(int device, uint64_t* used, uint64_t* peak) {
+    if (!used || !peak) return hipErrorInvalidValue;
+    hipMemPool_t pool = nullptr;
+    auto status = hipDeviceGetDefaultMemPool(&pool, device);
+    if (status != hipSuccess) return status;
+    status = hipMemPoolGetAttribute(pool, hipMemPoolAttrUsedMemCurrent, used);
+    if (status != hipSuccess) return status;
+    return hipMemPoolGetAttribute(pool, hipMemPoolAttrUsedMemHigh, peak);
 }

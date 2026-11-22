@@ -179,6 +179,60 @@ pub(crate) unsafe fn launch_host_func(
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn reset_default_mem_pool_peak(ctx: &CudaContext) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        use cudarc::driver::sys::{self, CUmemPool_attribute};
+        let mut pool = std::ptr::null_mut();
+        let mut zero = 0u64;
+        unsafe {
+            sys::cuDeviceGetDefaultMemPool(&mut pool, ctx.cu_device()).result()?;
+            sys::cuMemPoolSetAttribute(
+                pool,
+                CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+                (&mut zero as *mut u64).cast(),
+            )
+            .result()?;
+        }
+        Ok(())
+    }
+    #[cfg(feature = "rocm")]
+    {
+        ctx.reset_default_mem_pool_peak()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn default_mem_pool_peak(ctx: &CudaContext) -> Result<(u64, u64)> {
+    #[cfg(feature = "cuda")]
+    {
+        use cudarc::driver::sys::{self, CUmemPool_attribute};
+        let mut pool = std::ptr::null_mut();
+        let (mut used, mut peak) = (0u64, 0u64);
+        unsafe {
+            sys::cuDeviceGetDefaultMemPool(&mut pool, ctx.cu_device()).result()?;
+            sys::cuMemPoolGetAttribute(
+                pool,
+                CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+                (&mut used as *mut u64).cast(),
+            )
+            .result()?;
+            sys::cuMemPoolGetAttribute(
+                pool,
+                CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+                (&mut peak as *mut u64).cast(),
+            )
+            .result()?;
+        }
+        Ok((used, peak))
+    }
+    #[cfg(feature = "rocm")]
+    {
+        ctx.default_mem_pool_peak()
+    }
+}
+
 impl Device {
     pub(crate) fn workspace_budget(
         &self,

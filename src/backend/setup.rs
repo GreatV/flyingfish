@@ -46,10 +46,9 @@ impl DeviceInfo {
 }
 
 /// Operand type of a published BF16 or F32 Lt plan. Compute stays F32.
-#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+#[cfg(any(test, feature = "cuda"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LtOperand {
-    #[cfg(any(test, feature = "cuda"))]
     F32,
     F16,
     Bf16,
@@ -90,11 +89,17 @@ pub(crate) fn decoder_weight_is_raw_f32(name: &str) -> bool {
 
 #[cfg(any(test, feature = "cuda", feature = "rocm"))]
 impl DeviceArchitecture {
-    /// Published BF16 weights are FP16 operands below sm80. sm80+ and HIP stay BF16.
+    /// Published BF16 weights store and compute as FP16 below sm80; sm80+ and HIP keep BF16.
+    pub(crate) fn fp16_stored_half(&self) -> bool {
+        matches!(self, Self::Cuda(sm) if *sm < 80)
+    }
+
+    #[cfg(any(test, feature = "cuda"))]
     pub(crate) fn published_bf16_lt(&self) -> LtOperand {
-        match self {
-            Self::Cuda(sm) if *sm < 80 => LtOperand::F16,
-            Self::Cuda(_) | Self::Hip(_) => LtOperand::Bf16,
+        if self.fp16_stored_half() {
+            LtOperand::F16
+        } else {
+            LtOperand::Bf16
         }
     }
 
@@ -528,6 +533,11 @@ mod long_tests {
         assert_eq!(info80.arch.published_bf16_lt(), LtOperand::Bf16);
         assert_eq!(info89.arch.published_bf16_lt(), LtOperand::Bf16);
         assert_eq!(hip.arch.published_bf16_lt(), LtOperand::Bf16);
+        assert!(info75.arch.fp16_stored_half());
+        assert!(info70.arch.fp16_stored_half());
+        assert!(!info80.arch.fp16_stored_half());
+        assert!(!info89.arch.fp16_stored_half());
+        assert!(!hip.arch.fp16_stored_half());
         assert_eq!(info75.arch.published_f32_lt(), LtOperand::F32);
         assert_eq!(info89.arch.published_f32_lt(), LtOperand::F32);
         assert_eq!(hip.arch.published_f32_lt(), LtOperand::F32);

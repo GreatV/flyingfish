@@ -296,10 +296,10 @@ impl ImageDecoder {
         );
         let tiles = w.tiles.count();
         let vision = Arc::clone(&self.core.kernels.vision);
-        let sm = self.core.kernels.sm;
+        let fp16 = self.core.kernels.fp16_store;
         for first in (0..tiles).step_by(w.core.batch) {
             let active = (tiles - first).min(w.core.batch);
-            fp16_store(sm, s, &vision, "gather", || {
+            fp16_store(fp16, s, &vision, "gather", || {
                 unsafe {
                     s.launch_builder(&self.gather)
                         .arg(&pointer(input, s))
@@ -330,7 +330,7 @@ impl ImageDecoder {
                 |role, rows| observe(role, first, active, rows),
             )?;
         }
-        fp16_store(sm, s, &vision, "stitch", || {
+        fp16_store(fp16, s, &vision, "stitch", || {
             unsafe {
                 s.launch_builder(&self.core.kernels.stitch)
                     .arg(&pointer(&w.raw, s))
@@ -867,7 +867,7 @@ struct VaeKernels {
     vision: Arc<CudaModule>,
     common: Arc<CudaModule>,
     act: Arc<CudaModule>,
-    sm: u32,
+    fp16_store: bool,
 }
 
 pub(crate) struct VideoDecoder {
@@ -925,15 +925,15 @@ fn decoder_cast(arch: &crate::backend::setup::DeviceArchitecture, name: &str) ->
 }
 
 fn fp16_store(
-    sm: u32,
+    enabled: bool,
     s: &Arc<CudaStream>,
     module: &Arc<CudaModule>,
     tensor: &str,
     body: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    super::prepare_fp16_store_at(sm, s, module)?;
+    super::prepare_fp16_store_at(enabled, s, module)?;
     body()?;
-    super::finish_fp16_store_at(sm, s, module, tensor)
+    super::finish_fp16_store_at(enabled, s, module, tensor)
 }
 
 fn decoder_tensor_bytes(manifest: &TensorManifest, name: &str) -> usize {
@@ -1886,10 +1886,6 @@ impl VideoDecoder {
         let vision = cubin::module(&d.ctx, "vision_ops")?;
         let common = cubin::module(&d.ctx, "q38_common")?;
         let act = cubin::module(&d.ctx, "act")?;
-        #[cfg(feature = "cuda")]
-        let sm = cubin::capability(&d.ctx)?;
-        #[cfg(not(feature = "cuda"))]
-        let sm = 80u32;
         let vision_mod = Arc::clone(&vision);
         let common_mod = Arc::clone(&common);
         let act_mod = Arc::clone(&act);
@@ -1960,7 +1956,7 @@ impl VideoDecoder {
                 vision: vision_mod,
                 common: common_mod,
                 act: act_mod,
-                sm,
+                fp16_store: d.info.arch.fp16_stored_half(),
             },
             #[cfg(test)]
             prefix_only: false,
@@ -2142,11 +2138,11 @@ impl VideoDecoder {
         let dim = spec.dim;
         let n = rows * dim;
         let mat = |buffer| rows_view(buffer, s, 0, rows, dim, dim);
-        let sm = self.kernels.sm;
+        let fp16 = self.kernels.fp16_store;
         let vision = Arc::clone(&self.kernels.vision);
         let act = Arc::clone(&self.kernels.act);
         let norm = |weight: Tensor<f32, 1>| -> Result<()> {
-            fp16_store(sm, s, &vision, "rms", || {
+            fp16_store(fp16, s, &vision, "rms", || {
                 unsafe {
                     s.launch_builder(&self.kernels.rms)
                         .arg(&pointer(&w.x, s))
@@ -2174,7 +2170,7 @@ impl VideoDecoder {
             Ok(())
         };
         let residual_norm = |res_scale: Tensor<f32, 1>, norm_scale: Tensor<f32, 1>| -> Result<()> {
-            fp16_store(sm, s, &vision, "residual_rms", || {
+            fp16_store(fp16, s, &vision, "residual_rms", || {
                 unsafe {
                     s.launch_builder(&self.kernels.residual_rms)
                         .arg(&pointer(&w.x, s))
@@ -2205,7 +2201,7 @@ impl VideoDecoder {
             observe("q0", (DecoderRows::Bf16(&w.ff), 0, w.tokens, dim))?;
             observe("k0", (DecoderRows::Bf16(&w.ff), n, w.tokens, dim))?;
         }
-        fp16_store(sm, s, &vision, "head_pack", || {
+        fp16_store(fp16, s, &vision, "head_pack", || {
             unsafe {
                 s.launch_builder(&self.kernels.head_pack)
                     .arg(&pointer(&w.ff, s))
@@ -2254,7 +2250,7 @@ impl VideoDecoder {
             rows_view(&w.ff, s, 0, rows, 2 * f, 2 * f)?,
         )?;
         let (gu, y) = (pointer(&w.ff, s), pointer(&w.gated, s));
-        fp16_store(sm, s, &act, "swiglu", || {
+        fp16_store(fp16, s, &act, "swiglu", || {
             unsafe {
                 s.launch_builder(&self.kernels.swiglu)
                     .arg(&gu)
@@ -2394,7 +2390,7 @@ impl VideoDecoder {
             }
         }
         let common = Arc::clone(&self.kernels.common);
-        fp16_store(self.kernels.sm, s, &common, "norm_out", || {
+        fp16_store(self.kernels.fp16_store, s, &common, "norm_out", || {
             unsafe {
                 s.launch_builder(&self.kernels.norm_out)
                     .arg(&pointer(&w.x, s))
@@ -2554,7 +2550,7 @@ impl VideoDecoder {
             observe("raw", i, &raw)?;
             let planes = channels * clip_frames;
             let vision = Arc::clone(&self.kernels.vision);
-            fp16_store(self.kernels.sm, s, &vision, "stitch", || {
+            fp16_store(self.kernels.fp16_store, s, &vision, "stitch", || {
                 unsafe {
                     s.launch_builder(&self.kernels.stitch)
                         .arg(&pointer(&raw, s))
@@ -3068,7 +3064,7 @@ impl KeyframeEncoder {
                 "gaussian_posterior_f32"
             })?,
         };
-        let mut source = Source::new(vae_dir, manifest);
+        let mut source = Source::new(vae_dir, manifest, d.info.arch.fp16_stored_half());
         let mut bytes = 0usize;
         let mut consumed = std::collections::BTreeSet::new();
         let load: &mut LoadF32<'_> = &mut |name: &str, elements: usize| {
@@ -3878,7 +3874,7 @@ pub(crate) mod image_tests {
                     let mut input: Vec<_> = (0..count)
                         .map(|i| bf16::from_f32(((i * 73 % 65521) as f32 - 32760.0) / 8192.0))
                         .collect();
-                    if super::super::fp16_stored_half(&d.info.arch) {
+                    if d.info.arch.fp16_stored_half() {
                         crate::tensors::bf16_table_to_runtime_half("video_latent", &mut input)?;
                     }
                     let input_device = s.clone_htod(&input)?;
@@ -4027,7 +4023,7 @@ pub(crate) mod image_tests {
             decoder.bind(&mut blas, &work)?;
             let rounded = super::super::pipeline::video_latent_entry(
                 &values,
-                super::super::fp16_stored_half(&device.info.arch),
+                device.info.arch.fp16_stored_half(),
             )?;
             let input = s.clone_htod(&rounded)?;
             let raw = s.alloc_zeros::<bf16>(work.pixels())?;
@@ -5501,7 +5497,7 @@ pub(crate) mod image_tests {
             let d = Device::new(0)?;
             let s = &d.stream;
             let ops = Ops::new(&d.ctx)?;
-            if super::super::fp16_stored_half(&d.info.arch) {
+            if d.info.arch.fp16_stored_half() {
                 crate::tensors::bf16_table_to_runtime_half("video_latent", &mut input_host)?;
             }
             let mut blas = super::super::open_blas(
