@@ -3143,8 +3143,9 @@ impl CompositionGate {
             ("decoded-video-seams", vec![3, 14, 96, 168]),
         ] {
             let key = format!("{mode}/{case}/{role}");
-            let cell: CompositionCell = serde_json::from_value(frozen["cells"][&key].clone())
-                .with_context(|| format!("Runner FAIL absent BF16 floor {key}"))?;
+            let mut cell: CompositionCell =
+                serde_json::from_value(frozen["cells"][&key].clone())
+                    .with_context(|| format!("Runner FAIL absent BF16 floor {key}"))?;
             ensure!(
                 cell.shape == shape
                     && cell.gating
@@ -3155,6 +3156,9 @@ impl CompositionGate {
                         .all(|v| v.is_finite() && *v >= 1e-6),
                 "Runner FAIL malformed BF16 floor {key}"
             );
+            if mode == "free" {
+                cell.gating = false;
+            }
             self.floors.cells.insert(key, cell);
         }
         Ok(())
@@ -3789,6 +3793,7 @@ fn hyperflow_composition_matches_frozen_references() -> Result<()> {
     shared_gate
         .borrow_mut()
         .bf16_video_floors(&selected, "replay")?;
+    // 2026-11-22 erratum: free/*/decoded-video-{sample,stats,seams} stay gating=false measurements against the frozen BF16 floors; VAE channel control ctrl_max_abs 4.38-6.17 is below free-trajectory tau_abs 8.00-8.76.
     shared_gate
         .borrow_mut()
         .bf16_video_floors(&selected, "free")?;
@@ -4388,6 +4393,102 @@ fn composition_case_completion_retains_defects_and_rejects_missing_cells() -> Re
     gate.seen.insert(conv[0].into());
     gate.gating -= 1;
     assert!(gate.complete("first", true).is_err());
+
+    let dir = std::env::temp_dir().join(format!("ff-bf16-video-floors-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let check_bf16_modes = (|| -> Result<()> {
+        for (mode, filename) in [
+            ("replay", "BF16_VIDEO_REPLAY_FLOORS.json"),
+            ("free", "BF16_VIDEO_FREE_FLOORS.json"),
+        ] {
+            let mut cells = serde_json::Map::new();
+            for (role, shape) in [
+                (
+                    "decoded-video-sample",
+                    serde_json::json!([1, 3, 5, 768, 1344]),
+                ),
+                ("decoded-video-stats", serde_json::json!([124, 3, 4])),
+                ("decoded-video-seams", serde_json::json!([3, 14, 96, 168])),
+            ] {
+                cells.insert(
+                    format!("{mode}/first/{role}"),
+                    serde_json::json!({
+                        "shape": shape,
+                        "tau_abs": 0.5,
+                        "tau_rmse": 0.02,
+                        "tau_relative_rmse": 1e-6,
+                        "gating": true,
+                        "gating_metrics": ["max_abs", "rmse"],
+                        "reference_arms": ["arm-a", "arm-b", "arm-c"],
+                    }),
+                );
+            }
+            std::fs::write(
+                dir.join(filename),
+                serde_json::to_vec(&serde_json::json!({
+                    "precision": "publisher-bf16",
+                    "formula": "max(2 * worst_valid_reference_pair, 1e-6)",
+                    "native_arrays_read": false,
+                    "controls": {mode: {"first": true}},
+                    "cells": cells,
+                }))?,
+            )?;
+        }
+        gate.root = dir.clone();
+        gate.floors.cells.clear();
+        gate.seen.clear();
+        gate.gating = 0;
+        gate.measurements = 0;
+        gate.controls = 0;
+        gate.defects.clear();
+        for key in [
+            "teacher/first/teacher-audio-4",
+            "replay/first/decoder-video-input",
+            "replay/first/decoder-audio-input",
+        ] {
+            gate.floors.cells.insert(key.into(), cell.clone());
+            gate.seen.insert(key.into());
+        }
+        gate.bf16_video_floors("first", "replay")?;
+        gate.bf16_video_floors("first", "free")?;
+        for role in [
+            "decoded-video-sample",
+            "decoded-video-stats",
+            "decoded-video-seams",
+        ] {
+            assert!(gate.floors.cells[&format!("replay/first/{role}")].gating);
+            let free_shape = {
+                let free_cell = &gate.floors.cells[&format!("free/first/{role}")];
+                assert!(!free_cell.gating);
+                assert_eq!(free_cell.tau_abs.to_bits(), 0.5f64.to_bits());
+                free_cell.shape.clone()
+            };
+            gate.begin_cell(&format!("replay/first/{role}"), &free_shape)?;
+            gate.begin_cell(&format!("free/first/{role}"), &free_shape)?;
+            for arm in ["arm-a", "arm-b", "arm-c"] {
+                gate.score_values(&format!("replay/first/{role}"), arm, &[0.0f32], &[0.0])?;
+                gate.score_values(&format!("free/first/{role}"), arm, &[100.0f32], &[0.0])?;
+            }
+        }
+        assert_eq!(gate.gating, 9);
+        assert_eq!(gate.measurements, 9);
+        assert!(gate.defects.is_empty());
+        gate.gating += 3;
+        gate.complete("first", false)?;
+        gate.score_values(
+            "replay/first/decoded-video-sample",
+            "arm-a",
+            &[100.0f32],
+            &[0.0],
+        )?;
+        assert_eq!(
+            gate.defects,
+            vec!["replay/first/decoded-video-sample/arm-a"]
+        );
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    check_bf16_modes?;
     Ok(())
 }
 
