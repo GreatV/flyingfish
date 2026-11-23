@@ -14998,6 +14998,33 @@ mod tests {
         Ok((end_row - start_row, max_abs, rmse, argmax_row, above))
     }
 
+    fn edit_generated_distance(
+        candidate: &[f32],
+        reference: &[f32],
+        width: usize,
+        reference_rows: usize,
+    ) -> Result<(f64, f64)> {
+        ensure!(
+            width > 0
+                && candidate.len() == reference.len()
+                && candidate.len().is_multiple_of(width),
+            "edit velocity length {} width={width}",
+            candidate.len()
+        );
+        let image_rows = candidate.len() / width;
+        ensure!(
+            reference_rows < image_rows,
+            "edit velocity split reference_rows={reference_rows} image_rows={image_rows}"
+        );
+        let (_, max_abs, rmse, _, _) =
+            image_part_distance(candidate, reference, width, reference_rows, image_rows)?;
+        Ok((max_abs, rmse))
+    }
+
+    fn velocity_within(max_abs: f64, rmse: f64, tau_max: f64, tau_rmse: f64) -> bool {
+        max_abs <= tau_max && rmse <= tau_rmse
+    }
+
     struct RopeControl {
         shift_max: f64,
         shift_rmse: f64,
@@ -15119,6 +15146,65 @@ mod tests {
             velocity_rows_changed(&source, &transposed, &[0, 1]),
             vec![true, false]
         );
+    }
+
+    #[test]
+    fn dit_edit_step0_scores_the_generated_suffix() {
+        let cell = IMAGE_DIT_512
+            .iter()
+            .find(|cell| cell.name == "dit_edit_step0")
+            .expect("dit_edit_step0");
+        let published = (
+            image_dit_tau(cell.cross_max_abs),
+            image_dit_tau(cell.cross_rmse),
+        );
+        let fp16 = fp16_dit_bound();
+        let width = 4usize;
+        let reference_rows = 4usize;
+        let generated = 2usize;
+        let n = (reference_rows + generated) * width;
+        let reference = vec![0.0f32; n];
+        let mut candidate = vec![0.0f32; n];
+        for value in &mut candidate[reference_rows * width..] {
+            *value = 0.1;
+        }
+        let (suffix_max, suffix_rmse) =
+            edit_generated_distance(&candidate, &reference, width, reference_rows).expect("suffix");
+        assert!(velocity_within(suffix_max, suffix_rmse, fp16.0, fp16.1));
+        assert!(velocity_within(
+            suffix_max,
+            suffix_rmse,
+            published.0,
+            published.1
+        ));
+        let mut prefix = candidate.clone();
+        prefix[0] = (published.0 + 1.0) as f32;
+        let (prefix_max, prefix_rmse) =
+            edit_generated_distance(&prefix, &reference, width, reference_rows).expect("prefix");
+        assert_eq!(prefix_max.to_bits(), suffix_max.to_bits());
+        assert_eq!(prefix_rmse.to_bits(), suffix_rmse.to_bits());
+        let (whole_max, whole_rmse) = image_max_rmse(&prefix, &reference).expect("whole");
+        assert!(whole_max > published.0 && whole_max > fp16.0);
+        assert!(whole_rmse > published.1 && whole_rmse > fp16.1);
+        assert!(!velocity_within(whole_max, whole_rmse, fp16.0, fp16.1));
+        assert!(!velocity_within(
+            whole_max,
+            whole_rmse,
+            published.0,
+            published.1
+        ));
+        let mut suffix = candidate.clone();
+        suffix[reference_rows * width] = (published.0 + 1.0) as f32;
+        let (bad_max, bad_rmse) =
+            edit_generated_distance(&suffix, &reference, width, reference_rows)
+                .expect("bad suffix");
+        assert!(!velocity_within(bad_max, bad_rmse, fp16.0, fp16.1));
+        assert!(!velocity_within(
+            bad_max,
+            bad_rmse,
+            published.0,
+            published.1
+        ));
     }
 
     #[test]
@@ -15292,6 +15378,7 @@ mod tests {
     /// On sm >= 80 the control bar is `3 * tau` against the BF16 reference.
     /// On sm < 80 a `dit_*` cell uses the prod64 floor. Euler stays on `image_dit_tau`.
     /// On `fp16_stored_half` both rope controls score rows whose `(h, w)` changed, against `image_dit_tau` of `dit_step0`.
+    /// `dit_edit_step0` scores the generated suffix. The reference prefix is printed and is not a defect.
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_H3_IMAGE, FF_H3_IMAGE_DEVICE0, FF_H3_PLACEMENT"]
     fn image_dit_512_matches_the_frozen_cells() -> Result<()> {
@@ -15737,7 +15824,16 @@ mod tests {
                     .iter()
                     .find(|cell| cell.name == name)
                     .context(name)?;
-                let (max_abs, rmse) = image_max_rmse(candidate, reference)?;
+                let (max_abs, rmse) = if name == "dit_edit_step0" {
+                    edit_generated_distance(
+                        candidate,
+                        reference,
+                        width,
+                        edit_layout.reference_rows,
+                    )?
+                } else {
+                    image_max_rmse(candidate, reference)?
+                };
                 let (tau_max, tau_rmse) = scored_image_tau(
                     fp16,
                     name,
@@ -15745,8 +15841,7 @@ mod tests {
                     image_dit_tau(cell.cross_rmse),
                 );
                 let ok = candidate.iter().all(|v| v.is_finite())
-                    && max_abs <= tau_max
-                    && rmse <= tau_rmse;
+                    && velocity_within(max_abs, rmse, tau_max, tau_rmse);
                 println!(
                     "H3_IMAGE_DIT {name} max_abs={max_abs:.8e} rmse={rmse:.8e} tau_max={tau_max:.8e} tau_rmse={tau_rmse:.8e} within={ok}"
                 );
