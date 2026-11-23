@@ -15312,6 +15312,7 @@ mod tests {
                     crate::prefill::placement_visits(schedule.timesteps.len(), 1)?,
                 ),
             )?;
+            println!("H3_IMAGE_DIT setup=ok");
             let kernels = BlockKernels::new(&device)?;
             let context = BlockContext {
                 s,
