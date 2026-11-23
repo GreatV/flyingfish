@@ -305,7 +305,7 @@ impl Plan {
                 lt::set_matmul_desc_attribute(
                     p.desc,
                     sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
-                    (&dtype as *const sys::cudaDataType_t).cast(),
+                    (&operands.c as *const sys::cudaDataType_t).cast(),
                     size_of::<sys::cudaDataType_t>(),
                 )?;
             }
@@ -548,6 +548,8 @@ pub struct Blas {
     biased_plans: RefCell<BTreeMap<(LinearShape, u64, super::linear::LinearBiasMode), Plan>>,
     wide_plans: RefCell<BTreeMap<(LinearShape, u8), Plan>>,
     biased_f32_out: RefCell<BTreeMap<(LinearShape, u64), Plan>>,
+    // F32 bias storage. Dropped after the Lt descriptors, which keep this pointer.
+    biased_f32_bias: RefCell<BTreeMap<u64, CudaSlice<f32>>>,
     f16_reference: bool,
     f16_plans: RefCell<BTreeMap<LinearShape, Plan>>,
     bias_add: Option<CudaFunction>,
@@ -769,6 +771,7 @@ impl Blas {
             biased_plans: RefCell::new(BTreeMap::new()),
             wide_plans: RefCell::new(BTreeMap::new()),
             biased_f32_out: RefCell::new(BTreeMap::new()),
+            biased_f32_bias: RefCell::new(BTreeMap::new()),
             f16_reference: false,
             f16_plans: RefCell::new(BTreeMap::new()),
             bias_add: None,
@@ -2540,7 +2543,48 @@ impl Blas {
         Ok(())
     }
 
-    /// Context embedder: FP16 A/B, F32 C, bias before the F32 store.
+    fn stored_half_f32(&self, bits: u16) -> Result<f32> {
+        match self.half_dtype {
+            sys::cudaDataType_t::CUDA_R_16F => Ok(half::f16::from_bits(bits).to_f32()),
+            sys::cudaDataType_t::CUDA_R_16BF => Ok(bf16::from_bits(bits).to_f32()),
+            _ => anyhow::bail!("F32-output Lt bias storage is not FP16 or BF16"),
+        }
+    }
+
+    /// One F32 device buffer per source pointer. Length is `output`.
+    fn f32_bias_ptr(&self, bias: super::contracts::Tensor<bf16, 1>, output: u32) -> Result<u64> {
+        let output = output as usize;
+        let reused = {
+            let stored = self.biased_f32_bias.borrow();
+            match stored.get(&bias.ptr) {
+                Some(slice) => {
+                    ensure!(slice.len() == output, "F32 bias length mismatch");
+                    let (ptr, _guard) = slice.device_ptr(&self.stream);
+                    Some(ptr)
+                }
+                None => None,
+            }
+        };
+        if let Some(ptr) = reused {
+            return Ok(ptr);
+        }
+        let mut bits = vec![0u16; output];
+        unsafe { super::copy::dtoh_async(&mut bits, bias.ptr, &self.stream)? };
+        self.stream.synchronize()?;
+        let mut values = Vec::with_capacity(output);
+        for word in bits {
+            values.push(self.stored_half_f32(word)?);
+        }
+        let device = self.stream.clone_htod(&values)?;
+        let ptr = {
+            let (ptr, _guard) = device.device_ptr(&self.stream);
+            ptr
+        };
+        self.biased_f32_bias.borrow_mut().insert(bias.ptr, device);
+        Ok(ptr)
+    }
+
+    /// A/B are the stored half type, C and the bias vector are F32.
     pub(crate) fn prepare_biased_f32(
         &self,
         rows: u32,
@@ -2564,13 +2608,14 @@ impl Blas {
             output: output as usize,
             input: input as usize,
         };
+        let bias_ptr = self.f32_bias_ptr(bias, output)?;
         let mut plans = self.biased_f32_out.borrow_mut();
         if let std::collections::btree_map::Entry::Vacant(entry) = plans.entry((shape, bias.ptr)) {
             let plan = Plan::build(
                 self.handle,
                 (shape.rows, shape.output, shape.input, shape.input),
                 self.workspace.borrow().len(),
-                Some(bias.ptr),
+                Some(bias_ptr),
                 PlanOperands {
                     ab: self.half_dtype,
                     c: sys::cudaDataType_t::CUDA_R_32F,
@@ -3445,6 +3490,347 @@ mod tests {
         ensure!(changed > 0, "bit flip left the output unchanged");
         ensure!(defects == 0, "FP16_GEMM defects={defects}");
         println!("FP16_GEMM cells={} defects={defects}", FLOOR.len());
+        Ok(())
+    }
+
+    struct Dot {
+        rows: usize,
+        output: usize,
+        input: usize,
+        scale: f32,
+    }
+
+    fn cycle(index: usize, step: usize) -> half::bf16 {
+        const VALUES: [f32; 4] = [0.5, 1.0, 2.0, -1.0];
+        half::bf16::from_f32(VALUES[(index * step) % 4])
+    }
+
+    fn fill_weight(output: usize, input: usize) -> Vec<half::bf16> {
+        let mut weight = Vec::with_capacity(output * input);
+        for o in 0..output {
+            for k in 0..input {
+                weight.push(cycle(o + k, 3));
+            }
+        }
+        weight
+    }
+
+    fn fill_x(rows: usize, input: usize) -> Vec<half::bf16> {
+        let mut x = Vec::with_capacity(rows * input);
+        for r in 0..rows {
+            for k in 0..input {
+                x.push(cycle(r + k, 1));
+            }
+        }
+        x
+    }
+
+    fn fill_bias(output: usize) -> Vec<half::bf16> {
+        (0..output)
+            .map(|o| half::bf16::from_f32(if o % 2 == 0 { 1.0 } else { -1.0 }))
+            .collect()
+    }
+
+    fn f32_of(src: &[half::bf16]) -> Vec<f32> {
+        src.iter().map(|value| value.to_f32()).collect()
+    }
+
+    fn host_dot(weight: &[f32], x: &[f32], bias: Option<&[f32]>, dot: Dot) -> Vec<f32> {
+        let mut y = vec![0f32; dot.rows * dot.output];
+        for r in 0..dot.rows {
+            let xrow = &x[r * dot.input..(r + 1) * dot.input];
+            for o in 0..dot.output {
+                let wrow = &weight[o * dot.input..(o + 1) * dot.input];
+                let mut acc = 0f32;
+                for (wv, xv) in wrow.iter().zip(xrow) {
+                    acc += wv * xv;
+                }
+                acc *= dot.scale;
+                if let Some(values) = bias {
+                    acc += values[o];
+                }
+                y[r * dot.output + o] = acc;
+            }
+        }
+        y
+    }
+
+    fn mat2<T: Copy>(
+        ptr: u64,
+        rows: usize,
+        cols: usize,
+    ) -> Result<crate::backend::cuda::contracts::Tensor<T, 2>> {
+        unsafe {
+            crate::backend::cuda::contracts::Tensor::new(
+                ptr,
+                [rows as u32, cols as u32],
+                [cols as u64, 1],
+                (rows * cols * std::mem::size_of::<T>()) as u64,
+            )
+        }
+    }
+
+    fn mat2_mut<T: Copy>(
+        ptr: u64,
+        rows: usize,
+        cols: usize,
+    ) -> Result<crate::backend::cuda::contracts::TensorMut<T, 2>> {
+        unsafe {
+            crate::backend::cuda::contracts::TensorMut::new(
+                ptr,
+                [rows as u32, cols as u32],
+                [cols as u64, 1],
+                (rows * cols * std::mem::size_of::<T>()) as u64,
+            )
+        }
+    }
+
+    fn vec1<T: Copy>(ptr: u64, n: usize) -> Result<crate::backend::cuda::contracts::Tensor<T, 1>> {
+        unsafe {
+            crate::backend::cuda::contracts::Tensor::new(
+                ptr,
+                [n as u32],
+                [1],
+                (n * std::mem::size_of::<T>()) as u64,
+            )
+        }
+    }
+
+    fn score_f32(
+        label: &str,
+        actual: &[f32],
+        expected: &[f32],
+        max_abs_limit: f32,
+        rmse_limit: f32,
+    ) -> Result<()> {
+        ensure!(actual.len() == expected.len(), "{label} length");
+        let mut max_abs = 0f32;
+        let mut sse = 0f64;
+        for (got, want) in actual.iter().zip(expected) {
+            ensure!(got.is_finite() && want.is_finite(), "{label} non-finite");
+            let delta = (got - want).abs();
+            if delta > max_abs {
+                max_abs = delta;
+            }
+            sse += f64::from(delta) * f64::from(delta);
+        }
+        let rmse = (sse / actual.len() as f64).sqrt();
+        println!("f32_output_lt {label} max_abs={max_abs} rmse={rmse}");
+        ensure!(max_abs <= max_abs_limit, "{label} max_abs {max_abs}");
+        ensure!(rmse <= f64::from(rmse_limit), "{label} rmse {rmse}");
+        Ok(())
+    }
+
+    struct WideCheck<'a> {
+        blas: &'a Blas,
+        stream: &'a Arc<CudaStream>,
+        rows: usize,
+        output: usize,
+        max_abs: f32,
+        rmse: f32,
+    }
+
+    impl WideCheck<'_> {
+        fn operands(
+            &self,
+            input: usize,
+        ) -> Result<(Vec<half::bf16>, Vec<half::bf16>, Vec<f32>, Vec<f32>)> {
+            let weight = fill_weight(self.output, input);
+            let x = fill_x(self.rows, input);
+            let weight_f32 = f32_of(&weight);
+            let x_f32 = f32_of(&x);
+            Ok((weight, x, weight_f32, x_f32))
+        }
+
+        fn read_y(&self, y: &CudaSlice<f32>, label: &str, expected: &[f32]) -> Result<()> {
+            self.stream.synchronize()?;
+            let actual = self.stream.clone_dtoh(y)?;
+            score_f32(label, &actual, expected, self.max_abs, self.rmse)
+        }
+
+        fn host(&self, input: usize) -> Result<()> {
+            let label = format!("host_alpha input={input}");
+            println!(
+                "f32_output_lt {label} rows={} output={}",
+                self.rows, self.output
+            );
+            let (weight, x, weight_f32, x_f32) = self.operands(input)?;
+            let expected = host_dot(
+                &weight_f32,
+                &x_f32,
+                None,
+                Dot {
+                    rows: self.rows,
+                    output: self.output,
+                    input,
+                    scale: 1.0,
+                },
+            );
+            let w = self.stream.clone_htod(&weight)?;
+            let xv = self.stream.clone_htod(&x)?;
+            let mut y = self.stream.alloc_zeros::<f32>(self.rows * self.output)?;
+            self.blas
+                .prepare_wide_f32(self.rows, self.output, input, false)?;
+            {
+                let (wp, _wg) = w.device_ptr(self.stream);
+                let (xp, _xg) = xv.device_ptr(self.stream);
+                let (yp, _yg) = y.device_ptr_mut(self.stream);
+                let wt = mat2::<half::bf16>(wp, self.output, input)?;
+                let xt = mat2::<half::bf16>(xp, self.rows, input)?;
+                let mut yt = mat2_mut::<f32>(yp, self.rows, self.output)?;
+                self.blas.linear_wide_f32(wt, xt, &mut yt)?;
+            }
+            self.read_y(&y, &label, &expected)
+        }
+
+        fn device(&self, input: usize) -> Result<()> {
+            let label = format!("device_alpha input={input}");
+            println!(
+                "f32_output_lt {label} rows={} output={}",
+                self.rows, self.output
+            );
+            let (weight, x, weight_f32, x_f32) = self.operands(input)?;
+            let expected = host_dot(
+                &weight_f32,
+                &x_f32,
+                None,
+                Dot {
+                    rows: self.rows,
+                    output: self.output,
+                    input,
+                    scale: 0.5,
+                },
+            );
+            let w = self.stream.clone_htod(&weight)?;
+            let xv = self.stream.clone_htod(&x)?;
+            let mut y = self.stream.alloc_zeros::<f32>(self.rows * self.output)?;
+            let alpha = self.stream.clone_htod(&[0.5f32])?;
+            let beta = self.stream.clone_htod(&[0f32])?;
+            self.blas
+                .prepare_wide_f32(self.rows, self.output, input, true)?;
+            {
+                let (wp, _wg) = w.device_ptr(self.stream);
+                let (xp, _xg) = xv.device_ptr(self.stream);
+                let (yp, _yg) = y.device_ptr_mut(self.stream);
+                let (ap, _ag) = alpha.device_ptr(self.stream);
+                let (bp, _bg) = beta.device_ptr(self.stream);
+                let wt = mat2::<half::bf16>(wp, self.output, input)?;
+                let xt = mat2::<half::bf16>(xp, self.rows, input)?;
+                let mut yt = mat2_mut::<f32>(yp, self.rows, self.output)?;
+                self.blas.linear_wide_f32_device(wt, xt, &mut yt, ap, bp)?;
+            }
+            self.read_y(&y, &label, &expected)
+        }
+
+        fn biased(
+            &self,
+            bias_dev: &CudaSlice<half::bf16>,
+            bias_f32: &[f32],
+            input: usize,
+            step: u32,
+        ) -> Result<()> {
+            let label = format!("biased step={step} input={input}");
+            println!(
+                "f32_output_lt {label} rows={} output={}",
+                self.rows, self.output
+            );
+            let (weight, x, weight_f32, x_f32) = self.operands(input)?;
+            let expected = host_dot(
+                &weight_f32,
+                &x_f32,
+                Some(bias_f32),
+                Dot {
+                    rows: self.rows,
+                    output: self.output,
+                    input,
+                    scale: 1.0,
+                },
+            );
+            let w = self.stream.clone_htod(&weight)?;
+            let xv = self.stream.clone_htod(&x)?;
+            let mut y = self.stream.alloc_zeros::<f32>(self.rows * self.output)?;
+            println!(
+                "f32_output_lt step={step} prepare_biased_f32 rows={} output={} input={input}",
+                self.rows, self.output
+            );
+            {
+                let (bp, _bg) = bias_dev.device_ptr(self.stream);
+                let bias = vec1::<half::bf16>(bp, self.output)?;
+                self.blas.prepare_biased_f32(
+                    u32::try_from(self.rows)?,
+                    u32::try_from(self.output)?,
+                    u32::try_from(input)?,
+                    bias,
+                )?;
+                let (wp, _wg) = w.device_ptr(self.stream);
+                let (xp, _xg) = xv.device_ptr(self.stream);
+                let (yp, _yg) = y.device_ptr_mut(self.stream);
+                let (bp, _bg) = bias_dev.device_ptr(self.stream);
+                let wt = mat2::<half::bf16>(wp, self.output, input)?;
+                let xt = mat2::<half::bf16>(xp, self.rows, input)?;
+                let bias = vec1::<half::bf16>(bp, self.output)?;
+                let mut yt = mat2_mut::<f32>(yp, self.rows, self.output)?;
+                self.blas.linear_biased_f32(wt, bias, xt, &mut yt)?;
+            }
+            self.read_y(&y, &label, &expected)
+        }
+    }
+
+    /// 263 by 5376. max abs 0.5, rmse 0.1.
+    #[test]
+    #[ignore = "exclusive CUDA window and an empty FLYINGFISH_RUNTIME_DIR"]
+    fn f32_output_lt_matches_the_host_dot() -> Result<()> {
+        const MAX_ABS: f32 = 0.5;
+        const RMSE: f32 = 0.1;
+        const ROWS: usize = 263;
+        const OUTPUT: usize = 5376;
+        for value in [0.5f32, 1.0, 2.0, -1.0] {
+            ensure!(
+                half::bf16::from_f32(value).to_f32() == value,
+                "{value} bf16"
+            );
+            ensure!(f16::from_f32(value).to_f32() == value, "{value} fp16");
+        }
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let runtime = PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
+        );
+        ensure!(
+            std::fs::read_dir(&runtime)?.next().is_none(),
+            "runtime must be empty"
+        );
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let stream = &device.stream;
+        let blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(super::super::closure::Closure::new(
+                true,
+                "F32 output Lt".into(),
+            )),
+        )?;
+        println!("f32_output_lt half={:?}", blas.half_dtype);
+        let check = WideCheck {
+            blas: &blas,
+            stream,
+            rows: ROWS,
+            output: OUTPUT,
+            max_abs: MAX_ABS,
+            rmse: RMSE,
+        };
+        check.host(7168)?;
+        check.device(14336)?;
+        let bias_host = fill_bias(OUTPUT);
+        let bias_f32 = f32_of(&bias_host);
+        let bias_dev = stream.clone_htod(&bias_host)?;
+        check.biased(&bias_dev, &bias_f32, 7168, 3)?;
+        check.biased(&bias_dev, &bias_f32, 5120, 4)?;
         Ok(())
     }
 }
