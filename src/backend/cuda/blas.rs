@@ -1283,6 +1283,101 @@ impl Blas {
         Ok(())
     }
 
+    pub(crate) fn bf16_row_family(&self) -> bool {
+        self.half_dtype == sys::cudaDataType_t::CUDA_R_16BF
+    }
+
+    /// One opaque algorithm for an unbound base FFN `(output, input)`, chosen at `shape.rows`.
+    /// `lower_wave` replaces heuristic 0 only when index 1 has a strictly smaller whole-wave multiplier.
+    pub(crate) fn bind_base_ffn_family(&self, shape: LinearShape, lower_wave: bool) -> Result<()> {
+        let key = (shape.output, shape.input);
+        if self.row_families.borrow().contains_key(&key) {
+            return Ok(());
+        }
+        let mut chosen = Plan::new(
+            self.handle,
+            shape.rows,
+            shape.output,
+            shape.input,
+            self.workspace.borrow().len(),
+            0,
+            self.half_dtype,
+        )?;
+        if lower_wave && chosen.algo_count >= 2 {
+            let alternative = Plan::new(
+                self.handle,
+                shape.rows,
+                shape.output,
+                shape.input,
+                self.workspace.borrow().len(),
+                1,
+                self.half_dtype,
+            )?;
+            if lower_wave_index(&[f64::from(chosen.waves), f64::from(alternative.waves)])? == 1 {
+                self.bind_workspace(alternative.workspace)?;
+                chosen = alternative;
+            }
+        }
+        let algo = chosen.algo.context("base FFN family algorithm missing")?;
+        let limit = self.workspace.borrow().len();
+        self.row_families.borrow_mut().insert(key, (algo, limit));
+        Ok(())
+    }
+
+    /// Stores `algo` for `(output, input)` and rebuilds the prepared family plans through AlgoCheck.
+    pub(crate) fn adopt_qualified_gate_family(
+        &self,
+        output: usize,
+        input: usize,
+        algo: sys::cublasLtMatmulAlgo_t,
+    ) -> Result<()> {
+        let keys: Vec<_> = self
+            .plans
+            .borrow()
+            .keys()
+            .copied()
+            .filter(|&(_, plan_output, plan_input, index, family)| {
+                family && index == 0 && plan_output == output && plan_input == input
+            })
+            .collect();
+        let limit = self.workspace.borrow().len();
+        self.row_families
+            .borrow_mut()
+            .insert((output, input), (algo, limit));
+        for (rows, plan_output, plan_input, _, _) in keys {
+            let plan = Plan::build(
+                self.handle,
+                (rows, plan_output, plan_input, plan_input),
+                self.workspace.borrow().len(),
+                None,
+                PlanOperands {
+                    ab: self.half_dtype,
+                    c: self.half_dtype,
+                    device_alpha: false,
+                },
+                PlanAlgo::Fixed(algo),
+            )?;
+            self.bind_workspace(plan.workspace)?;
+            self.plans
+                .borrow_mut()
+                .insert((rows, plan_output, plan_input, 0, true), plan);
+        }
+        let limit = self.workspace.borrow().len();
+        self.row_families
+            .borrow_mut()
+            .insert((output, input), (algo, limit));
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn row_family_identity(&self, shape: LinearShape) -> Result<LtAlgorithm> {
+        self.plans
+            .borrow()
+            .get(&(shape.rows, shape.output, shape.input, 0, true))
+            .context("row family plan missing")?
+            .identity()
+    }
+
     /// One opaque algorithm per (output,input) family, selected at the canonical row count.
     pub(crate) fn bind_row_family(&self, shape: LinearShape) -> Result<()> {
         let key = (shape.output, shape.input);

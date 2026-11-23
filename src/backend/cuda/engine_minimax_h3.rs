@@ -2336,6 +2336,29 @@ impl BlockWork {
     /// chunks.
     pub(crate) fn prepare<const LORA: bool>(&self, blas: &Blas, spec: &H3Spec) -> Result<()> {
         let (h, width, f, r) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn, self.rank);
+        #[cfg(feature = "cuda")]
+        let base_family = blas.bf16_row_family();
+        #[cfg(not(feature = "cuda"))]
+        let base_family = false;
+        #[cfg(feature = "cuda")]
+        if base_family {
+            blas.bind_base_ffn_family(
+                crate::backend::setup::LinearShape {
+                    rows: FFN_CHUNK_ROWS,
+                    output: 2 * f,
+                    input: h,
+                },
+                false,
+            )?;
+            blas.bind_base_ffn_family(
+                crate::backend::setup::LinearShape {
+                    rows: FFN_CHUNK_ROWS,
+                    output: h,
+                    input: f,
+                },
+                true,
+            )?;
+        }
         let mut shapes = vec![(self.rows, width, h, false), (self.rows, h, width, false)];
         if LORA {
             shapes.extend([(self.rows, 3 * r, h, false), (self.rows, r, width, false)]);
@@ -2344,7 +2367,7 @@ impl BlockWork {
             .into_iter()
             .filter(|&n| n > 0)
         {
-            shapes.extend([(rows, 2 * f, h, false), (rows, h, f, false)]);
+            shapes.extend([(rows, 2 * f, h, base_family), (rows, h, f, base_family)]);
             if LORA {
                 shapes.extend([(rows, r, h, self.fixed_lora), (rows, r, f, self.fixed_lora)]);
                 if self.fixed_lora {
@@ -2353,12 +2376,14 @@ impl BlockWork {
             }
         }
         for (rows, output, input, family) in shapes {
+            let shape = crate::backend::setup::LinearShape {
+                rows,
+                output,
+                input,
+            };
             if family {
-                blas.prepare_row_family(crate::backend::setup::LinearShape {
-                    rows,
-                    output,
-                    input,
-                })?;
+                blas.prepare_row_family(shape)?;
+                blas.bind_workspace(blas.fixed_workspace(shape, true)?)?;
             } else {
                 blas.prepare_fixed(
                     u32::try_from(rows)?,
@@ -2632,15 +2657,21 @@ impl BlockWork {
         );
         self.fixed_lora = true;
         self.prepare::<LORA>(blas, spec)?;
-        for rows in [self.chunk, self.rows % self.chunk]
-            .into_iter()
-            .filter(|&rows| rows > 0)
-        {
-            blas.bind_lower_wave(crate::backend::setup::LinearShape {
-                rows,
-                output: spec.hidden,
-                input: spec.ffn,
-            })?;
+        #[cfg(feature = "cuda")]
+        let per_m_lower_wave = !blas.bf16_row_family();
+        #[cfg(not(feature = "cuda"))]
+        let per_m_lower_wave = true;
+        if per_m_lower_wave {
+            for rows in [self.chunk, self.rows % self.chunk]
+                .into_iter()
+                .filter(|&rows| rows > 0)
+            {
+                blas.bind_lower_wave(crate::backend::setup::LinearShape {
+                    rows,
+                    output: spec.hidden,
+                    input: spec.ffn,
+                })?;
+            }
         }
         if self.rows > FFN_CHUNK_ROWS {
             self.ffn_cost::<LORA>(blas, spec, self.chunk, true)?;
@@ -3581,6 +3612,15 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
             ptrs.rotate_32 = index == FF_IN && rotate_32[FF_IN][tail];
             ptrs
         });
+        #[cfg(feature = "cuda")]
+        if let BlockLinear::Dense { weight, .. } = &w.linears[index]
+            && wide.is_none()
+            && c.blas.bf16_row_family()
+        {
+            return c
+                .blas
+                .linear_row_family(*weight, x, &mut TensorMut(y), 1.0, 0.0);
+        }
         apply_linear(c, &w.linears[index], x, y, scratch)
     };
     for start in (0..rows).step_by(chunk) {
@@ -11095,6 +11135,60 @@ mod tests {
         let mut source = Source::new(&dir, &manifest, device.info.arch.fp16_stored_half());
         let mut defects = 0;
         let mut cells = 0;
+        #[cfg(feature = "cuda")]
+        {
+            ensure!(
+                blas.bf16_row_family(),
+                "base FFN row family requires BF16 Lt"
+            );
+            let mut required = std::collections::BTreeSet::new();
+            for &rows in &[40_045usize, 60_431] {
+                for &other in &partitions {
+                    for chunk in [1008usize, other] {
+                        for n in [chunk, rows % chunk] {
+                            if n > 0 {
+                                required.insert(n);
+                            }
+                        }
+                    }
+                }
+            }
+            let mut identity_defects = 0usize;
+            for (output, input, lower_wave) in [
+                (2 * spec.ffn, spec.hidden, false),
+                (spec.hidden, spec.ffn, true),
+            ] {
+                blas.bind_base_ffn_family(
+                    crate::backend::setup::LinearShape {
+                        rows: FFN_CHUNK_ROWS,
+                        output,
+                        input,
+                    },
+                    lower_wave,
+                )?;
+                let mut ids = std::collections::BTreeSet::new();
+                for &n in &required {
+                    let shape = crate::backend::setup::LinearShape {
+                        rows: n,
+                        output,
+                        input,
+                    };
+                    blas.prepare_row_family(shape)?;
+                    blas.bind_workspace(blas.fixed_workspace(shape, true)?)?;
+                    ids.insert(blas.row_family_identity(shape)?);
+                }
+                println!(
+                    "H3_BASE_ROW_IDENTITY output={output} input={input} rows={} identities={}",
+                    required.len(),
+                    ids.len()
+                );
+                identity_defects += usize::from(ids.len() != 1);
+            }
+            ensure!(
+                identity_defects == 0,
+                "DEFECT base FFN Lt identity count={identity_defects}"
+            );
+        }
         for layer in [0, spec.layers / 2] {
             for (name, output, input) in [
                 ("ff.net.0.proj", 2 * spec.ffn, spec.hidden),
@@ -11107,6 +11201,7 @@ mod tests {
                 )?;
                 for rows in [40_045usize, 60_431] {
                     for &other in &partitions {
+                        #[cfg(not(feature = "cuda"))]
                         for chunk in [1008, other] {
                             for n in [chunk, rows % chunk].into_iter().filter(|&n| n > 0) {
                                 blas.prepare_fixed(
@@ -11131,13 +11226,17 @@ mod tests {
                                 &host,
                             )?;
                             let y = stream.alloc_zeros::<bf16>(n * output)?;
+                            let weight = matrix(&weight, stream, output, input)?;
+                            let x = matrix(&x, stream, n, input)?;
+                            let mut y_view = TensorMut(matrix(&y, stream, n, output)?);
+                            #[cfg(feature = "cuda")]
+                            blas.linear_row_family(weight, x, &mut y_view, 1.0, 0.0)?;
+                            #[cfg(not(feature = "cuda"))]
                             blas.linear_typed(
                                 crate::op_contract::ExecutionPhase::Prefill,
-                                crate::backend::cuda::linear::LinearWeightRef::Bf16(matrix(
-                                    &weight, stream, output, input,
-                                )?),
-                                matrix(&x, stream, n, input)?,
-                                &mut TensorMut(matrix(&y, stream, n, output)?),
+                                crate::backend::cuda::linear::LinearWeightRef::Bf16(weight),
+                                x,
+                                &mut y_view,
                             )?;
                             let actual = stream.clone_dtoh(&y)?;
                             ensure!(

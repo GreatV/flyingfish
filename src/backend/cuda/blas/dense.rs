@@ -716,6 +716,7 @@ impl Blas {
             input: input.shape[1] as usize,
             output: weight.shape[0] as usize,
         };
+        let adopt_gate = ffn_tail.is_some_and(|tail| shape.rows != tail);
         ensure!(
             weight.shape[1] == input.shape[1]
                 && output.shape == [input.shape[0], weight.shape[0]]
@@ -795,11 +796,16 @@ impl Blas {
                 serde_json::json!({"dense_lt":{"filled":filled,"setup_seconds":setup_start.elapsed().as_secs_f64(),"selection":choice}})
             );
         }
+        let (family_output, family_input) = (shape.output, shape.input);
         let original = std::mem::replace(plan, bound);
         #[cfg(test)]
         self.dense_parents.borrow_mut().insert(shape, original);
         #[cfg(not(test))]
         drop(original);
+        drop(plans);
+        if adopt_gate {
+            self.adopt_qualified_gate_family(family_output, family_input, algo)?;
+        }
         Ok(())
     }
 
