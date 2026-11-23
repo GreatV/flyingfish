@@ -14905,6 +14905,117 @@ mod tests {
         (4.0, 0.73971736)
     }
 
+    fn fp16_rope_whole_tensor_separates(max_abs: f64, rmse: f64) -> bool {
+        let (bar_max, bar_rmse) = fp16_dit_bound();
+        max_abs > bar_max && rmse > bar_rmse
+    }
+
+    fn fp16_rope_changed_rows_separate(
+        max_abs: f64,
+        rmse: f64,
+        tau_max: f64,
+        tau_rmse: f64,
+    ) -> bool {
+        max_abs > tau_max && rmse > tau_rmse
+    }
+
+    fn velocity_rows_changed(
+        source: &[[f64; 3]],
+        mutated: &[[f64; 3]],
+        image_at: &[u32],
+    ) -> Vec<bool> {
+        image_at
+            .iter()
+            .map(|&row| {
+                let row = row as usize;
+                mutated[row][1] != source[row][1] || mutated[row][2] != source[row][2]
+            })
+            .collect()
+    }
+
+    fn masked_row_distance(
+        candidate: &[f32],
+        reference: &[f32],
+        width: usize,
+        changed: &[bool],
+    ) -> Result<(f64, f64, usize)> {
+        ensure!(
+            width > 0
+                && candidate.len() == reference.len()
+                && candidate.len() == changed.len() * width,
+            "rope row mask width={width} rows={} values={}",
+            changed.len(),
+            candidate.len()
+        );
+        let mut got = Vec::new();
+        let mut want = Vec::new();
+        for (row, &keep) in changed.iter().enumerate() {
+            if !keep {
+                continue;
+            }
+            let start = row * width;
+            got.extend_from_slice(&candidate[start..start + width]);
+            want.extend_from_slice(&reference[start..start + width]);
+        }
+        ensure!(!got.is_empty(), "rope control changed no image rows");
+        let (max_abs, rmse) = image_max_rmse(&got, &want)?;
+        Ok((max_abs, rmse, got.len() / width))
+    }
+
+    fn image_part_distance(
+        candidate: &[f32],
+        reference: &[f32],
+        width: usize,
+        start_row: usize,
+        end_row: usize,
+    ) -> Result<(usize, f64, f64, usize, usize)> {
+        let (bar_max, _) = fp16_dit_bound();
+        ensure!(
+            width > 0 && end_row > start_row && end_row * width <= candidate.len(),
+            "edit part rows {start_row}..{end_row} width={width} len={}",
+            candidate.len()
+        );
+        let start = start_row * width;
+        let end = end_row * width;
+        let (max_abs, rmse) = image_max_rmse(&candidate[start..end], &reference[start..end])?;
+        let mut argmax_row = start_row;
+        let mut best = -1.0f64;
+        let mut above = 0usize;
+        for row in start_row..end_row {
+            let mut row_best = 0.0f64;
+            for k in 0..width {
+                let d = f64::from((candidate[row * width + k] - reference[row * width + k]).abs());
+                if d > bar_max {
+                    above += 1;
+                }
+                row_best = row_best.max(d);
+            }
+            if row_best > best {
+                best = row_best;
+                argmax_row = row;
+            }
+        }
+        Ok((end_row - start_row, max_abs, rmse, argmax_row, above))
+    }
+
+    struct RopeControl {
+        shift_max: f64,
+        shift_rmse: f64,
+        shift_vs_max: f64,
+        shift_vs_rmse: f64,
+        shift_changed_max: f64,
+        shift_changed_rmse: f64,
+        shift_changed_rows: usize,
+        control_max: f64,
+        control_rmse: f64,
+        versus_max: f64,
+        versus_rmse: f64,
+        control_changed_max: f64,
+        control_changed_rmse: f64,
+        control_changed_rows: usize,
+        sample_changed: bool,
+    }
+
     fn scored_image_tau(
         fp16: bool,
         name: &str,
@@ -14958,6 +15069,56 @@ mod tests {
         );
         assert_eq!(scored_image_tau(false, "dit_step0", 1.0, 0.1), (1.0, 0.1));
         assert_eq!(scored_image_tau(false, "dit_step5", 3.0, 0.3), (3.0, 0.3));
+    }
+
+    #[test]
+    fn fp16_rope_control_scores_changed_rows() {
+        let cell = IMAGE_DIT_512
+            .iter()
+            .find(|cell| cell.name == "dit_step0")
+            .expect("dit_step0");
+        let tau_max = image_dit_tau(cell.cross_max_abs);
+        let tau_rmse = image_dit_tau(cell.cross_rmse);
+        let width = 4usize;
+        let rows = 20usize;
+        let mut candidate = vec![0.0f32; rows * width];
+        let reference = vec![0.0f32; rows * width];
+        let mut changed = vec![false; rows];
+        changed[0] = true;
+        let spike = (tau_max + 1.0) as f32;
+        for value in &mut candidate[..width] {
+            *value = spike;
+        }
+        let (changed_max, changed_rmse, changed_rows) =
+            masked_row_distance(&candidate, &reference, width, &changed).expect("changed rows");
+        let (whole_max, whole_rmse) = image_max_rmse(&candidate, &reference).expect("whole tensor");
+        assert_eq!(changed_rows, 1);
+        assert!(changed_max > tau_max && changed_rmse > tau_rmse);
+        assert!(whole_rmse < fp16_dit_bound().1);
+        assert!(!fp16_rope_whole_tensor_separates(whole_max, whole_rmse));
+        assert!(fp16_rope_changed_rows_separate(
+            changed_max,
+            changed_rmse,
+            tau_max,
+            tau_rmse
+        ));
+        for value in &mut candidate[..width] {
+            *value = (tau_rmse * 0.5) as f32;
+        }
+        let (changed_max, changed_rmse, _) =
+            masked_row_distance(&candidate, &reference, width, &changed).expect("under tau");
+        assert!(!fp16_rope_changed_rows_separate(
+            changed_max,
+            changed_rmse,
+            tau_max,
+            tau_rmse
+        ));
+        let source = [[0.0, 1.0, 2.0], [0.0, 3.0, 3.0]];
+        let transposed = [[0.0, 2.0, 1.0], [0.0, 3.0, 3.0]];
+        assert_eq!(
+            velocity_rows_changed(&source, &transposed, &[0, 1]),
+            vec![true, false]
+        );
     }
 
     #[test]
@@ -15130,7 +15291,7 @@ mod tests {
     /// Every image row's `(h, w)` is swapped to `(w, h)`.
     /// On sm >= 80 the control bar is `3 * tau` against the BF16 reference.
     /// On sm < 80 a `dit_*` cell uses the prod64 floor. Euler stays on `image_dit_tau`.
-    /// On sm < 80 the transpose must differ from the unshifted candidate by more than that floor.
+    /// On `fp16_stored_half` both rope controls score rows whose `(h, w)` changed, against `image_dit_tau` of `dit_step0`.
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_H3_IMAGE, FF_H3_IMAGE_DEVICE0, FF_H3_PLACEMENT"]
     fn image_dit_512_matches_the_frozen_cells() -> Result<()> {
@@ -15288,17 +15449,7 @@ mod tests {
             Rc::new(Closure::new(true, "MiniMax-H3-Image DiT gate".into())),
         )?;
         let mut defects = Vec::new();
-        let (
-            shift_max,
-            shift_rmse,
-            shift_vs_max,
-            shift_vs_rmse,
-            control_max,
-            control_rmse,
-            versus_max,
-            versus_rmse,
-            sample_changed,
-        ) = {
+        let rope = {
             let table = AdalnTable::build(&device, &mut blas, &dir, &manifest, &spec, &t2i_plan)?;
             let mut dit = ImageDit::new(
                 &device,
@@ -15431,6 +15582,12 @@ mod tests {
             let (shift_vs_max, shift_vs_rmse) = image_max_rmse(&shift, &step0)?;
             let (control_max, control_rmse) = image_max_rmse(&control, &step0_ref)?;
             let (versus_max, versus_rmse) = image_max_rmse(&control, &step0)?;
+            let shift_rows = velocity_rows_changed(&source, &shifted_ids, image_at);
+            let transpose_rows = velocity_rows_changed(&source, &transposed_ids, image_at);
+            let (shift_changed_max, shift_changed_rmse, shift_changed_rows) =
+                masked_row_distance(&shift, &step0, width, &shift_rows)?;
+            let (control_changed_max, control_changed_rmse, control_changed_rows) =
+                masked_row_distance(&control, &step0, width, &transpose_rows)?;
             if placement == Placement::Derived {
                 drop(dit);
                 let mut streamed = ImageDit::new(
@@ -15495,17 +15652,23 @@ mod tests {
                     residual.len()
                 );
             }
-            (
+            RopeControl {
                 shift_max,
                 shift_rmse,
                 shift_vs_max,
                 shift_vs_rmse,
+                shift_changed_max,
+                shift_changed_rmse,
+                shift_changed_rows,
                 control_max,
                 control_rmse,
                 versus_max,
                 versus_rmse,
-                changed,
-            )
+                control_changed_max,
+                control_changed_rmse,
+                control_changed_rows,
+                sample_changed: changed,
+            }
         };
         {
             let table = AdalnTable::build(&device, &mut blas, &dir, &manifest, &spec, &edit_plan)?;
@@ -15591,42 +15754,95 @@ mod tests {
                     defects.push(name);
                 }
             }
+            let image_rows = edit_step_ref.len() / width;
+            ensure!(
+                edit_layout.reference_rows > 0 && edit_layout.reference_rows < image_rows,
+                "edit velocity split reference_rows={} image_rows={image_rows}",
+                edit_layout.reference_rows
+            );
+            for (part, start, end) in [
+                ("reference", 0, edit_layout.reference_rows),
+                ("generated", edit_layout.reference_rows, image_rows),
+            ] {
+                let (rows, max_abs, rmse, argmax_row, above4) =
+                    image_part_distance(&step0, &edit_step_ref, width, start, end)?;
+                println!(
+                    "H3_IMAGE_DIT dit_edit_step0_part {part} rows={rows} max_abs={max_abs:.8e} rmse={rmse:.8e} argmax_row={argmax_row} above4={above4}"
+                );
+            }
         }
         fs::remove_dir_all(&runtime)?;
         let step0_cell = IMAGE_DIT_512
             .iter()
             .find(|cell| cell.name == "dit_step0")
             .context("dit_step0")?;
+        let tau_max = image_dit_tau(step0_cell.cross_max_abs);
+        let tau_rmse = image_dit_tau(step0_cell.cross_rmse);
         let (bar_max, bar_rmse, shift_gt, caught) = if fp16 {
-            let (bar_max, bar_rmse) = fp16_dit_bound();
             (
-                bar_max,
-                bar_rmse,
-                shift_vs_max > bar_max && shift_vs_rmse > bar_rmse,
-                versus_max > bar_max && versus_rmse > bar_rmse,
+                tau_max,
+                tau_rmse,
+                fp16_rope_changed_rows_separate(
+                    rope.shift_changed_max,
+                    rope.shift_changed_rmse,
+                    tau_max,
+                    tau_rmse,
+                ),
+                fp16_rope_changed_rows_separate(
+                    rope.control_changed_max,
+                    rope.control_changed_rmse,
+                    tau_max,
+                    tau_rmse,
+                ),
             )
         } else {
-            let bar_max = 3.0 * image_dit_tau(step0_cell.cross_max_abs);
-            let bar_rmse = 3.0 * image_dit_tau(step0_cell.cross_rmse);
+            let bar_max = 3.0 * tau_max;
+            let bar_rmse = 3.0 * tau_rmse;
             (
                 bar_max,
                 bar_rmse,
-                shift_max > bar_max && shift_rmse > bar_rmse,
-                control_max > bar_max && control_rmse > bar_rmse,
+                rope.shift_max > bar_max && rope.shift_rmse > bar_rmse,
+                rope.control_max > bar_max && rope.control_rmse > bar_rmse,
             )
         };
         println!(
-            "H3_IMAGE_DIT rope_shift max_abs={shift_max:.8e} rmse={shift_rmse:.8e} vs_step0_max={shift_vs_max:.8e} vs_step0_rmse={shift_vs_rmse:.8e} bar_max={bar_max:.8e} bar_rmse={bar_rmse:.8e} gt={shift_gt} sample_changed={sample_changed}"
+            "H3_IMAGE_DIT rope_shift max_abs={:.8e} rmse={:.8e} vs_step0_max={:.8e} vs_step0_rmse={:.8e} changed_rows={} changed_max={:.8e} changed_rmse={:.8e} bar_max={bar_max:.8e} bar_rmse={bar_rmse:.8e} gt={shift_gt} sample_changed={}",
+            rope.shift_max,
+            rope.shift_rmse,
+            rope.shift_vs_max,
+            rope.shift_vs_rmse,
+            rope.shift_changed_rows,
+            rope.shift_changed_max,
+            rope.shift_changed_rmse,
+            rope.sample_changed
         );
         println!(
-            "H3_IMAGE_DIT rope_transpose max_abs={control_max:.8e} rmse={control_rmse:.8e} vs_step0_max={versus_max:.8e} vs_step0_rmse={versus_rmse:.8e} bar_max={bar_max:.8e} bar_rmse={bar_rmse:.8e} gt={caught} sample_changed={sample_changed}"
+            "H3_IMAGE_DIT rope_transpose max_abs={:.8e} rmse={:.8e} vs_step0_max={:.8e} vs_step0_rmse={:.8e} changed_rows={} changed_max={:.8e} changed_rmse={:.8e} bar_max={bar_max:.8e} bar_rmse={bar_rmse:.8e} gt={caught} sample_changed={}",
+            rope.control_max,
+            rope.control_rmse,
+            rope.versus_max,
+            rope.versus_rmse,
+            rope.control_changed_rows,
+            rope.control_changed_max,
+            rope.control_changed_rmse,
+            rope.sample_changed
         );
+        if fp16 {
+            ensure!(
+                shift_gt,
+                "rope-shift control stayed within the dit_step0 tau on changed rows"
+            );
+        }
         ensure!(
             caught,
             "rope-transpose control stayed within {}",
-            if fp16 { "the FP16 floor" } else { "3x tau" }
+            if fp16 {
+                "the dit_step0 tau on changed rows"
+            } else {
+                "3x tau"
+            }
         );
-        ensure!(sample_changed, "image sample left the input unchanged");
+        ensure!(rope.sample_changed, "image sample left the input unchanged");
         ensure!(
             defects.is_empty(),
             "H3_IMAGE_DIT_GATE DEFECT cells outside the frozen taus: {defects:?}"
