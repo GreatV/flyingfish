@@ -3621,6 +3621,13 @@ mod tests {
         Ok(())
     }
 
+    struct WideMats {
+        weight: Vec<half::bf16>,
+        x: Vec<half::bf16>,
+        weight_f32: Vec<f32>,
+        x_f32: Vec<f32>,
+    }
+
     struct WideCheck<'a> {
         blas: &'a Blas,
         stream: &'a Arc<CudaStream>,
@@ -3631,15 +3638,17 @@ mod tests {
     }
 
     impl WideCheck<'_> {
-        fn operands(
-            &self,
-            input: usize,
-        ) -> Result<(Vec<half::bf16>, Vec<half::bf16>, Vec<f32>, Vec<f32>)> {
+        fn operands(&self, input: usize) -> Result<WideMats> {
             let weight = fill_weight(self.output, input);
             let x = fill_x(self.rows, input);
             let weight_f32 = f32_of(&weight);
             let x_f32 = f32_of(&x);
-            Ok((weight, x, weight_f32, x_f32))
+            Ok(WideMats {
+                weight,
+                x,
+                weight_f32,
+                x_f32,
+            })
         }
 
         fn read_y(&self, y: &CudaSlice<f32>, label: &str, expected: &[f32]) -> Result<()> {
@@ -3654,10 +3663,10 @@ mod tests {
                 "f32_output_lt {label} rows={} output={}",
                 self.rows, self.output
             );
-            let (weight, x, weight_f32, x_f32) = self.operands(input)?;
+            let mats = self.operands(input)?;
             let expected = host_dot(
-                &weight_f32,
-                &x_f32,
+                &mats.weight_f32,
+                &mats.x_f32,
                 None,
                 Dot {
                     rows: self.rows,
@@ -3666,8 +3675,8 @@ mod tests {
                     scale: 1.0,
                 },
             );
-            let w = self.stream.clone_htod(&weight)?;
-            let xv = self.stream.clone_htod(&x)?;
+            let w = self.stream.clone_htod(&mats.weight)?;
+            let xv = self.stream.clone_htod(&mats.x)?;
             let mut y = self.stream.alloc_zeros::<f32>(self.rows * self.output)?;
             self.blas
                 .prepare_wide_f32(self.rows, self.output, input, false)?;
@@ -3689,10 +3698,10 @@ mod tests {
                 "f32_output_lt {label} rows={} output={}",
                 self.rows, self.output
             );
-            let (weight, x, weight_f32, x_f32) = self.operands(input)?;
+            let mats = self.operands(input)?;
             let expected = host_dot(
-                &weight_f32,
-                &x_f32,
+                &mats.weight_f32,
+                &mats.x_f32,
                 None,
                 Dot {
                     rows: self.rows,
@@ -3701,8 +3710,8 @@ mod tests {
                     scale: 0.5,
                 },
             );
-            let w = self.stream.clone_htod(&weight)?;
-            let xv = self.stream.clone_htod(&x)?;
+            let w = self.stream.clone_htod(&mats.weight)?;
+            let xv = self.stream.clone_htod(&mats.x)?;
             let mut y = self.stream.alloc_zeros::<f32>(self.rows * self.output)?;
             let alpha = self.stream.clone_htod(&[0.5f32])?;
             let beta = self.stream.clone_htod(&[0f32])?;
@@ -3734,10 +3743,10 @@ mod tests {
                 "f32_output_lt {label} rows={} output={}",
                 self.rows, self.output
             );
-            let (weight, x, weight_f32, x_f32) = self.operands(input)?;
+            let mats = self.operands(input)?;
             let expected = host_dot(
-                &weight_f32,
-                &x_f32,
+                &mats.weight_f32,
+                &mats.x_f32,
                 Some(bias_f32),
                 Dot {
                     rows: self.rows,
@@ -3746,8 +3755,8 @@ mod tests {
                     scale: 1.0,
                 },
             );
-            let w = self.stream.clone_htod(&weight)?;
-            let xv = self.stream.clone_htod(&x)?;
+            let w = self.stream.clone_htod(&mats.weight)?;
+            let xv = self.stream.clone_htod(&mats.x)?;
             let mut y = self.stream.alloc_zeros::<f32>(self.rows * self.output)?;
             println!(
                 "f32_output_lt step={step} prepare_biased_f32 rows={} output={} input={input}",
