@@ -3500,12 +3500,12 @@ mod tests {
         scale: f32,
     }
 
-    fn cycle(index: usize, step: usize) -> half::bf16 {
+    fn cycle(index: usize, step: usize) -> f32 {
         const VALUES: [f32; 4] = [0.5, 1.0, 2.0, -1.0];
-        half::bf16::from_f32(VALUES[(index * step) % 4])
+        VALUES[(index * step) % 4]
     }
 
-    fn fill_weight(output: usize, input: usize) -> Vec<half::bf16> {
+    fn fill_weight(output: usize, input: usize) -> Vec<f32> {
         let mut weight = Vec::with_capacity(output * input);
         for o in 0..output {
             for k in 0..input {
@@ -3515,7 +3515,7 @@ mod tests {
         weight
     }
 
-    fn fill_x(rows: usize, input: usize) -> Vec<half::bf16> {
+    fn fill_x(rows: usize, input: usize) -> Vec<f32> {
         let mut x = Vec::with_capacity(rows * input);
         for r in 0..rows {
             for k in 0..input {
@@ -3525,14 +3525,23 @@ mod tests {
         x
     }
 
-    fn fill_bias(output: usize) -> Vec<half::bf16> {
+    fn fill_bias(output: usize) -> Vec<f32> {
         (0..output)
-            .map(|o| half::bf16::from_f32(if o % 2 == 0 { 1.0 } else { -1.0 }))
+            .map(|o| if o % 2 == 0 { 1.0 } else { -1.0 })
             .collect()
     }
 
-    fn f32_of(src: &[half::bf16]) -> Vec<f32> {
-        src.iter().map(|value| value.to_f32()).collect()
+    /// Bit patterns in the device's stored half type.
+    fn stored(values: &[f32], half_dtype: sys::cudaDataType_t) -> Vec<half::bf16> {
+        values
+            .iter()
+            .map(|&value| match half_dtype {
+                sys::cudaDataType_t::CUDA_R_16F => {
+                    half::bf16::from_bits(f16::from_f32(value).to_bits())
+                }
+                _ => half::bf16::from_f32(value),
+            })
+            .collect()
     }
 
     fn host_dot(weight: &[f32], x: &[f32], bias: Option<&[f32]>, dot: Dot) -> Vec<f32> {
@@ -3639,13 +3648,11 @@ mod tests {
 
     impl WideCheck<'_> {
         fn operands(&self, input: usize) -> Result<WideMats> {
-            let weight = fill_weight(self.output, input);
-            let x = fill_x(self.rows, input);
-            let weight_f32 = f32_of(&weight);
-            let x_f32 = f32_of(&x);
+            let weight_f32 = fill_weight(self.output, input);
+            let x_f32 = fill_x(self.rows, input);
             Ok(WideMats {
-                weight,
-                x,
+                weight: stored(&weight_f32, self.blas.half_dtype),
+                x: stored(&x_f32, self.blas.half_dtype),
                 weight_f32,
                 x_f32,
             })
@@ -3835,9 +3842,8 @@ mod tests {
         };
         check.host(7168)?;
         check.device(14336)?;
-        let bias_host = fill_bias(OUTPUT);
-        let bias_f32 = f32_of(&bias_host);
-        let bias_dev = stream.clone_htod(&bias_host)?;
+        let bias_f32 = fill_bias(OUTPUT);
+        let bias_dev = stream.clone_htod(&stored(&bias_f32, blas.half_dtype))?;
         check.biased(&bias_dev, &bias_f32, 7168, 3)?;
         check.biased(&bias_dev, &bias_f32, 5120, 4)?;
         Ok(())
