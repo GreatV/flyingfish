@@ -333,7 +333,9 @@ mod tests {
         let a4000 = mock_device_info(86, 48, 4 << 20, 101_376);
         let a4000_large_l2 = mock_device_info(86, 48, 40 << 20, 101_376);
         let rtx4090 = mock_device_info(89, 128, 72 << 20, 101_376);
+        let rtx4090_low_smem = mock_device_info(89, 128, 72 << 20, 32_768);
         let l4 = mock_device_info(89, 58, 48 << 20, 101_376);
+        let h100 = mock_device_info(90, 132, 50 << 20, 232_448);
         let g4 = mock_device_info(120, 188, 128 << 20, 101_376);
         let t4 = mock_device_info(75, 40, 40 << 20, 65_536);
         let gfx1100 = mock_hip_device_info("gfx1100", 48, 6 << 20, 65_536);
@@ -435,6 +437,10 @@ mod tests {
             gate_up_products(&a100, 1, [5678, 39_740], gate_up),
             [NFast; 2]
         );
+        assert_eq!(
+            gate_up_products(&a100, 1, [37_717, 128], gate_up),
+            [NFast; 2]
+        );
         assert_eq!(gate_up_products(&a100, 1, [128, 129], gate_up), [NFast; 2]);
         assert_eq!(
             gate_up_products(&a100, 1, [128, 513], gate_up),
@@ -453,8 +459,56 @@ mod tests {
             [NFast, MFastLdsm]
         );
         assert_eq!(
-            gate_up_products(&rtx4090, 1, [9935, 39_740], gate_up),
+            gate_up_products(&a4000_large_l2, 1, [1509, 37_717], gate_up),
+            [
+                MFastLdsm,
+                MFastStriped {
+                    tiles: 17,
+                    stripes: 18,
+                    one_barrier: false,
+                }
+            ]
+        );
+        assert_eq!(
+            gate_up_products(&l4, 1, [1509, 37_717], gate_up),
+            [
+                MFastLdsm,
+                MFastStriped {
+                    tiles: 23,
+                    stripes: 13,
+                    one_barrier: false,
+                }
+            ]
+        );
+        assert_eq!(
+            gate_up_products(&h100, 1, [1509, 37_717], gate_up),
             [MFastLdsm, NFast]
+        );
+        assert_eq!(
+            gate_up_products(&rtx4090, 1, [9935, 39_740], gate_up),
+            [
+                MFastLdsm,
+                MFastStriped {
+                    tiles: 32,
+                    stripes: 10,
+                    one_barrier: false,
+                }
+            ]
+        );
+        assert_eq!(
+            gate_up_products(&rtx4090, 1, [37_717, 0], gate_up),
+            [
+                MFastStriped {
+                    tiles: 30,
+                    stripes: 10,
+                    one_barrier: false,
+                },
+                NFast
+            ]
+        );
+        assert_eq!(
+            gate_up_products(&rtx4090_low_smem, 1, [9935, 37_717], gate_up),
+            [NFast; 2]
         );
         assert_eq!(
             gate_up_products(&g4, 1, [9935, 37_717], gate_up),
@@ -467,7 +521,10 @@ mod tests {
                 }
             ]
         );
-        assert_eq!(gate_up_products(&t4, 1, [1509, 1501], gate_up), [NFast; 2]);
+        assert_eq!(
+            gate_up_products(&t4, 1, [1509, 37_717], gate_up),
+            [NFast; 2]
+        );
         assert_eq!(
             gate_up_products(&gfx1100, 2, [1509, 1501], gate_up),
             [NFast; 2]
@@ -780,16 +837,6 @@ fn arch_supported(arch: &crate::backend::setup::DeviceArchitecture) -> bool {
 }
 
 #[cfg(any(test, feature = "cuda", feature = "rocm"))]
-fn arch_supports_striped(arch: &crate::backend::setup::DeviceArchitecture) -> bool {
-    use crate::backend::setup::DeviceArchitecture::{Cuda, Hip};
-    match arch {
-        Cuda(120) => true,
-        Hip(gfx) => gfx.starts_with("gfx11"),
-        _ => false,
-    }
-}
-
-#[cfg(any(test, feature = "cuda", feature = "rocm"))]
 pub(crate) fn qkv_product_eligible(
     info: &crate::backend::setup::DeviceInfo,
     rows: usize,
@@ -838,7 +885,7 @@ fn gate_up_products(
         if working_set(rows, m_tiles) < l2 {
             return ProductKernel::MFastLdsm;
         }
-        if arch_supports_striped(&info.arch) && rows.saturating_mul(k) > l2 {
+        if rows.saturating_mul(k) > l2 {
             for stripes in 2..=m_tiles.min(u16::MAX as usize) {
                 let tiles = m_tiles.div_ceil(stripes);
                 if tiles < 2 || tiles * n_tiles < wave {
@@ -1113,16 +1160,17 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
         product_function(&module, &arch, ProductKernel::MFastLdsm)?,
         product_function(&module, &arch, ProductKernel::NFastLdsm)?,
     ];
-    let striped = {
+    let (striped, sm120_binary) = {
         #[cfg(feature = "cuda")]
         {
-            product[1].get_attribute(
+            let version = product[1].get_attribute(
                 cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_BINARY_VERSION,
-            )? == 120
+            )?;
+            (version >= 80, version == 120)
         }
         #[cfg(feature = "rocm")]
         {
-            ctx.architecture().starts_with("gfx11")
+            (ctx.architecture().starts_with("gfx11"), false)
         }
     };
     let hadamard = module.load_function("convrot_hadamard_table")?;
@@ -1145,7 +1193,8 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
     let quantize = module.load_function("convrot_quantize")?;
     let quant_dyn = u32::try_from(optin / 4 * 4).context("convrot quantize opt-in")?;
     crate::backend::cuda::set_max_dynamic_shared_bytes(&quantize, quant_dyn)?;
-    let n_fast_swizzled = (arch == crate::backend::setup::DeviceArchitecture::Cuda(120) && striped)
+    let n_fast_swizzled = (arch == crate::backend::setup::DeviceArchitecture::Cuda(120)
+        && sm120_binary)
         .then(|| product_function(&module, &arch, ProductKernel::NFastSwizzled))
         .transpose()?;
     let m_fast_one_barrier = if n_fast_swizzled.is_some() {
@@ -2961,7 +3010,14 @@ mod device {
 
     fn check_gate_up_stripes(device: &Device) -> Result<()> {
         let (rows, k, n) = (37_717, 5376, 28_672);
+        let active = super::product_active_ctas(device, ProductKernel::MFastLdsm)?;
+        let expected = super::gate_up_products(&device.info, active, [rows, 0], (k, n))[0];
         let [selected, _] = super::gate_up_product_order(device, [rows, 0], (k, n))?;
+        ensure!(
+            selected == expected,
+            "gate/up stripe selection mismatch on {}: got {selected:?} expected {expected:?}",
+            device.info.arch
+        );
         let forced = match selected {
             ProductKernel::MFastStriped { .. } => false,
             _ if matches!(&device.info.arch, crate::backend::setup::DeviceArchitecture::Hip(gfx) if gfx.starts_with("gfx11")) => {
@@ -3232,6 +3288,12 @@ mod device {
                     imma == 32 && lds == want_lds && ldsm == want_ldsm && barriers == 2,
                     "sm_{sm} {name} IMMA={imma} LDS={lds} LDSM={ldsm} BAR={barriers}"
                 );
+                if name == "convrot_product_m_fast" {
+                    ensure!(
+                        body.contains("SR_CTAID.Z"),
+                        "sm_{sm} {name} missing SR_CTAID.Z stripe index"
+                    );
+                }
                 let ldg = body.matches("LDG.E.CONSTANT").count();
                 ensure!(ldg == 20, "sm_{sm} {name} scale LDG.E.CONSTANT {ldg}");
                 ensure!(
