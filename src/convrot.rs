@@ -558,14 +558,50 @@ mod tests {
         let gfx1100_low_smem = mock_hip_device_info("gfx1100", 48, 40 << 20, 32_768);
         let gfx1030 = mock_hip_device_info("gfx1030", 48, 40 << 20, 65_536);
 
-        assert_eq!(ProductKernel::NFast.symbol_name(), "convrot_product");
         assert_eq!(
-            ProductKernel::MFastLdsm.symbol_name(),
+            ProductKernel::NFast.symbol_name_for(&rtx4090.arch),
+            "convrot_product"
+        );
+        assert_eq!(
+            ProductKernel::NFastLdsm.symbol_name_for(&rtx4090.arch),
+            "convrot_product_n_fast_ldsm"
+        );
+        for (stages, symbol, smem) in [
+            (2u8, "convrot_product_m_fast_s2", 49_152u32),
+            (3u8, "convrot_product_m_fast_s3", 73_728u32),
+            (4u8, "convrot_product_m_fast_s4", 98_304u32),
+        ] {
+            let kernel = ProductKernel::MFastLdsm { stages };
+            assert_eq!(kernel.symbol_name_for(&rtx4090.arch), symbol);
+            assert_eq!(kernel.shared_mem_bytes(&rtx4090.arch), smem);
+            assert_eq!(kernel.symbol_name_for(&a100.arch), symbol);
+            assert_eq!(kernel.symbol_name_for(&h100.arch), symbol);
+        }
+        assert_eq!(
+            ProductKernel::MFastLdsm { stages: 2 }.symbol_name_for(&g4.arch),
             "convrot_product_m_fast"
         );
         assert_eq!(
-            ProductKernel::NFastLdsm.symbol_name(),
-            "convrot_product_n_fast_ldsm"
+            ProductKernel::MFastStriped {
+                tiles: 59,
+                stripes: 5,
+                one_barrier: true,
+                stages: 2,
+            }
+            .symbol_name_for(&g4.arch),
+            "convrot_product_m_fast_one_barrier"
+        );
+        assert_eq!(
+            ProductKernel::MFastLdsm { stages: 2 }.symbol_name_for(&gfx1100.arch),
+            "convrot_product_m_fast"
+        );
+        assert_eq!(
+            ProductKernel::MFastLdsm { stages: 2 }.shared_mem_bytes(&gfx1100.arch),
+            32_768
+        );
+        assert_eq!(
+            ProductKernel::MFastLdsm { stages: 2 }.tile_dims(&gfx1100.arch),
+            (128, 128)
         );
         for (stages, symbol, smem) in [
             (2u8, "convrot_product_n_fast_swizzled", 49_152u32),
@@ -573,34 +609,22 @@ mod tests {
             (4u8, "convrot_product_n_fast_swizzled_s4", 98_304u32),
         ] {
             let kernel = ProductKernel::NFastSwizzled { stages };
-            assert_eq!(kernel.symbol_name(), symbol);
+            assert_eq!(kernel.symbol_name_for(&rtx4090.arch), symbol);
             assert_eq!(kernel.shared_mem_bytes(&rtx4090.arch), smem);
             assert_eq!(kernel.shared_mem_bytes(&gfx1100.arch), 49_152);
             assert_eq!(kernel.tile_dims(&gfx1100.arch), (128, 256));
         }
         assert_eq!(ProductKernel::NFast.shared_mem_bytes(&rtx4090.arch), 61_440);
         assert_eq!(
-            ProductKernel::MFastLdsm.shared_mem_bytes(&rtx4090.arch),
-            49_152
-        );
-        assert_eq!(
             ProductKernel::NFastLdsm.shared_mem_bytes(&rtx4090.arch),
             61_440
         );
         assert_eq!(ProductKernel::NFast.shared_mem_bytes(&gfx1100.arch), 32_768);
         assert_eq!(
-            ProductKernel::MFastLdsm.shared_mem_bytes(&gfx1100.arch),
-            32_768
-        );
-        assert_eq!(
             ProductKernel::NFastLdsm.shared_mem_bytes(&gfx1100.arch),
             49_152
         );
         assert_eq!(ProductKernel::NFast.tile_dims(&gfx1100.arch), (128, 128));
-        assert_eq!(
-            ProductKernel::MFastLdsm.tile_dims(&gfx1100.arch),
-            (128, 128)
-        );
         assert_eq!(
             ProductKernel::NFastLdsm.tile_dims(&gfx1100.arch),
             (128, 256)
@@ -657,128 +681,169 @@ mod tests {
             None
         );
 
+        for info in [&a100, &a4000, &l4, &rtx4090, &h100] {
+            assert_eq!(super::m_fast_stage(info), Some(4));
+        }
+        assert_eq!(super::m_fast_stage(&optin_72k), Some(3));
+        assert_eq!(super::m_fast_stage(&low_smem), Some(2));
+        assert_eq!(super::m_fast_stage(&g4), Some(2));
+        assert_eq!(super::m_fast_stage(&gfx1100), Some(2));
+        assert_eq!(super::m_fast_stage(&gfx1100_low_smem), Some(2));
+        assert_eq!(
+            super::m_fast_stage(&mock_hip_device_info("gfx1100", 48, 40 << 20, 32_767)),
+            None
+        );
+        assert_eq!(super::m_fast_stage(&rtx4090_low_smem), None);
+        assert_eq!(super::m_fast_stage(&t4), None);
+        assert_eq!(super::m_fast_stage(&gfx1030), None);
+
         let gate_up = (5376, 28_672);
         assert_eq!(
-            gate_up_products(&a100, 1, [1509, 1501], gate_up),
-            [MFastLdsm; 2]
+            gate_up_products(&a100, 1, [1509, 1501], gate_up, 4),
+            [MFastLdsm { stages: 4 }; 2]
         );
         assert_eq!(
-            gate_up_products(&a100, 1, [3057, 5400], gate_up),
-            [MFastLdsm; 2]
+            gate_up_products(&a100, 1, [3057, 5400], gate_up, 4),
+            [MFastLdsm { stages: 4 }; 2]
         );
         assert_eq!(
-            gate_up_products(&a100, 1, [5678, 39_740], gate_up),
+            gate_up_products(&a100, 1, [5678, 39_740], gate_up, 4),
             [NFast; 2]
         );
         assert_eq!(
-            gate_up_products(&a100, 1, [37_717, 128], gate_up),
-            [NFast; 2]
-        );
-        assert_eq!(gate_up_products(&a100, 1, [128, 129], gate_up), [NFast; 2]);
-        assert_eq!(
-            gate_up_products(&a100, 1, [128, 513], gate_up),
-            [NFast, MFastLdsm]
-        );
-        assert_eq!(
-            gate_up_products(&a4000, 1, [1509, 1501], gate_up),
+            gate_up_products(&a100, 1, [37_717, 128], gate_up, 4),
             [NFast; 2]
         );
         assert_eq!(
-            gate_up_products(&a4000, 1, [256, 37_717], gate_up),
+            gate_up_products(&a100, 1, [128, 129], gate_up, 4),
             [NFast; 2]
         );
         assert_eq!(
-            gate_up_products(&a4000_large_l2, 1, [128, 129], gate_up),
-            [NFast, MFastLdsm]
+            gate_up_products(&a100, 1, [128, 513], gate_up, 4),
+            [NFast, MFastLdsm { stages: 4 }]
         );
         assert_eq!(
-            gate_up_products(&a4000_large_l2, 1, [1509, 37_717], gate_up),
+            gate_up_products(&a4000, 1, [1509, 1501], gate_up, 4),
+            [NFast; 2]
+        );
+        assert_eq!(
+            gate_up_products(&a4000, 1, [256, 37_717], gate_up, 4),
+            [NFast; 2]
+        );
+        assert_eq!(
+            gate_up_products(&a4000_large_l2, 1, [128, 129], gate_up, 4),
+            [NFast, MFastLdsm { stages: 4 }]
+        );
+        assert_eq!(
+            gate_up_products(&a4000_large_l2, 1, [1509, 37_717], gate_up, 4),
             [
-                MFastLdsm,
+                MFastLdsm { stages: 4 },
                 MFastStriped {
                     tiles: 17,
                     stripes: 18,
                     one_barrier: false,
+                    stages: 4,
                 }
             ]
         );
         assert_eq!(
-            gate_up_products(&l4, 1, [1509, 37_717], gate_up),
+            gate_up_products(&l4, 1, [1509, 37_717], gate_up, 4),
             [
-                MFastLdsm,
+                MFastLdsm { stages: 4 },
                 MFastStriped {
                     tiles: 23,
                     stripes: 13,
                     one_barrier: false,
+                    stages: 4,
                 }
             ]
         );
         assert_eq!(
-            gate_up_products(&h100, 1, [1509, 37_717], gate_up),
-            [MFastLdsm, NFast]
+            gate_up_products(&h100, 1, [1509, 37_717], gate_up, 4),
+            [MFastLdsm { stages: 4 }, NFast]
         );
         assert_eq!(
-            gate_up_products(&rtx4090, 1, [9935, 39_740], gate_up),
+            gate_up_products(&rtx4090, 1, [9935, 39_740], gate_up, 4),
             [
-                MFastLdsm,
+                MFastLdsm { stages: 4 },
                 MFastStriped {
                     tiles: 32,
                     stripes: 10,
                     one_barrier: false,
+                    stages: 4,
                 }
             ]
         );
         assert_eq!(
-            gate_up_products(&rtx4090, 1, [37_717, 0], gate_up),
+            gate_up_products(&rtx4090, 1, [37_717, 0], gate_up, 4),
             [
                 MFastStriped {
                     tiles: 30,
                     stripes: 10,
                     one_barrier: false,
+                    stages: 4,
                 },
                 NFast
             ]
         );
         assert_eq!(
-            gate_up_products(&rtx4090_low_smem, 1, [9935, 37_717], gate_up),
+            gate_up_products(&optin_72k, 1, [37_717, 0], gate_up, 3),
+            [
+                MFastStriped {
+                    tiles: 30,
+                    stripes: 10,
+                    one_barrier: false,
+                    stages: 3,
+                },
+                NFast
+            ]
+        );
+        assert_eq!(
+            gate_up_products(&low_smem, 1, [1509, 1501], gate_up, 2),
+            [MFastLdsm { stages: 2 }; 2]
+        );
+        assert_eq!(
+            gate_up_products(&rtx4090_low_smem, 1, [9935, 37_717], gate_up, 2),
             [NFast; 2]
         );
         assert_eq!(
-            gate_up_products(&g4, 1, [9935, 37_717], gate_up),
+            gate_up_products(&g4, 1, [9935, 37_717], gate_up, 2),
             [
-                MFastLdsm,
+                MFastLdsm { stages: 2 },
                 MFastStriped {
                     tiles: 59,
                     stripes: 5,
                     one_barrier: true,
+                    stages: 2,
                 }
             ]
         );
         assert_eq!(
-            gate_up_products(&t4, 1, [1509, 37_717], gate_up),
+            gate_up_products(&t4, 1, [1509, 37_717], gate_up, 2),
             [NFast; 2]
         );
         assert_eq!(
-            gate_up_products(&gfx1100, 2, [1509, 1501], gate_up),
+            gate_up_products(&gfx1100, 2, [1509, 1501], gate_up, 2),
             [NFast; 2]
         );
         assert_eq!(
-            gate_up_products(&gfx1100, 2, [9935, 37_717], gate_up),
+            gate_up_products(&gfx1100, 2, [9935, 37_717], gate_up, 2),
             [NFast; 2]
         );
         assert_eq!(
-            gate_up_products(&gfx1100_large_l2, 2, [1509, 37_717], gate_up),
+            gate_up_products(&gfx1100_large_l2, 2, [1509, 37_717], gate_up, 2),
             [
-                MFastLdsm,
+                MFastLdsm { stages: 2 },
                 MFastStriped {
                     tiles: 19,
                     stripes: 16,
                     one_barrier: false,
+                    stages: 2,
                 }
             ]
         );
         assert_eq!(
-            gate_up_products(&gfx1030, 2, [1509, 37_717], gate_up),
+            gate_up_products(&gfx1030, 2, [1509, 37_717], gate_up, 2),
             [NFast; 2]
         );
     }
@@ -873,9 +938,10 @@ pub struct ConvrotFns {
     fwht_smem: [crate::backend::gpu::CudaFunction; 2],
     #[cfg(test)]
     fwht_probe: [crate::backend::gpu::CudaFunction; 3],
-    product: [crate::backend::gpu::CudaFunction; 3],
+    product: [crate::backend::gpu::CudaFunction; 2],
     arch: crate::backend::setup::DeviceArchitecture,
     striped: bool,
+    m_fast: [Option<crate::backend::gpu::CudaFunction>; 3],
     m_fast_one_barrier: Option<crate::backend::gpu::CudaFunction>,
     n_fast_swizzled: [Option<crate::backend::gpu::CudaFunction>; 3],
     optin: usize,
@@ -885,11 +951,14 @@ pub struct ConvrotFns {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProductKernel {
     NFast,
-    MFastLdsm,
+    MFastLdsm {
+        stages: u8,
+    },
     MFastStriped {
         tiles: u32,
         stripes: u32,
         one_barrier: bool,
+        stages: u8,
     },
     NFastLdsm,
     NFastSwizzled {
@@ -919,12 +988,13 @@ impl ProductKernel {
     fn shared_mem_bytes(self, arch: &crate::backend::setup::DeviceArchitecture) -> u32 {
         match arch {
             crate::backend::setup::DeviceArchitecture::Cuda(_) => match self {
-                Self::MFastLdsm | Self::MFastStriped { .. } => 49_152,
-                Self::NFastSwizzled { stages } => u32::from(stages) * 24_576,
+                Self::MFastLdsm { stages }
+                | Self::MFastStriped { stages, .. }
+                | Self::NFastSwizzled { stages } => u32::from(stages) * 24_576,
                 Self::NFast | Self::NFastLdsm => 61_440,
             },
             crate::backend::setup::DeviceArchitecture::Hip(_) => match self {
-                Self::NFast | Self::MFastLdsm | Self::MFastStriped { .. } => 32_768,
+                Self::NFast | Self::MFastLdsm { .. } | Self::MFastStriped { .. } => 32_768,
                 Self::NFastLdsm | Self::NFastSwizzled { .. } => 49_152,
             },
         }
@@ -934,7 +1004,7 @@ impl ProductKernel {
         match arch {
             crate::backend::setup::DeviceArchitecture::Cuda(_) => (128, 256),
             crate::backend::setup::DeviceArchitecture::Hip(_) => match self {
-                Self::NFast | Self::MFastLdsm | Self::MFastStriped { .. } => (128, 128),
+                Self::NFast | Self::MFastLdsm { .. } | Self::MFastStriped { .. } => (128, 128),
                 Self::NFastLdsm | Self::NFastSwizzled { .. } => (128, 256),
             },
         }
@@ -945,7 +1015,7 @@ impl ProductKernel {
         match arch {
             crate::backend::setup::DeviceArchitecture::Cuda(_) => 512,
             crate::backend::setup::DeviceArchitecture::Hip(_) => match self {
-                Self::NFast | Self::MFastLdsm | Self::MFastStriped { .. } => 256,
+                Self::NFast | Self::MFastLdsm { .. } | Self::MFastStriped { .. } => 256,
                 Self::NFastLdsm | Self::NFastSwizzled { .. } => 512,
             },
         }
@@ -956,7 +1026,7 @@ impl ProductKernel {
         match arch {
             crate::backend::setup::DeviceArchitecture::Cuda(_) => (124, 1),
             crate::backend::setup::DeviceArchitecture::Hip(_) => match self {
-                Self::NFast | Self::MFastLdsm | Self::MFastStriped { .. } => (216, 2),
+                Self::NFast | Self::MFastLdsm { .. } | Self::MFastStriped { .. } => (216, 2),
                 Self::NFastLdsm | Self::NFastSwizzled { .. } => (216, 1),
             },
         }
@@ -964,13 +1034,31 @@ impl ProductKernel {
 
     const ONE_BARRIER_SYMBOL: &'static str = "convrot_product_m_fast_one_barrier";
 
-    pub(crate) const fn symbol_name(self) -> &'static str {
+    /// Kernel entry symbol for `arch`.
+    pub(crate) fn symbol_name_for(
+        self,
+        arch: &crate::backend::setup::DeviceArchitecture,
+    ) -> &'static str {
         match self {
             Self::NFast => "convrot_product",
             Self::MFastStriped {
                 one_barrier: true, ..
             } => Self::ONE_BARRIER_SYMBOL,
-            Self::MFastLdsm | Self::MFastStriped { .. } => "convrot_product_m_fast",
+            Self::MFastLdsm { stages } | Self::MFastStriped { stages, .. } => match arch {
+                crate::backend::setup::DeviceArchitecture::Cuda(sm) if (80..120).contains(sm) => {
+                    match stages {
+                        2 => "convrot_product_m_fast_s2",
+                        3 => "convrot_product_m_fast_s3",
+                        4 => "convrot_product_m_fast_s4",
+                        _ => "convrot_product_m_fast_unsupported",
+                    }
+                }
+                crate::backend::setup::DeviceArchitecture::Cuda(120)
+                | crate::backend::setup::DeviceArchitecture::Hip(_) => "convrot_product_m_fast",
+                crate::backend::setup::DeviceArchitecture::Cuda(_) => {
+                    "convrot_product_m_fast_unsupported"
+                }
+            },
             Self::NFastLdsm => "convrot_product_n_fast_ldsm",
             Self::NFastSwizzled { stages: 2 } => "convrot_product_n_fast_swizzled",
             Self::NFastSwizzled { stages: 3 } => "convrot_product_n_fast_swizzled_s3",
@@ -1003,24 +1091,45 @@ pub(crate) fn qkv_product_eligible(
         && k.saturating_mul(n) <= info.l2_bytes
 }
 
+/// Maximum M-fast pipeline stages fitting `info.optin_shared_bytes` (`2..=4` on CUDA sm80..90, `2` on sm120/gfx11).
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+pub(crate) fn m_fast_stage(info: &crate::backend::setup::DeviceInfo) -> Option<u8> {
+    use crate::backend::setup::DeviceArchitecture::Cuda;
+    if info.warp != 32 || info.sms == 0 {
+        return None;
+    }
+    match &info.arch {
+        Cuda(sm) if (80..120).contains(sm) => [4u8, 3, 2].into_iter().find(|&stages| {
+            info.optin_shared_bytes
+                >= ProductKernel::MFastLdsm { stages }.shared_mem_bytes(&info.arch) as usize
+        }),
+        arch if arch_supported(arch) => (info.optin_shared_bytes
+            >= ProductKernel::MFastLdsm { stages: 2 }.shared_mem_bytes(arch) as usize)
+            .then_some(2),
+        _ => None,
+    }
+}
+
 #[cfg(any(test, feature = "cuda", feature = "rocm"))]
 fn gate_up_products(
     info: &crate::backend::setup::DeviceInfo,
     active_ctas: usize,
     row_counts: [usize; 2],
     (k, n): (usize, usize),
+    stages: u8,
 ) -> [ProductKernel; 2] {
     let l2 = info.l2_bytes;
+    let ldsm = ProductKernel::MFastLdsm { stages };
     if !arch_supported(&info.arch)
         || info.warp != 32
-        || info.optin_shared_bytes < ProductKernel::MFastLdsm.shared_mem_bytes(&info.arch) as usize
+        || info.optin_shared_bytes < ldsm.shared_mem_bytes(&info.arch) as usize
         || active_ctas == 0
         || n.saturating_mul(k) <= l2
     {
         return [ProductKernel::NFast; 2];
     }
     let wave = info.sms * active_ctas;
-    let (bm_u32, bn_u32) = ProductKernel::MFastLdsm.tile_dims(&info.arch);
+    let (bm_u32, bn_u32) = ldsm.tile_dims(&info.arch);
     let (bm, bn) = (bm_u32 as usize, bn_u32 as usize);
     let n_tiles = n.div_ceil(bn);
     let working_set = |rows: usize, m_tiles: usize| {
@@ -1036,7 +1145,7 @@ fn gate_up_products(
             return ProductKernel::NFast;
         }
         if working_set(rows, m_tiles) < l2 {
-            return ProductKernel::MFastLdsm;
+            return ldsm;
         }
         if rows.saturating_mul(k) > l2 {
             for stripes in 2..=m_tiles.min(u16::MAX as usize) {
@@ -1053,6 +1162,7 @@ fn gate_up_products(
                             == crate::backend::setup::DeviceArchitecture::Cuda(120)
                             && (rows, k, n, tiles, m_tiles.div_ceil(tiles))
                                 == (37_717, 5376, 28_672, 59, 5),
+                        stages,
                     };
                 }
             }
@@ -1106,19 +1216,31 @@ fn active_blocks(
     }
 }
 
+/// Validates stage count (`2..=4`) for pipelined ConvRot product variants.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+fn validate_product_stages(product: ProductKernel) -> Result<()> {
+    match product {
+        ProductKernel::MFastLdsm { stages }
+        | ProductKernel::MFastStriped { stages, .. }
+        | ProductKernel::NFastSwizzled { stages } => {
+            ensure!(
+                matches!(stages, 2..=4),
+                "ConvRot {product:?} supports 2..=4 stages, got {stages}"
+            );
+        }
+        ProductKernel::NFast | ProductKernel::NFastLdsm => {}
+    }
+    Ok(())
+}
+
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 fn product_function(
     module: &std::sync::Arc<crate::backend::gpu::CudaModule>,
     arch: &crate::backend::setup::DeviceArchitecture,
     product: ProductKernel,
 ) -> Result<crate::backend::gpu::CudaFunction> {
-    if let ProductKernel::NFastSwizzled { stages } = product {
-        ensure!(
-            matches!(stages, 2..=4),
-            "ConvRot N-fast swizzled supports 2..=4 stages, got {stages}"
-        );
-    }
-    let function = module.load_function(product.symbol_name())?;
+    validate_product_stages(product)?;
+    let function = module.load_function(product.symbol_name_for(arch))?;
     crate::backend::cuda::set_max_dynamic_shared_bytes(&function, product.shared_mem_bytes(arch))?;
     Ok(function)
 }
@@ -1130,27 +1252,21 @@ fn probe_product_stage(
 ) -> Result<std::result::Result<usize, String>> {
     let arch = &device.info.arch;
     let smem = product.shared_mem_bytes(arch) as usize;
+    let symbol = product.symbol_name_for(arch);
     ensure!(
         arch_supported(arch) && device.info.warp == 32,
-        "ConvRot {} requires supported warp32 arch (arch={} warp={})",
-        product.symbol_name(),
+        "ConvRot {symbol} requires supported warp32 arch (arch={} warp={})",
         device.info.arch,
         device.info.warp,
     );
-    if let ProductKernel::NFastSwizzled { stages } = product {
-        ensure!(
-            matches!(stages, 2..=4),
-            "ConvRot N-fast swizzled supports 2..=4 stages, got {stages}"
-        );
-    }
+    validate_product_stages(product)?;
     let module = crate::backend::cuda::cubin::module(&device.ctx, "convrot")?;
-    let function = module.load_function(product.symbol_name())?;
+    let function = module.load_function(symbol)?;
     let (regs, local, static_smem) = function_attributes(&function)?;
     let (max_regs, min_ctas) = product.resource_limits(arch);
     ensure!(
         regs <= max_regs && local == 0,
-        "ConvRot {} regs={regs} (limit {max_regs}) local={local}",
-        product.symbol_name()
+        "ConvRot {symbol} regs={regs} (limit {max_regs}) local={local}"
     );
     let total_smem = static_smem
         .checked_add(smem)
@@ -1170,8 +1286,7 @@ fn probe_product_stage(
     }
     if crate::backend::diagnostics_enabled() {
         eprintln!(
-            "CONVROT_PRODUCT_RESOURCE kernel={} regs={regs} local={local} static_smem={static_smem} dynamic_smem={smem} active_ctas={active}",
-            product.symbol_name()
+            "CONVROT_PRODUCT_RESOURCE kernel={symbol} regs={regs} local={local} static_smem={static_smem} dynamic_smem={smem} active_ctas={active}"
         );
     }
     Ok(Ok(usize::try_from(active)?))
@@ -1182,8 +1297,12 @@ pub(crate) fn product_active_ctas(
     device: &crate::backend::cuda::Device,
     product: ProductKernel,
 ) -> Result<usize> {
-    probe_product_stage(device, product)?
-        .map_err(|reason| anyhow::anyhow!("ConvRot {} {reason}", product.symbol_name()))
+    probe_product_stage(device, product)?.map_err(|reason| {
+        anyhow::anyhow!(
+            "ConvRot {} {reason}",
+            product.symbol_name_for(&device.info.arch)
+        )
+    })
 }
 
 #[cfg(any(test, feature = "cuda", feature = "rocm"))]
@@ -1223,7 +1342,7 @@ pub(crate) fn n_fast_product(
                 Err(reason) if crate::backend::diagnostics_enabled() => {
                     eprintln!(
                         "CONVROT_N_FAST_DECLINE kernel={} reason={reason}",
-                        kernel.symbol_name()
+                        kernel.symbol_name_for(&info.arch)
                     );
                 }
                 Err(_) => {}
@@ -1249,31 +1368,50 @@ pub(crate) fn gate_up_product_order(
     (k, n): (usize, usize),
 ) -> Result<[ProductKernel; 2]> {
     let info = &device.info;
-    let selected = if arch_supported(&info.arch)
-        && info.warp == 32
-        && info.optin_shared_bytes >= ProductKernel::MFastLdsm.shared_mem_bytes(&info.arch) as usize
-        && n.saturating_mul(k) > info.l2_bytes
+    let mut selected = [ProductKernel::NFast; 2];
+    if n.saturating_mul(k) > info.l2_bytes
+        && let Some(max_stages) = m_fast_stage(info)
     {
-        let active = product_active_ctas(device, ProductKernel::MFastLdsm)?;
-        let selected = gate_up_products(info, active, row_counts, (k, n));
-        if let Some(&kernel) = selected.iter().find(|p| {
-            matches!(
-                p,
-                ProductKernel::MFastStriped {
-                    one_barrier: true,
-                    ..
+        let stages_to_try: &[u8] = if matches!(
+            info.arch,
+            crate::backend::setup::DeviceArchitecture::Cuda(sm) if (80..120).contains(&sm)
+        ) {
+            &[4, 3, 2]
+        } else {
+            &[2]
+        };
+        for &stages in stages_to_try.iter().filter(|&&s| s <= max_stages) {
+            let probe = ProductKernel::MFastLdsm { stages };
+            match probe_product_stage(device, probe)? {
+                Ok(active) => {
+                    let candidate = gate_up_products(info, active, row_counts, (k, n), stages);
+                    if let Some(&kernel) = candidate.iter().find(|p| {
+                        matches!(
+                            p,
+                            ProductKernel::MFastStriped {
+                                one_barrier: true,
+                                ..
+                            }
+                        )
+                    }) {
+                        ensure!(
+                            product_active_ctas(device, kernel)? == active,
+                            "one-barrier stripe residency changed"
+                        );
+                    }
+                    selected = candidate;
+                    break;
                 }
-            )
-        }) {
-            ensure!(
-                product_active_ctas(device, kernel)? == active,
-                "one-barrier stripe residency changed"
-            );
+                Err(reason) if crate::backend::diagnostics_enabled() => {
+                    eprintln!(
+                        "CONVROT_M_FAST_DECLINE kernel={} reason={reason}",
+                        probe.symbol_name_for(&info.arch)
+                    );
+                }
+                Err(_) => {}
+            }
         }
-        selected
-    } else {
-        [ProductKernel::NFast; 2]
-    };
+    }
     if crate::backend::diagnostics_enabled() {
         eprintln!(
             "CONVROT_GATE_UP_SELECT row_counts={row_counts:?} k={k} n={n} l2_bytes={} products={selected:?}",
@@ -1386,6 +1524,47 @@ pub(crate) fn derive_rotate_plan(
     Ok(plan)
 }
 
+/// Loads and validates one staged product kernel when `optin` fits static + dynamic shared memory.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+fn load_staged_slot(
+    module: &std::sync::Arc<crate::backend::gpu::CudaModule>,
+    arch: &crate::backend::setup::DeviceArchitecture,
+    optin: usize,
+    kernel: ProductKernel,
+) -> Result<Option<crate::backend::gpu::CudaFunction>> {
+    let symbol = kernel.symbol_name_for(arch);
+    let function = module.load_function(symbol)?;
+    let (regs, local, static_smem) = function_attributes(&function)?;
+    let (max_regs, _) = kernel.resource_limits(arch);
+    ensure!(
+        regs <= max_regs && local == 0,
+        "ConvRot {symbol} regs={regs} local={local}"
+    );
+    let needed = static_smem
+        .checked_add(kernel.shared_mem_bytes(arch) as usize)
+        .context("ConvRot shared memory extent overflow")?;
+    if optin < needed {
+        return Ok(None);
+    }
+    crate::backend::cuda::set_max_dynamic_shared_bytes(&function, kernel.shared_mem_bytes(arch))?;
+    Ok(Some(function))
+}
+
+/// Loads the `2..=4`-stage family produced by `make_kernel`.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+fn load_staged_products(
+    module: &std::sync::Arc<crate::backend::gpu::CudaModule>,
+    arch: &crate::backend::setup::DeviceArchitecture,
+    optin: usize,
+    make_kernel: impl Fn(u8) -> ProductKernel,
+) -> Result<[Option<crate::backend::gpu::CudaFunction>; 3]> {
+    let mut slots = [None, None, None];
+    for (slot, stages) in slots.iter_mut().zip([2u8, 3, 4]) {
+        *slot = load_staged_slot(module, arch, optin, make_kernel(stages))?;
+    }
+    Ok(slots)
+}
+
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> Result<ConvrotFns> {
     #[cfg(feature = "rocm")]
@@ -1405,13 +1584,12 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
     let module = crate::backend::cuda::cubin::module(ctx, "convrot")?;
     let product = [
         product_function(&module, &arch, ProductKernel::NFast)?,
-        product_function(&module, &arch, ProductKernel::MFastLdsm)?,
         product_function(&module, &arch, ProductKernel::NFastLdsm)?,
     ];
     let (striped, sm120_binary) = {
         #[cfg(feature = "cuda")]
         {
-            let version = product[1].get_attribute(
+            let version = product[0].get_attribute(
                 cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_BINARY_VERSION,
             )?;
             ensure!(version > 0, "corrupt ConvRot binary version {version}");
@@ -1453,6 +1631,32 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
             smem,
         ]
     };
+    let m_fast = match &arch {
+        crate::backend::setup::DeviceArchitecture::Cuda(sm)
+            if (80..120).contains(sm) && striped =>
+        {
+            load_staged_products(&module, &arch, optin, |stages| ProductKernel::MFastLdsm {
+                stages,
+            })?
+        }
+        other
+            if (other == &crate::backend::setup::DeviceArchitecture::Cuda(120) && sm120_binary)
+                || (matches!(other, crate::backend::setup::DeviceArchitecture::Hip(gfx) if gfx.starts_with("gfx11"))
+                    && striped) =>
+        {
+            [
+                load_staged_slot(
+                    &module,
+                    &arch,
+                    optin,
+                    ProductKernel::MFastLdsm { stages: 2 },
+                )?,
+                None,
+                None,
+            ]
+        }
+        _ => [None, None, None],
+    };
     let n_fast_swizzled = {
         #[cfg(feature = "cuda")]
         {
@@ -1461,29 +1665,9 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
                 crate::backend::setup::DeviceArchitecture::Cuda(sm) if sm >= 80
             ) && striped
             {
-                let mut slots = [None, None, None];
-                for (slot, stages) in slots.iter_mut().zip([2u8, 3, 4]) {
-                    let kernel = ProductKernel::NFastSwizzled { stages };
-                    let function = module.load_function(kernel.symbol_name())?;
-                    let (regs, local, static_smem) = function_attributes(&function)?;
-                    let (max_regs, _) = kernel.resource_limits(&arch);
-                    ensure!(
-                        regs <= max_regs && local == 0,
-                        "ConvRot {} regs={regs} local={local}",
-                        kernel.symbol_name()
-                    );
-                    let needed = static_smem
-                        .checked_add(kernel.shared_mem_bytes(&arch) as usize)
-                        .context("ConvRot shared memory extent overflow")?;
-                    if optin >= needed {
-                        crate::backend::cuda::set_max_dynamic_shared_bytes(
-                            &function,
-                            kernel.shared_mem_bytes(&arch),
-                        )?;
-                        *slot = Some(function);
-                    }
-                }
-                slots
+                load_staged_products(&module, &arch, optin, |stages| {
+                    ProductKernel::NFastSwizzled { stages }
+                })?
             } else {
                 [None, None, None]
             }
@@ -1498,7 +1682,7 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
             let f = module.load_function(ProductKernel::ONE_BARRIER_SYMBOL)?;
             crate::backend::cuda::set_max_dynamic_shared_bytes(
                 &f,
-                ProductKernel::MFastLdsm.shared_mem_bytes(&arch),
+                ProductKernel::MFastLdsm { stages: 2 }.shared_mem_bytes(&arch),
             )?;
             Some(f)
         } else {
@@ -1512,6 +1696,7 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
         fwht_probe,
         arch,
         striped,
+        m_fast,
         n_fast_swizzled,
         m_fast_one_barrier,
         product,
@@ -1570,6 +1755,21 @@ fn launch_rows(
     Ok(())
 }
 
+/// Resolves a `2..=4`-stage function slot from `slots`.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+fn staged_product_kernel<'a>(
+    slots: &'a [Option<crate::backend::gpu::CudaFunction>; 3],
+    stages: u8,
+    kind: &str,
+    arch: &crate::backend::setup::DeviceArchitecture,
+) -> Result<&'a crate::backend::gpu::CudaFunction> {
+    let idx = usize::from(stages.checked_sub(2).context("pipelined stage count")?);
+    slots
+        .get(idx)
+        .and_then(|slot| slot.as_ref())
+        .with_context(|| format!("{kind} product stages={stages} unavailable on {arch}"))
+}
+
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) fn launch_product(
     stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
@@ -1586,11 +1786,15 @@ pub(crate) fn launch_product(
     let n = (args.n as u32).div_ceil(bn);
     let (product, grid) = match args.product {
         ProductKernel::NFast => (&fns.product[0], (n, m, 1)),
-        ProductKernel::MFastLdsm => (&fns.product[1], (m, n, 1)),
+        ProductKernel::MFastLdsm { stages } => (
+            staged_product_kernel(&fns.m_fast, stages, "M-fast", &fns.arch)?,
+            (m, n, 1),
+        ),
         ProductKernel::MFastStriped {
             tiles,
             stripes,
             one_barrier,
+            stages,
         } => {
             ensure!(
                 fns.striped && tiles > 0 && tiles <= m && stripes == m.div_ceil(tiles),
@@ -1602,29 +1806,15 @@ pub(crate) fn launch_product(
                     .as_ref()
                     .context("one-barrier product requires sm120")?
             } else {
-                &fns.product[1]
+                staged_product_kernel(&fns.m_fast, stages, "M-fast", &fns.arch)?
             };
             (kernel, (tiles, n, stripes))
         }
-        ProductKernel::NFastLdsm => (&fns.product[2], (n, m, 1)),
-        ProductKernel::NFastSwizzled { stages } => {
-            let idx = usize::from(
-                stages
-                    .checked_sub(2)
-                    .context("swizzled N-fast stage count")?,
-            );
-            let kernel = fns
-                .n_fast_swizzled
-                .get(idx)
-                .and_then(|slot| slot.as_ref())
-                .with_context(|| {
-                    format!(
-                        "swizzled N-fast product stages={stages} unavailable on {}",
-                        fns.arch
-                    )
-                })?;
-            (kernel, (n, m, 1))
-        }
+        ProductKernel::NFastLdsm => (&fns.product[1], (n, m, 1)),
+        ProductKernel::NFastSwizzled { stages } => (
+            staged_product_kernel(&fns.n_fast_swizzled, stages, "swizzled N-fast", &fns.arch)?,
+            (n, m, 1),
+        ),
     };
     unsafe {
         stream
@@ -2830,6 +3020,7 @@ mod device {
                     tiles: 1,
                     stripes,
                     one_barrier,
+                    stages: 2,
                 };
                 for flag in [false, true] {
                     let output = launch_product_at(
@@ -2868,8 +3059,19 @@ mod device {
 
     fn check_gate_up_product(device: &Device) -> Result<()> {
         let (rows, k, n) = (1509, 5376, 28672);
-        let active = super::product_active_ctas(device, ProductKernel::MFastLdsm)?;
-        let expected_order = super::gate_up_products(&device.info, active, [rows, 1501], (k, n));
+        let Some(stages) = super::m_fast_stage(&device.info) else {
+            ensure!(
+                super::gate_up_product_order(device, [rows, 1501], (k, n))?
+                    == [ProductKernel::NFast; 2],
+                "gate/up M-fast enabled without stage support on {}",
+                device.info.arch
+            );
+            return Ok(());
+        };
+        let m_fast_kernel = ProductKernel::MFastLdsm { stages };
+        let active = super::product_active_ctas(device, m_fast_kernel)?;
+        let expected_order =
+            super::gate_up_products(&device.info, active, [rows, 1501], (k, n), stages);
         ensure!(
             super::gate_up_product_order(device, [rows, 1501], (k, n))? == expected_order,
             "gate/up M-fast selection mismatch on {}",
@@ -2893,7 +3095,7 @@ mod device {
                     0,
                     0,
                     if m_fast {
-                        ProductKernel::MFastLdsm
+                        m_fast_kernel
                     } else {
                         ProductKernel::NFast
                     },
@@ -2918,7 +3120,7 @@ mod device {
             &qweight,
             &shifted,
             k,
-            (0, 0, ProductKernel::MFastLdsm),
+            (0, 0, m_fast_kernel),
         )?;
         ensure!(output.len() == rows * n, "convrot gate/up control extent");
         let differing = diff(&output);
@@ -2970,16 +3172,21 @@ mod device {
     }
 
     #[cfg(feature = "cuda")]
-    fn check_n_fast_swizzle_short_k(device: &Device, max_stage: u8) -> Result<()> {
+    fn check_pipelined_short_k(
+        device: &Device,
+        max_stage: u8,
+        mut make_kernel: impl FnMut(u8, usize) -> ProductKernel,
+    ) -> Result<()> {
         for stages in 2u8..=max_stage {
-            let kernel = ProductKernel::NFastSwizzled { stages };
             for (rows, k, n) in [
                 (85, 64, 500),
                 (85, 128, 499),
                 (85, 128, 500),
                 (85, 192, 500),
+                (257, 384, 512),
                 (1100, 384, 500),
             ] {
+                let kernel = make_kernel(stages, rows);
                 let (mut codes, scales, qweight, wscale) = fixture(rows, k, n);
                 let reference = launch_product_at(
                     device,
@@ -3040,7 +3247,32 @@ mod device {
         }
         let max_stage = super::n_fast_swizzle_stage(&device.info, 37_717, (5376, 7168))
             .context("expected swizzled N-fast stage on sm>=80")?;
-        check_n_fast_swizzle_short_k(&device, max_stage)
+        check_pipelined_short_k(&device, max_stage, |stages, _| {
+            ProductKernel::NFastSwizzled { stages }
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a reserved sm80..sm90 GPU window; small fixture for compute-sanitizer"]
+    fn convrot_m_fast_racecheck_small_gpu() -> Result<()> {
+        let device = Device::new(0)?;
+        if !matches!(
+            device.info.arch,
+            crate::backend::setup::DeviceArchitecture::Cuda(sm) if (80..120).contains(&sm)
+        ) {
+            return Ok(());
+        }
+        let max_stage = super::m_fast_stage(&device.info)
+            .context("expected pipelined M-fast stage on sm80..90")?;
+        check_pipelined_short_k(&device, max_stage, |stages, rows| {
+            ProductKernel::MFastStriped {
+                tiles: 1,
+                stripes: u32::try_from(rows.div_ceil(128)).unwrap(),
+                one_barrier: false,
+                stages,
+            }
+        })
     }
 
     #[cfg(feature = "cuda")]
@@ -3056,7 +3288,9 @@ mod device {
         }
         let max_stage = super::n_fast_swizzle_stage(&device.info, 37_717, (5376, 7168))
             .context("expected swizzled N-fast stage on sm>=80")?;
-        check_n_fast_swizzle_short_k(&device, max_stage)?;
+        check_pipelined_short_k(&device, max_stage, |stages, _| {
+            ProductKernel::NFastSwizzled { stages }
+        })?;
         for (role, rows, k, n, salt, baseline) in [
             ("q", 37_717, 5376, 7168, 0, ProductKernel::NFastLdsm),
             ("k", 37_717, 5376, 7168, 1, ProductKernel::NFastLdsm),
@@ -3079,9 +3313,27 @@ mod device {
     }
 
     fn check_gate_up_stripes(device: &Device) -> Result<()> {
+        let Some(stages) = super::m_fast_stage(&device.info) else {
+            return Ok(());
+        };
+        #[cfg(feature = "cuda")]
+        if matches!(
+            device.info.arch,
+            crate::backend::setup::DeviceArchitecture::Cuda(sm) if (80..120).contains(&sm)
+        ) {
+            check_pipelined_short_k(device, stages, |s, _| ProductKernel::MFastLdsm {
+                stages: s,
+            })?;
+            check_pipelined_short_k(device, stages, |s, r| ProductKernel::MFastStriped {
+                tiles: 1,
+                stripes: u32::try_from(r.div_ceil(128)).expect("stripes"),
+                one_barrier: false,
+                stages: s,
+            })?;
+        }
         let (rows, k, n) = (37_717, 5376, 28_672);
-        let active = super::product_active_ctas(device, ProductKernel::MFastLdsm)?;
-        let expected = super::gate_up_products(&device.info, active, [rows, 0], (k, n))[0];
+        let active = super::product_active_ctas(device, ProductKernel::MFastLdsm { stages })?;
+        let expected = super::gate_up_products(&device.info, active, [rows, 0], (k, n), stages)[0];
         let [selected, _] = super::gate_up_product_order(device, [rows, 0], (k, n))?;
         ensure!(
             selected == expected,
@@ -3100,6 +3352,7 @@ mod device {
                 tiles: 59,
                 stripes: 5,
                 one_barrier: false,
+                stages,
             }
         } else {
             selected
@@ -3120,6 +3373,7 @@ mod device {
                 tiles,
                 stripes,
                 one_barrier: false,
+                stages,
             };
             for order in [baseline, product] {
                 let output = launch_product_at(
@@ -3150,6 +3404,7 @@ mod device {
                 tiles: 60,
                 stripes: 5,
                 one_barrier: false,
+                stages,
             }
         } else {
             super::gate_up_product_order(device, [padded_rows, 0], (k, n))?[0]
@@ -3176,6 +3431,10 @@ mod device {
         let device = Device::new(0)?;
         check_gate_up_product(&device)?;
         check_gate_up_stripes(&device)?;
+        let mut products = vec![ProductKernel::NFast, ProductKernel::NFastLdsm];
+        if let Some(stages) = super::m_fast_stage(&device.info) {
+            products.push(ProductKernel::MFastLdsm { stages });
+        }
         for rows in [17usize, 20, 42] {
             for n in [2usize, 40] {
                 let k = 256usize;
@@ -3187,11 +3446,7 @@ mod device {
                     host_diff == 0,
                     "host product rows={rows} n={n} differ {host_diff}"
                 );
-                for product in [
-                    ProductKernel::NFast,
-                    ProductKernel::MFastLdsm,
-                    ProductKernel::NFastLdsm,
-                ] {
+                for &product in &products {
                     let got = launch_product_at(
                         &device,
                         &codes,
@@ -3204,12 +3459,12 @@ mod device {
                     let differ = bit_diff(&got, &host);
                     println!(
                         "CONVROT_PRODUCT kernel={} rows={rows} k={k} n={n} differ={differ}",
-                        product.symbol_name()
+                        product.symbol_name_for(&device.info.arch)
                     );
                     ensure!(
                         differ == 0,
                         "convrot product kernel={} rows={rows} n={n} differ {differ}",
-                        product.symbol_name()
+                        product.symbol_name_for(&device.info.arch)
                     );
                 }
             }
@@ -3326,18 +3581,50 @@ mod device {
                 resources.status
             );
             let mut kernels = vec![
-                ("convrot_product", 54, 0),
-                ("convrot_product_m_fast", 6, 12),
-                ("convrot_product_n_fast_ldsm", 6, 12),
+                ("convrot_product", 54, 0, 2),
+                ("convrot_product_n_fast_ldsm", 6, 12, 2),
             ];
-            if sm >= 80 {
+            let mut absent = Vec::new();
+            if sm == 120 {
+                kernels.push(("convrot_product_m_fast", 6, 12, 2));
+                absent.extend_from_slice(&[
+                    "convrot_product_m_fast_s2",
+                    "convrot_product_m_fast_s3",
+                    "convrot_product_m_fast_s4",
+                ]);
+            } else if sm >= 80 {
                 kernels.extend_from_slice(&[
-                    ("convrot_product_n_fast_swizzled", 6, 12),
-                    ("convrot_product_n_fast_swizzled_s3", 6, 12),
-                    ("convrot_product_n_fast_swizzled_s4", 6, 12),
+                    ("convrot_product_m_fast_s2", 6, 12, 6),
+                    ("convrot_product_m_fast_s3", 6, 12, 4),
+                    ("convrot_product_m_fast_s4", 6, 12, 4),
+                ]);
+                absent.extend_from_slice(&[
+                    "convrot_product_m_fast",
+                    "convrot_product_m_fast_one_barrier",
+                ]);
+            } else {
+                absent.extend_from_slice(&[
+                    "convrot_product_m_fast",
+                    "convrot_product_m_fast_one_barrier",
+                    "convrot_product_m_fast_s2",
+                    "convrot_product_m_fast_s3",
+                    "convrot_product_m_fast_s4",
                 ]);
             }
-            for (name, want_lds, want_ldsm) in kernels {
+            if sm >= 80 {
+                kernels.extend_from_slice(&[
+                    ("convrot_product_n_fast_swizzled", 6, 12, 2),
+                    ("convrot_product_n_fast_swizzled_s3", 6, 12, 2),
+                    ("convrot_product_n_fast_swizzled_s4", 6, 12, 2),
+                ]);
+            }
+            for name in absent {
+                ensure!(
+                    function_sass(&text, name).is_none(),
+                    "sm_{sm} unexpectedly contains unreachable {name}"
+                );
+            }
+            for (name, want_lds, want_ldsm, want_bars) in kernels {
                 let body = function_sass(&text, name)
                     .with_context(|| format!("{name} missing from cuobjdump"))?;
                 let ops = sass_ops(body);
@@ -3372,13 +3659,21 @@ mod device {
                     continue;
                 }
                 ensure!(
-                    imma == 32 && lds == want_lds && ldsm == want_ldsm && barriers == 2,
+                    imma == 32 && lds == want_lds && ldsm == want_ldsm && barriers == want_bars,
                     "sm_{sm} {name} IMMA={imma} LDS={lds} LDSM={ldsm} BAR={barriers}"
                 );
-                if name == "convrot_product_m_fast" {
+                if name.starts_with("convrot_product_m_fast") {
                     ensure!(
                         body.contains("SR_CTAID.Z"),
                         "sm_{sm} {name} missing SR_CTAID.Z stripe index"
+                    );
+                }
+                if name.starts_with("convrot_product_m_fast_s") {
+                    let stg128 = count("STG.E.128");
+                    let lds128 = count("LDS.128");
+                    ensure!(
+                        stg128 == 8 && lds128 == 8,
+                        "sm_{sm} {name} STG128={stg128} LDS128={lds128}"
                     );
                 }
                 let ldg = body.matches("LDG.E.CONSTANT").count();

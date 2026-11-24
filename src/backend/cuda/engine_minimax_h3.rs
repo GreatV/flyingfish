@@ -5863,7 +5863,7 @@ fn bind_video_ffn(
                     "CONVROT_QKV_PRODUCT_SELECT rows={} k={h} n={width} l2_bytes={} kernel={}",
                     work.rows,
                     d.info.l2_bytes,
-                    work.qkv_product.symbol_name()
+                    work.qkv_product.symbol_name_for(&d.info.arch)
                 );
                 eprintln!(
                     "CONVROT_N_FAST_PRODUCTS out={:?} down={:?}",
