@@ -1302,6 +1302,10 @@ fn ffn_projection_family(base_family: bool, index: usize) -> bool {
     index >= 2 || base_family
 }
 
+fn qualification_plan_family(base_family: bool, ff_in: bool) -> bool {
+    ff_in && base_family
+}
+
 #[derive(Clone, Copy, Debug)]
 struct FfnPlan {
     chunk: usize,
@@ -5744,6 +5748,7 @@ impl Dit {
                 copies,
                 &table.blocks,
                 (role == FF_IN).then_some(work.rows % work.chunk),
+                qualification_plan_family(blas.bf16_row_family(), role == FF_IN),
             )
         };
         let q = matrix(&work.q_raw, stream, work.rows, work.q_raw.len() / work.rows)?;
@@ -8491,6 +8496,9 @@ mod tests {
             if index >= 2 { family_ws } else { row_ws }
         };
         assert!(priced(true, 0) > old(0) && priced(true, 1) > old(1));
+        assert!(qualification_plan_family(true, true));
+        assert!(!qualification_plan_family(true, false));
+        assert!(!qualification_plan_family(false, true));
         assert!(
             FfnPlan::select(
                 &[FfnPlan {
@@ -17674,6 +17682,140 @@ mod tests {
             Ok(())
         })();
         let cleanup = std::fs::remove_dir_all(runtime);
+        result?;
+        cleanup?;
+        Ok(())
+    }
+
+    /// Resident non-HyperFlow video setup qualifies FF_IN against the prepared family plan.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_LORA"]
+    fn video_ff_in_qualification_uses_the_family_plan() -> Result<()> {
+        use crate::backend::setup::LinearShape;
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let path = |key: &str| {
+            std::env::var_os(key)
+                .map(PathBuf::from)
+                .with_context(|| format!("{key} missing"))
+        };
+        let model = path("FF_MODEL")?;
+        let lora_path = path("FF_H3_LORA")?;
+        let spec = H3Spec::read(&model)?;
+        ensure!(!spec.is_hyperflow()?, "non-HyperFlow video");
+        let geometry = Geometry::resolve(&spec, 768, 1344, 124)?;
+        let text = vec![TEXT_TAG; 4];
+        let layout = PackedLayout::build(&spec, &geometry, &text, &[KeyframeAnchor::First])?;
+        let rows = layout.rows();
+        let initial = ffn_chunk(rows);
+        let output = 2 * spec.ffn;
+        let comparison = rows * spec.heads * spec.head_dim;
+        let fit = |chunk: usize| {
+            let tail = rows % chunk;
+            let ff_in = chunk * output;
+            let tail_elements = tail * output;
+            let fits = ff_in <= comparison && (tail == 0 || tail_elements <= comparison);
+            (tail, ff_in, fits)
+        };
+        let (tail, ff_in, fits) = fit(initial);
+        println!(
+            "H3_VIDEO_GATE_QUALIFY rows={rows} chunk={initial} tail={tail} ff_in_elements={ff_in} comparison_elements={comparison} fits={fits}"
+        );
+        let transformer = model.join("transformer");
+        let base_checkpoint =
+            MappedCheckpoint::open_component(&transformer, "diffusion_pytorch_model")?;
+        let manifest = base_checkpoint.minimax_h3_manifest(&spec)?;
+        let lora_dir = lora_path.parent().context("LoRA directory")?.to_owned();
+        let stem = lora_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".safetensors"))
+            .context("LoRA file stem")?;
+        let lora_checkpoint = MappedCheckpoint::open_component(&lora_dir, stem)?;
+        let (lora_manifest, adapter) = lora_checkpoint.minimax_h3_lora_manifest(&spec)?;
+        let video_grid = Schedule::new(9, 6.0)?;
+        let audio_grid = Schedule::new(9, 3.0)?;
+        let plan = row_timestep_plan(&layout, &video_grid, &audio_grid)?;
+        let adaln_plan = AdalnPlan::build(&layout, &plan)?;
+        let device = Device::new(0)?;
+        ensure!(
+            !device.info.arch.fp16_stored_half(),
+            "BF16 CUDA qualification"
+        );
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let runtime =
+            std::env::temp_dir().join(format!("ff-h3-video-qualify-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let result = (|| -> Result<()> {
+            let mut blas = open_blas(
+                &device,
+                &ops,
+                &runtime,
+                Rc::new(Closure::new(true, "MiniMax-H3 video qualify".into())),
+            )?;
+            ensure!(blas.bf16_row_family(), "base FFN row family");
+            let table = AdalnTable::build(
+                &device,
+                &mut blas,
+                &transformer,
+                &manifest,
+                &spec,
+                &adaln_plan,
+            )?;
+            let visits = crate::prefill::placement_visits(plan.len(), 1)?;
+            let dit = crate::backend::with_verbose(true, || {
+                Dit::new(
+                    &device,
+                    &mut blas,
+                    &spec,
+                    (adapter.rank, &layout, &table),
+                    Source::new(&transformer, &manifest, device.info.arch.fp16_stored_half()),
+                    Some(Source::new(
+                        &lora_dir,
+                        &lora_manifest,
+                        device.info.arch.fp16_stored_half(),
+                    )),
+                    (Placement::Derived, visits),
+                )
+            })?;
+            let chunk = dit.work.chunk;
+            let (tail, ff_in, fits) = fit(chunk);
+            println!(
+                "H3_VIDEO_GATE_QUALIFY rows={} chunk={chunk} tail={tail} ff_in_elements={ff_in} comparison_elements={comparison} fits={fits}",
+                dit.work.rows
+            );
+            ensure!(
+                dit.work.rows == rows && fits,
+                "FF_IN qualify skipped for lack of comparison buffer"
+            );
+            let shape = |rows| LinearShape {
+                rows,
+                output,
+                input: spec.hidden,
+            };
+            ensure!(
+                blas.dense_parent_count(shape(chunk), true) == 1,
+                "family gate/up parent missing"
+            );
+            ensure!(
+                blas.dense_parent_count(shape(chunk), false) == 0,
+                "ordinary gate/up parent was prepared"
+            );
+            if tail > 0 {
+                ensure!(
+                    blas.dense_parent_count(shape(tail), true) == 1
+                        && blas.dense_parent_count(shape(tail), false) == 0,
+                    "tail family parent missing or ordinary tail parent prepared"
+                );
+            }
+            println!("H3_VIDEO_GATE_QUALIFY PASS family_parent=1 ordinary_parent=0");
+            Ok(())
+        })();
+        let cleanup = fs::remove_dir_all(&runtime);
         result?;
         cleanup?;
         Ok(())

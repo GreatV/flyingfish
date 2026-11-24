@@ -699,6 +699,7 @@ impl Blas {
         copies: [Tensor<bf16, 2>; 2],
         source: &cudarc::driver::CudaSlice<bf16>,
         ffn_tail: Option<usize>,
+        family: bool,
     ) -> Result<()> {
         use crate::backend::cuda::contracts::no_overlap;
         let setup_start = std::time::Instant::now();
@@ -740,73 +741,76 @@ impl Blas {
             "dense Lt calibration inside stream capture"
         );
         self.closure.require_setup()?;
-        let key = (shape.rows, shape.output, shape.input, 0, false);
-        let mut plans = self.plans.borrow_mut();
-        let plan = plans
-            .get_mut(&key)
-            .context("dense Lt projection lacks an incumbent")?;
-        let desc = Descriptor {
-            key: self.calibration.key.clone(),
-            sm: super::cubin::capability(self.stream.context())?,
-            shape,
-            alignment: operands.alignments(),
-            workspace: self.workspace_bytes(),
-            ffn_tail,
-        };
-        let (choice, filled) = desc.selection(self.calibration.runtime(), || {
-            let bytes = input
-                .span_bytes
-                .min(u64::from(input.shape[0]) * u64::from(input.shape[1]) * 2)
-                as usize;
-            let (src, _guard) = source.device_ptr(&self.stream);
-            let source_bytes = std::mem::size_of::<bf16>() * source.len();
-            ensure!(source_bytes > 0, "dense setup activation is empty");
-            for at in (0..bytes).step_by(source_bytes) {
-                unsafe {
-                    cudarc::driver::result::memcpy_dtod_async(
-                        input.ptr + at as u64,
-                        src,
-                        source_bytes.min(bytes - at),
-                        self.stream.cu_stream(),
-                    )?;
+        let key = (shape.rows, shape.output, shape.input, 0, family);
+        let algo = {
+            let mut plans = self.plans.borrow_mut();
+            let plan = plans
+                .get_mut(&key)
+                .context("dense Lt projection lacks an incumbent")?;
+            let desc = Descriptor {
+                key: self.calibration.key.clone(),
+                sm: super::cubin::capability(self.stream.context())?,
+                shape,
+                alignment: operands.alignments(),
+                workspace: self.workspace_bytes(),
+                ffn_tail,
+            };
+            let (choice, filled) = desc.selection(self.calibration.runtime(), || {
+                let bytes = input
+                    .span_bytes
+                    .min(u64::from(input.shape[0]) * u64::from(input.shape[1]) * 2)
+                    as usize;
+                let (src, _guard) = source.device_ptr(&self.stream);
+                let source_bytes = std::mem::size_of::<bf16>() * source.len();
+                ensure!(source_bytes > 0, "dense setup activation is empty");
+                for at in (0..bytes).step_by(source_bytes) {
+                    unsafe {
+                        cudarc::driver::result::memcpy_dtod_async(
+                            input.ptr + at as u64,
+                            src,
+                            source_bytes.min(bytes - at),
+                            self.stream.cu_stream(),
+                        )?;
+                    }
                 }
-            }
-            self.fill_dense(plan, desc.clone(), &operands, copies.map(|t| t.ptr))
-        })?;
-        let algo = self.restore_dense_algo(choice.algorithm)?;
-        let bound = Plan::build(
-            self.handle,
-            (shape.rows, shape.output, shape.input, shape.input),
-            desc.workspace,
-            None,
-            super::PlanOperands {
-                ab: self.half_dtype,
-                c: self.half_dtype,
-                device_alpha: false,
-            },
-            super::PlanAlgo::Fixed(algo),
-        )?;
-        ensure!(
-            bound.workspace == choice.required_workspace,
-            "dense Lt cache workspace recheck differs"
-        );
-        if crate::backend::diagnostics_enabled() {
-            eprintln!(
-                "{}",
-                serde_json::json!({"dense_lt":{"filled":filled,"setup_seconds":setup_start.elapsed().as_secs_f64(),"selection":choice}})
+                self.fill_dense(plan, desc.clone(), &operands, copies.map(|t| t.ptr))
+            })?;
+            let algo = self.restore_dense_algo(choice.algorithm)?;
+            let bound = Plan::build(
+                self.handle,
+                (shape.rows, shape.output, shape.input, shape.input),
+                desc.workspace,
+                None,
+                super::PlanOperands {
+                    ab: self.half_dtype,
+                    c: self.half_dtype,
+                    device_alpha: false,
+                },
+                super::PlanAlgo::Fixed(algo),
+            )?;
+            ensure!(
+                bound.workspace == choice.required_workspace,
+                "dense Lt cache workspace recheck differs"
             );
-        }
-        let (family_output, family_input) = (shape.output, shape.input);
-        let original = std::mem::replace(plan, bound);
-        #[cfg(test)]
-        self.dense_parents
-            .borrow_mut()
-            .insert((shape, false), original);
-        #[cfg(not(test))]
-        drop(original);
-        drop(plans);
+            if crate::backend::diagnostics_enabled() {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"dense_lt":{"filled":filled,"setup_seconds":setup_start.elapsed().as_secs_f64(),"selection":choice}})
+                );
+            }
+            if !family {
+                let original = std::mem::replace(plan, bound);
+                #[cfg(test)]
+                self.dense_parents
+                    .borrow_mut()
+                    .insert((shape, false), original);
+                #[cfg(not(test))]
+                drop(original);
+            }
+            algo
+        };
         if adopt_gate {
-            self.adopt_qualified_gate_family(family_output, family_input, algo)?;
+            self.adopt_qualified_gate_family(shape.output, shape.input, algo)?;
         }
         Ok(())
     }
@@ -823,6 +827,11 @@ impl Blas {
             std::mem::swap(current, old);
         }
         Ok(parents.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dense_parent_count(&self, shape: LinearShape, family: bool) -> usize {
+        usize::from(self.dense_parents.borrow().contains_key(&(shape, family)))
     }
 
     #[cfg(test)]
