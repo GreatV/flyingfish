@@ -324,7 +324,7 @@ fn write_png_color(
 }
 
 pub fn write_wav(
-    mut writer: impl Write,
+    writer: impl Write,
     sampling_rate: usize,
     channels: usize,
     samples: &[f32],
@@ -354,6 +354,7 @@ pub fn write_wav(
     let byte_rate = rate
         .checked_mul(u32::from(block_align))
         .context("WAV byte rate overflow")?;
+    let mut writer = std::io::BufWriter::new(writer);
     writer.write_all(b"RIFF")?;
     writer.write_all(&riff_bytes.to_le_bytes())?;
     writer.write_all(b"WAVEfmt ")?;
@@ -370,6 +371,7 @@ pub fn write_wav(
         let quantized = (sample * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
         writer.write_all(&quantized.to_le_bytes())?;
     }
+    writer.flush()?;
     Ok(())
 }
 
@@ -389,19 +391,134 @@ fn y4m_extents(width: usize, height: usize, frames: usize, video: &[u8]) -> Resu
     Ok((frame_bytes, width * height))
 }
 
-fn rgb_to_yuv(rgb: [i64; 3], shift: u32) -> [u8; 3] {
-    let [r, g, b] = rgb;
-    let rounding = 1i64 << (shift - 1);
-    let quantize = |value: i64, offset: i64| {
-        ((value + rounding) >> shift)
-            .saturating_add(offset)
-            .clamp(0, 255) as u8
+/// Converts `2 * pair_rows` RGB rows into Y, U and V planes in one i32 pass.
+fn convert_y4m_row_pairs(
+    rgb_rows: &[u8],
+    width: usize,
+    y_rows: &mut [u8],
+    u_rows: &mut [u8],
+    v_rows: &mut [u8],
+) {
+    let row_stride = width * 3;
+    let chroma_width = width / 2;
+    for (((rgb_pair, y_pair), u_row), v_row) in rgb_rows
+        .chunks_exact(row_stride * 2)
+        .zip(y_rows.chunks_exact_mut(width * 2))
+        .zip(u_rows.chunks_exact_mut(chroma_width))
+        .zip(v_rows.chunks_exact_mut(chroma_width))
+    {
+        let (rgb0, rgb1) = rgb_pair.split_at(row_stride);
+        let (y0, y1) = y_pair.split_at_mut(width);
+        for ((((p0, p1), y0_pair), y1_pair), (u_out, v_out)) in rgb0
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .zip(rgb1.as_chunks::<6>().0)
+            .zip(y0.as_chunks_mut::<2>().0)
+            .zip(y1.as_chunks_mut::<2>().0)
+            .zip(u_row.iter_mut().zip(v_row.iter_mut()))
+        {
+            let (r00, g00, b00) = (i32::from(p0[0]), i32::from(p0[1]), i32::from(p0[2]));
+            let (r01, g01, b01) = (i32::from(p0[3]), i32::from(p0[4]), i32::from(p0[5]));
+            let (r10, g10, b10) = (i32::from(p1[0]), i32::from(p1[1]), i32::from(p1[2]));
+            let (r11, g11, b11) = (i32::from(p1[3]), i32::from(p1[4]), i32::from(p1[5]));
+            y0_pair[0] = ((19595 * r00 + 38470 * g00 + 7471 * b00 + 32768) >> 16) as u8;
+            y0_pair[1] = ((19595 * r01 + 38470 * g01 + 7471 * b01 + 32768) >> 16) as u8;
+            y1_pair[0] = ((19595 * r10 + 38470 * g10 + 7471 * b10 + 32768) >> 16) as u8;
+            y1_pair[1] = ((19595 * r11 + 38470 * g11 + 7471 * b11 + 32768) >> 16) as u8;
+            let sr = r00 + r01 + r10 + r11;
+            let sg = g00 + g01 + g10 + g11;
+            let sb = b00 + b01 + b10 + b11;
+            *u_out = (((-11058 * sr - 21710 * sg + 32768 * sb + 131072) >> 18) + 128).clamp(0, 255)
+                as u8;
+            *v_out =
+                (((32768 * sr - 27439 * sg - 5329 * sb + 131072) >> 18) + 128).clamp(0, 255) as u8;
+        }
+    }
+}
+
+fn spawn_y4m_frame<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    rgb: &'env [u8],
+    (width, height): (usize, usize),
+    out: &'env mut [u8],
+    workers: usize,
+) {
+    out[..6].copy_from_slice(b"FRAME\n");
+    let pixels = width * height;
+    let chroma_pixels = pixels / 4;
+    let (y_plane, uv_planes) = out[6..].split_at_mut(pixels);
+    let (u_plane, v_plane) = uv_planes.split_at_mut(chroma_pixels);
+    let row_pairs = height / 2;
+    let threads = workers.min(row_pairs);
+    if threads <= 1 {
+        convert_y4m_row_pairs(rgb, width, y_plane, u_plane, v_plane);
+        return;
+    }
+    let base = row_pairs / threads;
+    let extra = row_pairs % threads;
+    let mut rgb_rest = rgb;
+    let mut y_rest = y_plane;
+    let mut u_rest = u_plane;
+    let mut v_rest = v_plane;
+    for index in 0..threads {
+        let pairs = base + usize::from(index < extra);
+        let (rgb_slice, next_rgb) = rgb_rest.split_at(pairs * width * 6);
+        let (y_slice, next_y) = y_rest.split_at_mut(pairs * width * 2);
+        let (u_slice, next_u) = u_rest.split_at_mut(pairs * (width / 2));
+        let (v_slice, next_v) = v_rest.split_at_mut(pairs * (width / 2));
+        rgb_rest = next_rgb;
+        y_rest = next_y;
+        u_rest = next_u;
+        v_rest = next_v;
+        scope.spawn(move || {
+            convert_y4m_row_pairs(rgb_slice, width, y_slice, u_slice, v_slice);
+        });
+    }
+}
+
+fn spawn_y4m_frames<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    rgb_batch: &'env [u8],
+    (width, height, frame_bytes, frame_out_bytes): (usize, usize, usize, usize),
+    out_batch: &'env mut [u8],
+    workers: usize,
+) {
+    let count = out_batch.len() / frame_out_bytes;
+    if count == 1 {
+        spawn_y4m_frame(scope, rgb_batch, (width, height), out_batch, workers);
+        return;
+    }
+    let threads = workers.min(count);
+    let convert_serial = move |rgb_chunk: &[u8], out_chunk: &mut [u8]| {
+        let pixels = width * height;
+        let chroma_pixels = pixels / 4;
+        for (rgb, out) in rgb_chunk
+            .chunks_exact(frame_bytes)
+            .zip(out_chunk.chunks_exact_mut(frame_out_bytes))
+        {
+            out[..6].copy_from_slice(b"FRAME\n");
+            let (y_plane, uv_planes) = out[6..].split_at_mut(pixels);
+            let (u_plane, v_plane) = uv_planes.split_at_mut(chroma_pixels);
+            convert_y4m_row_pairs(rgb, width, y_plane, u_plane, v_plane);
+        }
     };
-    [
-        quantize(19595 * r + 38470 * g + 7471 * b, 0),
-        quantize(-11058 * r - 21710 * g + 32768 * b, 128),
-        quantize(32768 * r - 27439 * g - 5329 * b, 128),
-    ]
+    if threads <= 1 {
+        convert_serial(rgb_batch, out_batch);
+        return;
+    }
+    let base = count / threads;
+    let extra = count % threads;
+    let mut rgb_rest = rgb_batch;
+    let mut out_rest = out_batch;
+    for index in 0..threads {
+        let chunk_frames = base + usize::from(index < extra);
+        let (rgb_chunk, next_rgb) = rgb_rest.split_at(chunk_frames * frame_bytes);
+        let (out_chunk, next_out) = out_rest.split_at_mut(chunk_frames * frame_out_bytes);
+        rgb_rest = next_rgb;
+        out_rest = next_out;
+        scope.spawn(move || convert_serial(rgb_chunk, out_chunk));
+    }
 }
 
 pub fn write_y4m(
@@ -419,48 +536,75 @@ pub fn write_y4m(
         "YUV4MPEG2 W{width} H{height} F{}:{} Ip A1:1 C420jpeg XCOLORRANGE=FULL",
         fps.0, fps.1
     )?;
-    let chroma_pixels = pixels / 4;
-    let mut y = Vec::with_capacity(pixels);
-    let mut u = Vec::with_capacity(chroma_pixels);
-    let mut v = Vec::with_capacity(chroma_pixels);
-    for frame in 0..frames {
-        let rgb = &video[frame * frame_bytes..(frame + 1) * frame_bytes];
-        y.clear();
-        u.clear();
-        v.clear();
-        for pixel in rgb.as_chunks::<3>().0 {
-            y.push(
-                rgb_to_yuv(
-                    [
-                        i64::from(pixel[0]),
-                        i64::from(pixel[1]),
-                        i64::from(pixel[2]),
-                    ],
-                    16,
-                )[0],
-            );
+    let frame_out_bytes = 6usize
+        .checked_add(pixels)
+        .and_then(|n| n.checked_add(pixels / 2))
+        .context("Y4M output frame extent overflow")?;
+    let workers = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let shape = (width, height, frame_bytes, frame_out_bytes);
+    if workers <= 1 {
+        let mut out = vec![0u8; frame_out_bytes];
+        let chroma_pixels = pixels / 4;
+        for rgb in video.chunks_exact(frame_bytes) {
+            out[..6].copy_from_slice(b"FRAME\n");
+            let (y_plane, uv_planes) = out[6..].split_at_mut(pixels);
+            let (u_plane, v_plane) = uv_planes.split_at_mut(chroma_pixels);
+            convert_y4m_row_pairs(rgb, width, y_plane, u_plane, v_plane);
+            writer.write_all(&out)?;
         }
-        for row in (0..height).step_by(2) {
-            for col in (0..width).step_by(2) {
-                let mut sum = [0i64; 3];
-                for dy in 0..2 {
-                    for dx in 0..2 {
-                        let offset = ((row + dy) * width + col + dx) * 3;
-                        for channel in 0..3 {
-                            sum[channel] += i64::from(rgb[offset + channel]);
-                        }
-                    }
-                }
-                let yuv = rgb_to_yuv(sum, 18);
-                u.push(yuv[1]);
-                v.push(yuv[2]);
-            }
-        }
-        writer.write_all(b"FRAME\n")?;
-        writer.write_all(&y)?;
-        writer.write_all(&u)?;
-        writer.write_all(&v)?;
+        return Ok(());
     }
+    if frames <= workers {
+        let out_bytes = frames
+            .checked_mul(frame_out_bytes)
+            .context("Y4M batch extent overflow")?;
+        let mut current = vec![0u8; out_bytes];
+        std::thread::scope(|scope| {
+            spawn_y4m_frames(scope, video, shape, &mut current, workers);
+        });
+        writer.write_all(&current)?;
+        return Ok(());
+    }
+    let convert_workers = workers - 1;
+    let batch = convert_workers;
+    let batch_bytes = batch
+        .checked_mul(frame_out_bytes)
+        .context("Y4M batch extent overflow")?;
+    let mut current = vec![0u8; batch_bytes];
+    let mut next = vec![0u8; batch_bytes];
+    std::thread::scope(|scope| {
+        spawn_y4m_frames(
+            scope,
+            &video[..batch * frame_bytes],
+            shape,
+            &mut current,
+            workers,
+        );
+    });
+    let mut offset = batch;
+    let mut current_len = batch_bytes;
+    while offset < frames {
+        let count = batch.min(frames - offset);
+        let next_len = count * frame_out_bytes;
+        let rgb_slice = &video[offset * frame_bytes..(offset + count) * frame_bytes];
+        std::thread::scope(|scope| -> Result<()> {
+            spawn_y4m_frames(
+                scope,
+                rgb_slice,
+                shape,
+                &mut next[..next_len],
+                convert_workers,
+            );
+            writer.write_all(&current[..current_len])?;
+            Ok(())
+        })?;
+        std::mem::swap(&mut current, &mut next);
+        current_len = next_len;
+        offset += count;
+    }
+    writer.write_all(&current[..current_len])?;
     Ok(())
 }
 
@@ -1278,6 +1422,81 @@ end_header
         Ok(())
     }
 
+    fn rgb_to_yuv(rgb: [i64; 3], shift: u32) -> [u8; 3] {
+        let [r, g, b] = rgb;
+        let rounding = 1i64 << (shift - 1);
+        let quantize = |value: i64, offset: i64| {
+            ((value + rounding) >> shift)
+                .saturating_add(offset)
+                .clamp(0, 255) as u8
+        };
+        [
+            quantize(19595 * r + 38470 * g + 7471 * b, 0),
+            quantize(-11058 * r - 21710 * g + 32768 * b, 128),
+            quantize(32768 * r - 27439 * g - 5329 * b, 128),
+        ]
+    }
+
+    fn write_y4m_serial(
+        mut writer: impl Write,
+        width: usize,
+        height: usize,
+        fps: (u32, u32),
+        frames: usize,
+        video: &[u8],
+    ) -> Result<()> {
+        let (frame_bytes, pixels) = y4m_extents(width, height, frames, video)?;
+        ensure!(fps.0 > 0 && fps.1 > 0, "invalid Y4M frame rate");
+        writeln!(
+            writer,
+            "YUV4MPEG2 W{width} H{height} F{}:{} Ip A1:1 C420jpeg XCOLORRANGE=FULL",
+            fps.0, fps.1
+        )?;
+        let chroma_pixels = pixels / 4;
+        let mut y = Vec::with_capacity(pixels);
+        let mut u = Vec::with_capacity(chroma_pixels);
+        let mut v = Vec::with_capacity(chroma_pixels);
+        for frame in 0..frames {
+            let rgb = &video[frame * frame_bytes..(frame + 1) * frame_bytes];
+            y.clear();
+            u.clear();
+            v.clear();
+            for pixel in rgb.as_chunks::<3>().0 {
+                y.push(
+                    rgb_to_yuv(
+                        [
+                            i64::from(pixel[0]),
+                            i64::from(pixel[1]),
+                            i64::from(pixel[2]),
+                        ],
+                        16,
+                    )[0],
+                );
+            }
+            for row in (0..height).step_by(2) {
+                for col in (0..width).step_by(2) {
+                    let mut sum = [0i64; 3];
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            let offset = ((row + dy) * width + col + dx) * 3;
+                            for channel in 0..3 {
+                                sum[channel] += i64::from(rgb[offset + channel]);
+                            }
+                        }
+                    }
+                    let yuv = rgb_to_yuv(sum, 18);
+                    u.push(yuv[1]);
+                    v.push(yuv[2]);
+                }
+            }
+            writer.write_all(b"FRAME\n")?;
+            writer.write_all(&y)?;
+            writer.write_all(&u)?;
+            writer.write_all(&v)?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn y4m_round_trip_preserves_frame_and_chroma_layout() -> Result<()> {
         assert_eq!(rgb_to_yuv([0; 3], 18), [0, 128, 128]);
@@ -1324,6 +1543,127 @@ end_header
             )
         );
         assert!(write_y4m(Vec::new(), 3, 2, (24, 1), 1, &[0; 18]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn y4m_parallel_and_wav_buffered_match_serial_definition() -> Result<()> {
+        let build_rgb = |width: usize, height: usize, frames: usize| -> Vec<u8> {
+            let mut rgb = Vec::with_capacity(frames * width * height * 3);
+            let corners: [[u8; 3]; 8] = [
+                [0, 0, 0],
+                [255, 255, 255],
+                [255, 0, 0],
+                [0, 255, 0],
+                [0, 0, 255],
+                [1, 127, 254],
+                [254, 128, 1],
+                [128, 0, 255],
+            ];
+            for frame in 0..frames {
+                for row in 0..height {
+                    for col in 0..width {
+                        if row + 2 >= height && col + 2 >= width {
+                            let idx = (frame + (row & 1) * 2 + (col & 1)) % corners.len();
+                            rgb.extend_from_slice(&corners[idx]);
+                        } else {
+                            let base = frame * 131 + row * 73 + col * 37;
+                            rgb.push((base % 256) as u8);
+                            rgb.push(((base * 5 + 17) % 256) as u8);
+                            rgb.push(((base * 11 + 83) % 256) as u8);
+                        }
+                    }
+                }
+            }
+            rgb
+        };
+        // Odd chroma width and odd chroma height exercise subsampling edge boundaries and uneven thread splits.
+        for &(width, height, frames) in &[
+            (2, 2, 1),
+            (14, 10, 1),
+            (14, 10, 5),
+            (14, 10, 37),
+            (38, 26, 1),
+            (38, 26, 37),
+        ] {
+            let rgb = build_rgb(width, height, frames);
+            let mut expected = Vec::new();
+            write_y4m_serial(&mut expected, width, height, (24, 1), frames, &rgb)?;
+            let mut actual = Vec::new();
+            write_y4m(&mut actual, width, height, (24, 1), frames, &rgb)?;
+            assert_eq!(
+                actual, expected,
+                "Y4M mismatch for {width}x{height}x{frames}"
+            );
+            if (width, height, frames) == (14, 10, 1) {
+                let mut mutant = actual.clone();
+                let last = mutant.len() - 1;
+                mutant[last] ^= 1;
+                assert_ne!(mutant, expected, "edge-chroma mutant must be detected");
+            }
+        }
+        // Odd pixel width or height are rejected by both parallel and serial encoders.
+        for &(width, height) in &[(13, 10), (14, 9), (13, 9)] {
+            let rgb = vec![0u8; width * height * 3];
+            assert!(write_y4m(Vec::new(), width, height, (24, 1), 1, &rgb).is_err());
+            assert!(write_y4m_serial(Vec::new(), width, height, (24, 1), 1, &rgb).is_err());
+        }
+        struct LimitedWriter {
+            written: usize,
+            limit: usize,
+        }
+        impl Write for LimitedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.written + buf.len() > self.limit {
+                    return Err(std::io::Error::other("injected Y4M write failure"));
+                }
+                self.written += buf.len();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let multi = build_rgb(14, 10, 37);
+        let err = write_y4m(
+            LimitedWriter {
+                written: 0,
+                limit: 128,
+            },
+            14,
+            10,
+            (24, 1),
+            37,
+            &multi,
+        )
+        .expect_err("mid-stream Y4M write failure must propagate")
+        .to_string();
+        assert!(err.contains("injected Y4M write failure"), "{err}");
+
+        // Buffered WAV output matches unbuffered per-sample PCM16 across multiple flushes.
+        let mut samples = vec![-1.5f32, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, -0.25];
+        samples.extend((0..50_000).map(|i| ((i * 37 % 4096) as f32 / 2048.0) - 1.0));
+        let mut actual_wav = Vec::new();
+        write_wav(&mut actual_wav, 48000, 2, &samples)?;
+        let mut expected_wav = Vec::with_capacity(44 + samples.len() * 2);
+        let data_bytes = (samples.len() * 2) as u32;
+        expected_wav.extend_from_slice(b"RIFF");
+        expected_wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        expected_wav.extend_from_slice(b"WAVEfmt ");
+        expected_wav.extend_from_slice(&16u32.to_le_bytes());
+        expected_wav.extend_from_slice(&1u16.to_le_bytes());
+        expected_wav.extend_from_slice(&2u16.to_le_bytes());
+        expected_wav.extend_from_slice(&48000u32.to_le_bytes());
+        expected_wav.extend_from_slice(&(48000u32 * 4).to_le_bytes());
+        expected_wav.extend_from_slice(&4u16.to_le_bytes());
+        expected_wav.extend_from_slice(&16u16.to_le_bytes());
+        expected_wav.extend_from_slice(b"data");
+        expected_wav.extend_from_slice(&data_bytes.to_le_bytes());
+        for &sample in &samples {
+            let quantized = (sample * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
+            expected_wav.extend_from_slice(&quantized.to_le_bytes());
+        }
+        assert_eq!(actual_wav, expected_wav);
         Ok(())
     }
 
