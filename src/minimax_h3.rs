@@ -568,8 +568,9 @@ pub fn stored_scratch_extents(spec: &H3Spec) -> Result<Option<(usize, usize)>> {
     Ok(Some((k, low_rank)))
 }
 
-/// Bytes of one HyperFlow stored scratch for `rows`: when `k > 0`, two f32 buffers of `rows * k` and one f32 scale
-/// per row; plus `rows * stored_low_rank_pitch(low_rank)` bf16 elements. Zero when the spec is not HyperFlow.
+/// Bytes of one HyperFlow stored scratch for `rows`: when `k > 0`, one f32 buffer of `rows * k` (upcast input below
+/// 17 rows, aliased as int8 codes at 17+ rows) and one f32 scale per row; plus `rows * stored_low_rank_pitch(low_rank)`
+/// bf16 elements. Zero when the spec is not HyperFlow.
 pub fn stored_scratch_bytes(spec: &H3Spec, rows: usize) -> Result<u64> {
     let Some((k, low_rank)) = stored_scratch_extents(spec)? else {
         return Ok(0);
@@ -579,7 +580,6 @@ pub fn stored_scratch_bytes(spec: &H3Spec, rows: usize) -> Result<u64> {
     let mid = u64::try_from(stored_low_rank_pitch(low_rank))?;
     let f32_elems = if k > 0 {
         rows.checked_mul(k)
-            .and_then(|n| n.checked_mul(2))
             .and_then(|n| n.checked_add(rows))
             .context("stored scratch elements")?
     } else {

@@ -97,215 +97,6 @@ extern "C" __global__ void convrot_linear(
         __float2bfloat16(__fmul_rn(__fmul_rn(static_cast<float>(acc), scale), wscale[col]));
 }
 
-__device__ __forceinline__ __nv_bfloat16 convrot_xor_low_bit(__nv_bfloat16 value) {
-    union {
-        __nv_bfloat16 value;
-        unsigned short bits;
-    } bits;
-    static_assert(sizeof(bits.value) == sizeof(bits.bits), "bf16 is 16 bits");
-    bits.value = value;
-    bits.bits ^= 1u;
-    return bits.value;
-}
-
-// table[col * group + row] = bf16(hadamard(group, row, col)). entries = group * group.
-// flip >= 0 xors the low bit of entry flip. Block 256.
-extern "C" __global__ void convrot_hadamard_table(__nv_bfloat16* table, int group, int flip) {
-    if (group < 16 || (group & 15)) __trap();
-    const long long entries = static_cast<long long>(group) * group;
-    const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= entries) return;
-    const int col = static_cast<int>(idx / group);
-    const int row = static_cast<int>(idx - static_cast<long long>(col) * group);
-    __nv_bfloat16 value = __float2bfloat16(convrot_hadamard(group, row, col));
-    if (idx == flip) value = convrot_xor_low_bit(value);
-    table[idx] = value;
-}
-
-// 17 rows and above. One block owns 16*SLABS rows and one group. Block is 256.
-// group is a power of 4 and k is a multiple of group.
-// Activations and table[col * group + row] are ld.global.v4.u32.
-// The dot is mma.m16n8k16, bf16 inputs, f32 accumulator, K groups of 16 in order.
-// Grid: (ceil(rows/(16*SLABS)), 1, k/group).
-// Dynamic smem is SLABS contiguous 16*group BF16 tiles, then 8*8*16 BF16.
-template <bool SILU, int SLABS>
-__device__ __forceinline__ void convrot_group_dot_tile(
-    const __nv_bfloat16* __restrict__ x, float* __restrict__ y,
-    const __nv_bfloat16* __restrict__ table, int rows, int k, int group) {
-    constexpr int THREADS = 256;
-    constexpr int STRIDE = 16;
-    const unsigned real = static_cast<unsigned>(group);
-    const unsigned exp = 31u - __clz(real | 16u);
-    if (blockDim.x != THREADS || rows < 17 || real < 16u || (real & (real - 1u)) || ((__ffs(real) - 1) & 1) ||
-        (static_cast<unsigned>(k) & (real - 1u)))
-        __trap();
-    extern __shared__ __align__(16) __nv_bfloat16 tile[];
-    __nv_bfloat16* atile = tile;
-    const int slab_stride = 16 * group;
-    __nv_bfloat16* bsmem = tile + SLABS * slab_stride;
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int row0 = static_cast<int>(blockIdx.x) * (16 * SLABS);
-    const int x_col0 = static_cast<int>(blockIdx.z) * group;
-    const int vshift = static_cast<int>(exp) - 3;
-    const int vecs_per_row = static_cast<int>(real >> 3);
-    const int vectors = (16 * SLABS) * vecs_per_row;
-    for (int i = static_cast<int>(threadIdx.x); i < vectors; i += THREADS) {
-        const int r = i >> vshift;
-        const int c = (i & (vecs_per_row - 1)) << 3;
-        const int gr = row0 + r;
-        uint4 packed = make_uint4(0u, 0u, 0u, 0u);
-        if (gr < rows) {
-            const __nv_bfloat16* src = x + static_cast<long long>(gr) * (SILU ? 2LL * k : k) + x_col0 + c;
-            packed = convrot_load_u128(src);
-            if constexpr (SILU) {
-                const uint4 upper = convrot_load_u128(src + k);
-                auto* lower = reinterpret_cast<__nv_bfloat16*>(&packed);
-                const auto* up = reinterpret_cast<const __nv_bfloat16*>(&upper);
-                #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const float u = __bfloat162float(up[j]);
-                    lower[j] = __hmul(__float2bfloat16(u / (1.0f + expf(-u))), lower[j]);
-                }
-            }
-        }
-        const int panel = c >> 4;
-        const int local = c & 15;
-        const int slab = SLABS == 1 ? 0 : r >> 4;
-        const int row = SLABS == 1 ? r : (r & 15);
-        __nv_bfloat16* a = atile + slab * slab_stride;
-        *reinterpret_cast<uint4*>(a + panel * (16 * STRIDE) + row * STRIDE + local) = packed;
-    }
-    __syncthreads();
-    __nv_bfloat16* bt = bsmem + warp * (8 * STRIDE);
-    const int nsub = static_cast<int>(real >> 3);
-    const int ksteps = static_cast<int>(real >> 4);
-    for (int sub = warp; sub < nsub; sub += 8) {
-        const int n0 = sub << 3;
-        float acc[SLABS][4] = {};
-        for (int step = 0; step < ksteps; ++step) {
-            const int k0 = step << 4;
-            if (lane < 16) {
-                const int n = lane & 7;
-                const int c0 = lane & 8;
-                const __nv_bfloat16* src = table + static_cast<long long>(n0 + n) * group + (k0 + c0);
-                *reinterpret_cast<uint4*>(bt + n * STRIDE + c0) = convrot_load_u128(src);
-            }
-            __syncwarp();
-            const __nv_bfloat16* ap =
-                atile + (k0 >> 4) * (16 * STRIDE) + (lane & 15) * STRIDE + (lane >> 4) * 8;
-            unsigned a[4];
-            convrot_ldsm_x4(a, ap);
-            unsigned b[2];
-            convrot_ldsm_x2(b, bt + (lane & 7) * STRIDE + ((lane >> 3) & 1) * 8);
-            convrot_mma_16816(acc[0], a, b);
-            #pragma unroll
-            for (int slab = 1; slab < SLABS; ++slab) {
-                convrot_ldsm_x4(a, ap + slab * slab_stride);
-                convrot_mma_16816(acc[slab], a, b);
-            }
-            __syncwarp();
-        }
-        const int rbase = lane >> 2;
-        const int cbase = (lane & 3) * 2;
-        const int rows_out[4] = {rbase, rbase, rbase + 8, rbase + 8};
-        const int cols_out[4] = {cbase, cbase + 1, cbase, cbase + 1};
-        #pragma unroll
-        for (int slab = 0; slab < SLABS; ++slab) {
-            for (int t = 0; t < 4; ++t) {
-                const int r = row0 + 16 * slab + rows_out[t];
-                const int c = cols_out[t];
-                if (r < rows && n0 + c < group)
-                    y[static_cast<long long>(r) * k + x_col0 + n0 + c] = acc[slab][t];
-            }
-        }
-    }
-}
-
-extern "C" __global__ void convrot_group_dot(
-    const __nv_bfloat16* x, float* y, const __nv_bfloat16* table, int rows, int k, int group) {
-    convrot_group_dot_tile<false, 1>(x, y, table, rows, k, group);
-}
-
-extern "C" __global__ void convrot_group_dot_silu(
-    const __nv_bfloat16* gu, float* y, const __nv_bfloat16* table, int rows, int k, int group) {
-    convrot_group_dot_tile<true, 1>(gu, y, table, rows, k, group);
-}
-
-extern "C" __global__ void convrot_group_dot_32(
-    const __nv_bfloat16* x, float* y, const __nv_bfloat16* table, int rows, int k, int group) {
-    convrot_group_dot_tile<false, 2>(x, y, table, rows, k, group);
-}
-
-extern "C" __global__ void convrot_group_dot_silu_32(
-    const __nv_bfloat16* gu, float* y, const __nv_bfloat16* table, int rows, int k, int group) {
-    convrot_group_dot_tile<true, 2>(gu, y, table, rows, k, group);
-}
-
-// Block 256. Dynamic smem is tile_rows * k f32. Each live row is loaded once, coalesced.
-// Warp peaks reuse that row's first 8 floats, then the reciprocal does. k >= 8.
-// s = max(peak, 1e-12) / 127. q = rint(v * (1/s)), clamped to [-127, 127].
-constexpr int CONVROT_QUANT_THREADS = 256;
-
-extern "C" __global__ void convrot_quantize(const float* __restrict__ xr, int8_t* __restrict__ codes,
-                                            float* __restrict__ scales, int rows, int k, int tile_rows) {
-    extern __shared__ float quant_tile[];
-    const int tid = static_cast<int>(threadIdx.x);
-    const int lane = tid & 31;
-    const int wid = tid >> 5;
-    const int row0 = static_cast<int>(blockIdx.x) * tile_rows;
-    for (int r = 0; r < tile_rows; ++r) {
-        const int row = row0 + r;
-        if (row < rows) {
-            const float* src = xr + static_cast<long long>(row) * k;
-            float* dst = quant_tile + static_cast<long long>(r) * k;
-            for (int col = tid; col < k; col += CONVROT_QUANT_THREADS) dst[col] = src[col];
-        }
-    }
-    __syncthreads();
-    for (int r = 0; r < tile_rows; ++r) {
-        const int row = row0 + r;
-        const bool live = row < rows;
-        float* row_tile = quant_tile + static_cast<long long>(r) * k;
-        float peak = 0.f;
-        if (live) {
-            for (int col = tid; col < k; col += CONVROT_QUANT_THREADS)
-                peak = fmaxf(peak, fabsf(row_tile[col]));
-        }
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, off));
-        __syncthreads();
-        float saved = 0.f;
-        if (live && tid < 8) saved = row_tile[tid];
-        __syncthreads();
-        if (live && lane == 0) row_tile[wid] = peak;
-        __syncthreads();
-        if (live && tid == 0) {
-            float reduced = 0.f;
-            for (int w = 0; w < 8; ++w) reduced = fmaxf(reduced, row_tile[w]);
-            const float scale = __fdiv_rn(fmaxf(reduced, 1e-12f), 127.f);
-            scales[row] = scale;
-            row_tile[0] = __fdiv_rn(1.f, scale);
-        }
-        __syncthreads();
-        float inv = 0.f;
-        if (live) inv = row_tile[0];
-        __syncthreads();
-        if (live && tid < 8) row_tile[tid] = saved;
-        __syncthreads();
-        if (live) {
-            int8_t* dst = codes + static_cast<long long>(row) * k;
-            for (int col = tid; col < k; col += CONVROT_QUANT_THREADS) {
-                float q = rintf(__fmul_rn(row_tile[col], inv));
-                q = fminf(fmaxf(q, -127.f), 127.f);
-                dst[col] = static_cast<int8_t>(static_cast<int>(q));
-            }
-        }
-        __syncthreads();
-    }
-}
-
 // m16n8k32.row.col.s32.s8.s8. BM 128, BN 256, BK 64, stride 80, 2 stages, 512 threads.
 // Dynamic smem 61440 N-fast, 49152 M-fast.
 constexpr int CONVROT_BM = 128;
@@ -660,329 +451,6 @@ extern "C" __global__ void convrot_linear(
     }
     y[static_cast<long long>(row) * n + col] =
         __float2bfloat16(__fmul_rn(__fmul_rn(static_cast<float>(acc), scale), wscale[col]));
-}
-
-__device__ __forceinline__ __nv_bfloat16 convrot_xor_low_bit(__nv_bfloat16 value) {
-    union {
-        __nv_bfloat16 value;
-        unsigned short bits;
-    } bits;
-    static_assert(sizeof(bits.value) == sizeof(bits.bits), "bf16 is 16 bits");
-    bits.value = value;
-    bits.bits ^= 1u;
-    return bits.value;
-}
-
-// table[col * group + row] = bf16(hadamard(group, row, col)). entries = group * group.
-// flip >= 0 xors the low bit of entry flip. Block 256.
-extern "C" __global__ void convrot_hadamard_table(__nv_bfloat16* table, int group, int flip) {
-    if (group < 16 || (group & 15)) __trap();
-    const long long entries = static_cast<long long>(group) * group;
-    const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= entries) return;
-    const int col = static_cast<int>(idx / group);
-    const int row = static_cast<int>(idx - static_cast<long long>(col) * group);
-    __nv_bfloat16 value = __float2bfloat16(convrot_hadamard(group, row, col));
-    if (idx == flip) value = convrot_xor_low_bit(value);
-    table[idx] = value;
-}
-
-#if !defined(__HIP__)
-// 17 rows and above. One block owns 16*SLABS rows and one group. Block is 256.
-// group is a power of 4 and k is a multiple of group.
-// Activations and table[col * group + row] are ld.global.v4.u32.
-// The dot is mma.m16n8k16, bf16 inputs, f32 accumulator, K groups of 16 in order.
-// Grid: (ceil(rows/(16*SLABS)), 1, k/group).
-// Dynamic smem is SLABS contiguous 16*group BF16 tiles, then 8*8*16 BF16.
-template <bool SILU, int SLABS>
-__device__ __forceinline__ void convrot_group_dot_tile(
-    const __nv_bfloat16* __restrict__ x, float* __restrict__ y,
-    const __nv_bfloat16* __restrict__ table, int rows, int k, int group) {
-    constexpr int THREADS = 256;
-    constexpr int STRIDE = 16;
-    const unsigned real = static_cast<unsigned>(group);
-    const unsigned exp = 31u - __clz(real | 16u);
-    if (blockDim.x != THREADS || rows < 17 || real < 16u || (real & (real - 1u)) || ((__ffs(real) - 1) & 1) ||
-        (static_cast<unsigned>(k) & (real - 1u)))
-        __trap();
-    extern __shared__ __align__(16) __nv_bfloat16 tile[];
-    __nv_bfloat16* atile = tile;
-    const int slab_stride = 16 * group;
-    __nv_bfloat16* bsmem = tile + SLABS * slab_stride;
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int row0 = static_cast<int>(blockIdx.x) * (16 * SLABS);
-    const int x_col0 = static_cast<int>(blockIdx.z) * group;
-    const int vshift = static_cast<int>(exp) - 3;
-    const int vecs_per_row = static_cast<int>(real >> 3);
-    const int vectors = (16 * SLABS) * vecs_per_row;
-    for (int i = static_cast<int>(threadIdx.x); i < vectors; i += THREADS) {
-        const int r = i >> vshift;
-        const int c = (i & (vecs_per_row - 1)) << 3;
-        const int gr = row0 + r;
-        uint4 packed = make_uint4(0u, 0u, 0u, 0u);
-        if (gr < rows) {
-            const __nv_bfloat16* src = x + static_cast<long long>(gr) * (SILU ? 2LL * k : k) + x_col0 + c;
-            packed = convrot_load_u128(src);
-            if constexpr (SILU) {
-                const uint4 upper = convrot_load_u128(src + k);
-                auto* lower = reinterpret_cast<__nv_bfloat16*>(&packed);
-                const auto* up = reinterpret_cast<const __nv_bfloat16*>(&upper);
-                #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const float u = __bfloat162float(up[j]);
-                    lower[j] = __hmul(__float2bfloat16(u / (1.0f + expf(-u))), lower[j]);
-                }
-            }
-        }
-        const int panel = c >> 4;
-        const int local = c & 15;
-        const int slab = SLABS == 1 ? 0 : r >> 4;
-        const int row = SLABS == 1 ? r : (r & 15);
-        __nv_bfloat16* a = atile + slab * slab_stride;
-        *reinterpret_cast<uint4*>(a + panel * (16 * STRIDE) + row * STRIDE + local) = packed;
-    }
-    __syncthreads();
-    __nv_bfloat16* bt = bsmem + warp * (8 * STRIDE);
-    const int nsub = static_cast<int>(real >> 3);
-    const int ksteps = static_cast<int>(real >> 4);
-    for (int sub = warp; sub < nsub; sub += 8) {
-        const int n0 = sub << 3;
-        float acc[SLABS][4] = {};
-        for (int step = 0; step < ksteps; ++step) {
-            const int k0 = step << 4;
-            if (lane < 16) {
-                const int n = lane & 7;
-                const int c0 = lane & 8;
-                const __nv_bfloat16* src = table + static_cast<long long>(n0 + n) * group + (k0 + c0);
-                *reinterpret_cast<uint4*>(bt + n * STRIDE + c0) = convrot_load_u128(src);
-            }
-            __syncwarp();
-            const __nv_bfloat16* ap =
-                atile + (k0 >> 4) * (16 * STRIDE) + (lane & 15) * STRIDE + (lane >> 4) * 8;
-            unsigned a[4];
-            convrot_ldsm_x4(a, ap);
-            unsigned b[2];
-            convrot_ldsm_x2(b, bt + (lane & 7) * STRIDE + ((lane >> 3) & 1) * 8);
-            convrot_mma_16816(acc[0], a, b);
-            #pragma unroll
-            for (int slab = 1; slab < SLABS; ++slab) {
-                convrot_ldsm_x4(a, ap + slab * slab_stride);
-                convrot_mma_16816(acc[slab], a, b);
-            }
-            __syncwarp();
-        }
-        const int rbase = lane >> 2;
-        const int cbase = (lane & 3) * 2;
-        const int rows_out[4] = {rbase, rbase, rbase + 8, rbase + 8};
-        const int cols_out[4] = {cbase, cbase + 1, cbase, cbase + 1};
-        #pragma unroll
-        for (int slab = 0; slab < SLABS; ++slab) {
-            for (int t = 0; t < 4; ++t) {
-                const int r = row0 + 16 * slab + rows_out[t];
-                const int c = cols_out[t];
-                if (r < rows && n0 + c < group)
-                    y[static_cast<long long>(r) * k + x_col0 + n0 + c] = acc[slab][t];
-            }
-        }
-    }
-}
-#else
-// gfx11 wave32 v_wmma_f32_16x16x16_bf16. Block 256, dynamic LDS = SLABS * 16 * group BF16.
-template <bool SILU, int SLABS>
-__device__ __forceinline__ void convrot_group_dot_tile(
-    const __nv_bfloat16* __restrict__ x, float* __restrict__ y,
-    const __nv_bfloat16* __restrict__ table, int rows, int k, int group) {
-    using Bf16Vec16 = short __attribute__((ext_vector_type(16)));
-    using F32Vec8 = float __attribute__((ext_vector_type(8)));
-    constexpr int THREADS = 256;
-    const unsigned real = static_cast<unsigned>(group);
-    const unsigned exp = 31u - __clz(real | 16u);
-    if (blockDim.x != THREADS || rows < 17 || real < 16u || (real & (real - 1u)) || ((__ffs(real) - 1) & 1) ||
-        (static_cast<unsigned>(k) & (real - 1u)))
-        __trap();
-    extern __shared__ __align__(16) __nv_bfloat16 tile[];
-    const int slab_stride = 16 * group;
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int row0 = static_cast<int>(blockIdx.x) * (16 * SLABS);
-    const int x_col0 = static_cast<int>(blockIdx.z) * group;
-    const int vshift = static_cast<int>(exp) - 3;
-    const int vecs_per_row = static_cast<int>(real >> 3);
-    const int vectors = (16 * SLABS) * vecs_per_row;
-    const bool group16 = (group == 16);
-    for (int i = static_cast<int>(threadIdx.x); i < vectors; i += THREADS) {
-        const int r = i >> vshift;
-        const int chunk = i & (vecs_per_row - 1);
-        const int c = chunk << 3;
-        const int gr = row0 + r;
-        uint4 packed = make_uint4(0u, 0u, 0u, 0u);
-        if (gr < rows) {
-            const __nv_bfloat16* src = x + static_cast<long long>(gr) * (SILU ? 2LL * k : k) + x_col0 + c;
-            packed = *reinterpret_cast<const uint4*>(src);
-            if constexpr (SILU) {
-                const uint4 upper = *reinterpret_cast<const uint4*>(src + k);
-                auto* lower = reinterpret_cast<__nv_bfloat16*>(&packed);
-                const auto* up = reinterpret_cast<const __nv_bfloat16*>(&upper);
-                #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const float u = __bfloat162float(up[j]);
-                    lower[j] = __hmul(__float2bfloat16(u / (1.0f + expf(-u))), lower[j]);
-                }
-            }
-        }
-        const int slab = SLABS == 1 ? 0 : (r >> 4);
-        const int row = SLABS == 1 ? r : (r & 15);
-        const int swiz = group16 ? ((row >> 2) & 1) : (row & 7);
-        const int ch = chunk ^ swiz;
-        __nv_bfloat16* a = tile + slab * slab_stride;
-        *reinterpret_cast<uint4*>(a + row * group + (ch << 3)) = packed;
-    }
-    __syncthreads();
-    const int nsub = static_cast<int>(real >> 4);
-    const int ksteps = static_cast<int>(real >> 4);
-    const int r_local = lane & 15;
-    const int half = lane >> 4;
-    const int swiz = group16 ? ((r_local >> 2) & 1) : (r_local & 7);
-    const __nv_bfloat16* a_base = tile + r_local * group;
-    for (int sub = warp; sub < nsub; sub += 8) {
-        const int n0 = sub << 4;
-        const int b_row = n0 + r_local;
-        const __nv_bfloat16* b_ptr = table + static_cast<long long>(b_row) * group + (half << 3);
-        F32Vec8 acc[SLABS];
-        #pragma unroll
-        for (int slab = 0; slab < SLABS; ++slab) {
-            acc[slab] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-        }
-        for (int step = 0; step < ksteps; ++step) {
-            const uint4 my = *reinterpret_cast<const uint4*>(b_ptr + (step << 4));
-            uint4 peer;
-            peer.x = __shfl_xor_sync(FF_WARP_MASK, my.x, 16);
-            peer.y = __shfl_xor_sync(FF_WARP_MASK, my.y, 16);
-            peer.z = __shfl_xor_sync(FF_WARP_MASK, my.z, 16);
-            peer.w = __shfl_xor_sync(FF_WARP_MASK, my.w, 16);
-            const uint4 bpair[2] = {half == 0 ? my : peer, half == 0 ? peer : my};
-            Bf16Vec16 b_frag;
-            __builtin_memcpy(&b_frag, bpair, sizeof(b_frag));
-            const int ch0 = (step << 1) ^ swiz;
-            const int ch1 = ((step << 1) | 1) ^ swiz;
-            #pragma unroll
-            for (int slab = 0; slab < SLABS; ++slab) {
-                const __nv_bfloat16* ap = a_base + slab * slab_stride;
-                const uint4 apair[2] = {
-                    *reinterpret_cast<const uint4*>(ap + (ch0 << 3)),
-                    *reinterpret_cast<const uint4*>(ap + (ch1 << 3)),
-                };
-                Bf16Vec16 a_frag;
-                __builtin_memcpy(&a_frag, apair, sizeof(a_frag));
-                acc[slab] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a_frag, b_frag, acc[slab]);
-            }
-        }
-        const int col = n0 + r_local;
-        if (col < group) {
-            #pragma unroll
-            for (int slab = 0; slab < SLABS; ++slab) {
-                #pragma unroll
-                for (int g = 0; g < 8; ++g) {
-                    const int r = row0 + 16 * slab + 2 * g + half;
-                    if (r < rows) {
-                        y[static_cast<long long>(r) * k + x_col0 + col] = acc[slab][g];
-                    }
-                }
-            }
-        }
-    }
-}
-#endif
-
-#if defined(__HIP__)
-#define CONVROT_GROUP_DOT_BOUNDS __launch_bounds__(256, 4)
-#else
-#define CONVROT_GROUP_DOT_BOUNDS
-#endif
-
-extern "C" __global__ CONVROT_GROUP_DOT_BOUNDS void convrot_group_dot(
-    const __nv_bfloat16* x, float* y, const __nv_bfloat16* table, int rows, int k, int group) {
-    convrot_group_dot_tile<false, 1>(x, y, table, rows, k, group);
-}
-
-extern "C" __global__ CONVROT_GROUP_DOT_BOUNDS void convrot_group_dot_silu(
-    const __nv_bfloat16* gu, float* y, const __nv_bfloat16* table, int rows, int k, int group) {
-    convrot_group_dot_tile<true, 1>(gu, y, table, rows, k, group);
-}
-
-extern "C" __global__ CONVROT_GROUP_DOT_BOUNDS void convrot_group_dot_32(
-    const __nv_bfloat16* x, float* y, const __nv_bfloat16* table, int rows, int k, int group) {
-    convrot_group_dot_tile<false, 2>(x, y, table, rows, k, group);
-}
-
-extern "C" __global__ CONVROT_GROUP_DOT_BOUNDS void convrot_group_dot_silu_32(
-    const __nv_bfloat16* gu, float* y, const __nv_bfloat16* table, int rows, int k, int group) {
-    convrot_group_dot_tile<true, 2>(gu, y, table, rows, k, group);
-}
-
-// Block 256. Dynamic smem is tile_rows * k f32. Each live row is loaded once, coalesced.
-// Warp peaks reuse that row's first 8 floats, then the reciprocal does. k >= 8.
-// s = max(peak, 1e-12) / 127. q = rint(v * (1/s)), clamped to [-127, 127].
-constexpr int CONVROT_QUANT_THREADS = 256;
-
-extern "C" __global__ void convrot_quantize(const float* __restrict__ xr, int8_t* __restrict__ codes,
-                                            float* __restrict__ scales, int rows, int k, int tile_rows) {
-    extern __shared__ float quant_tile[];
-    const int tid = static_cast<int>(threadIdx.x);
-    const int lane = tid & 31;
-    const int wid = tid >> 5;
-    const int row0 = static_cast<int>(blockIdx.x) * tile_rows;
-    for (int r = 0; r < tile_rows; ++r) {
-        const int row = row0 + r;
-        if (row < rows) {
-            const float* src = xr + static_cast<long long>(row) * k;
-            float* dst = quant_tile + static_cast<long long>(r) * k;
-            for (int col = tid; col < k; col += CONVROT_QUANT_THREADS) dst[col] = src[col];
-        }
-    }
-    __syncthreads();
-    for (int r = 0; r < tile_rows; ++r) {
-        const int row = row0 + r;
-        const bool live = row < rows;
-        float* row_tile = quant_tile + static_cast<long long>(r) * k;
-        float peak = 0.f;
-        if (live) {
-            for (int col = tid; col < k; col += CONVROT_QUANT_THREADS)
-                peak = fmaxf(peak, fabsf(row_tile[col]));
-        }
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            peak = fmaxf(peak, __shfl_xor_sync(FF_WARP_MASK, peak, off));
-        __syncthreads();
-        float saved = 0.f;
-        if (live && tid < 8) saved = row_tile[tid];
-        __syncthreads();
-        if (live && lane == 0) row_tile[wid] = peak;
-        __syncthreads();
-        if (live && tid == 0) {
-            float reduced = 0.f;
-            for (int w = 0; w < 8; ++w) reduced = fmaxf(reduced, row_tile[w]);
-            const float scale = __fdiv_rn(fmaxf(reduced, 1e-12f), 127.f);
-            scales[row] = scale;
-            row_tile[0] = __fdiv_rn(1.f, scale);
-        }
-        __syncthreads();
-        float inv = 0.f;
-        if (live) inv = row_tile[0];
-        __syncthreads();
-        if (live && tid < 8) row_tile[tid] = saved;
-        __syncthreads();
-        if (live) {
-            int8_t* dst = codes + static_cast<long long>(row) * k;
-            for (int col = tid; col < k; col += CONVROT_QUANT_THREADS) {
-                float q = rintf(__fmul_rn(row_tile[col], inv));
-                q = fminf(fmaxf(q, -127.f), 127.f);
-                dst[col] = static_cast<int8_t>(static_cast<int>(q));
-            }
-        }
-        __syncthreads();
-    }
 }
 
 #if !defined(__HIP__)
@@ -1736,3 +1204,360 @@ extern "C" __global__ __launch_bounds__(512, 1) void convrot_product_n_fast_ldsm
 }
 #endif
 #endif /* ff-sm80 */
+
+// Fused 1-pass Radix-4 regular Hadamard + per-row INT8 quantize (CUDA sm75+ and HIP wave32).
+// Grid: (rows, 1, 1). Each warp processes 256-element chunks (8 consecutive elements per lane).
+// H4/2 butterfly: s = 0.5 * ((x0 + x1) + (x2 + x3)), y_q = s - x_{3-q} in f32 round-to-nearest.
+__device__ __forceinline__ uint4 convrot_fwht_load_u128(const void* p) {
+#if defined(__HIP__)
+    return *reinterpret_cast<const uint4*>(p);
+#else
+    uint4 v;
+    asm volatile("ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p));
+    return v;
+#endif
+}
+
+template <bool SILU>
+__device__ __forceinline__ void convrot_fwht_load_row8(const __nv_bfloat16* __restrict__ x_row, int k, int col,
+                                                       float (&v)[8]) {
+    if (col < k) {
+        const uint4 lower_u = convrot_fwht_load_u128(x_row + col);
+        const auto* lower = reinterpret_cast<const __nv_bfloat16*>(&lower_u);
+        if constexpr (SILU) {
+            const uint4 upper_u = convrot_fwht_load_u128(x_row + k + col);
+            const auto* up = reinterpret_cast<const __nv_bfloat16*>(&upper_u);
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float u = __bfloat162float(up[j]);
+                const __nv_bfloat16 gated = __hmul(__float2bfloat16(u / (1.0f + expf(-u))), lower[j]);
+                v[j] = __bfloat162float(gated);
+            }
+        } else {
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                v[j] = __bfloat162float(lower[j]);
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            v[j] = 0.0f;
+        }
+    }
+}
+
+template <bool PROBE>
+__device__ __forceinline__ void convrot_fwht_warp(float (&v)[8], int stages, int mutant) {
+    const int eff_stages = (PROBE && mutant == 1) ? (stages > 0 ? stages - 1 : 0) : stages;
+    if (eff_stages >= 1) {
+        #pragma unroll
+        for (int base = 0; base < 8; base += 4) {
+            const float x0 = v[base + 0];
+            const float x1 = v[base + 1];
+            const float x2 = v[base + 2];
+            const float x3 = v[base + 3];
+            const float sum = __fadd_rn(__fadd_rn(x0, x1), __fadd_rn(x2, x3));
+            const float opp0 = (PROBE && mutant == 2 && base == 0) ? x3 : -x3;
+            v[base + 0] = fmaf(0.5f, sum, opp0);
+            v[base + 1] = fmaf(0.5f, sum, -x2);
+            v[base + 2] = fmaf(0.5f, sum, -x1);
+            v[base + 3] = fmaf(0.5f, sum, -x0);
+        }
+    }
+    if (eff_stages >= 2) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float lo = v[j];
+            const float hi = v[j + 4];
+            const float lo_p = __shfl_xor_sync(FF_WARP_MASK, lo, 1);
+            const float hi_p = __shfl_xor_sync(FF_WARP_MASK, hi, 1);
+            const float sum = __fadd_rn(__fadd_rn(lo, hi), __fadd_rn(lo_p, hi_p));
+            v[j] = fmaf(0.5f, sum, -hi_p);
+            v[j + 4] = fmaf(0.5f, sum, -lo_p);
+        }
+    }
+    if (eff_stages >= 3) {
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float x = v[j];
+            const float t1 = __fadd_rn(x, __shfl_xor_sync(FF_WARP_MASK, x, 2));
+            const float sum = __fadd_rn(t1, __shfl_xor_sync(FF_WARP_MASK, t1, 4));
+            const float opp = __shfl_xor_sync(FF_WARP_MASK, x, 6);
+            v[j] = fmaf(0.5f, sum, -opp);
+        }
+    }
+    if (eff_stages >= 4) {
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float x = v[j];
+            const float t1 = __fadd_rn(x, __shfl_xor_sync(FF_WARP_MASK, x, 8));
+            const float sum = __fadd_rn(t1, __shfl_xor_sync(FF_WARP_MASK, t1, 16));
+            const float opp = __shfl_xor_sync(FF_WARP_MASK, x, 24);
+            v[j] = fmaf(0.5f, sum, -opp);
+        }
+    }
+}
+
+__device__ __forceinline__ uint2 convrot_quantize_pack8(const float (&v)[8], float inv) {
+    unsigned lo = 0u;
+    unsigned hi = 0u;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float q0 = rintf(__fmul_rn(v[j], inv));
+        q0 = fminf(fmaxf(q0, -127.0f), 127.0f);
+        const unsigned b0 = static_cast<unsigned>(static_cast<unsigned char>(static_cast<int8_t>(static_cast<int>(q0))));
+        lo |= b0 << (j * 8);
+
+        float q1 = rintf(__fmul_rn(v[j + 4], inv));
+        q1 = fminf(fmaxf(q1, -127.0f), 127.0f);
+        const unsigned b1 = static_cast<unsigned>(static_cast<unsigned char>(static_cast<int8_t>(static_cast<int>(q1))));
+        hi |= b1 << (j * 8);
+    }
+    return make_uint2(lo, hi);
+}
+
+template <bool SILU, int MAX_CHUNKS, bool PROBE>
+__device__ __forceinline__ void convrot_fwht_quantize_reg(
+    const __nv_bfloat16* __restrict__ x, float* __restrict__ rotated, int8_t* __restrict__ codes,
+    float* __restrict__ scales, int rows, int k, int group, int mutant) {
+    const unsigned ugroup = static_cast<unsigned>(group);
+    const int threads = static_cast<int>(blockDim.x);
+    const int warps = threads >> 5;
+    if (rows <= 0 || k <= 0 || ugroup < 4u || ugroup > 256u || (ugroup & (ugroup - 1u)) != 0u ||
+        ((__ffs(static_cast<int>(ugroup)) - 1) & 1) != 0 ||
+        (static_cast<unsigned>(k) & (ugroup - 1u)) != 0u || (k & 7) != 0 ||
+        (threads & 31) != 0 || threads <= 0 || threads > 1024 ||
+        ((k + 255) >> 8) > MAX_CHUNKS * warps ||
+        ((reinterpret_cast<unsigned long long>(x) & 15ull) != 0ull) ||
+        ((reinterpret_cast<unsigned long long>(codes) & 7ull) != 0ull)) {
+        __trap();
+    }
+    const int row = static_cast<int>(blockIdx.x);
+    if (row >= rows) return;
+    const int stages = (__ffs(static_cast<int>(ugroup)) - 1) >> 1;
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int wid = tid >> 5;
+    const __nv_bfloat16* x_row = x + static_cast<long long>(row) * (SILU ? 2LL * k : k);
+    float out[MAX_CHUNKS][8];
+    float peak = 0.0f;
+    #pragma unroll
+    for (int c = 0; c < MAX_CHUNKS; ++c) {
+        const int chunk = wid + c * warps;
+        if ((chunk << 8) < k) {
+            const int col = (chunk << 8) + (lane << 3);
+            convrot_fwht_load_row8<SILU>(x_row, k, col, out[c]);
+            convrot_fwht_warp<PROBE>(out[c], stages, mutant);
+            if (col < k) {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    peak = fmaxf(peak, fabsf(out[c][j]));
+                }
+            }
+        }
+    }
+    __shared__ float warp_peaks[32];
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        peak = fmaxf(peak, __shfl_xor_sync(FF_WARP_MASK, peak, off));
+    }
+    if (lane == 0) warp_peaks[wid] = peak;
+    __syncthreads();
+    float w = (lane < warps) ? warp_peaks[lane] : 0.0f;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        w = fmaxf(w, __shfl_xor_sync(FF_WARP_MASK, w, off));
+    }
+    const float scale = __fdiv_rn(fmaxf(w, 1e-12f), 127.0f);
+    if (tid == 0) scales[row] = scale;
+    const float inv = __fdiv_rn(1.0f, scale);
+    int8_t* dst = codes + static_cast<long long>(row) * k;
+    float* rdst = PROBE ? (rotated + static_cast<long long>(row) * k) : nullptr;
+    #pragma unroll
+    for (int c = 0; c < MAX_CHUNKS; ++c) {
+        const int chunk = wid + c * warps;
+        const int col = (chunk << 8) + (lane << 3);
+        if (col < k) {
+            if constexpr (PROBE) {
+                *reinterpret_cast<float4*>(rdst + col) =
+                    make_float4(out[c][0], out[c][1], out[c][2], out[c][3]);
+                *reinterpret_cast<float4*>(rdst + col + 4) =
+                    make_float4(out[c][4], out[c][5], out[c][6], out[c][7]);
+            }
+            *reinterpret_cast<uint2*>(dst + col) = convrot_quantize_pack8(out[c], inv);
+        }
+    }
+}
+
+template <bool SILU, bool PROBE>
+__device__ __forceinline__ void convrot_fwht_quantize_smem_impl(
+    const __nv_bfloat16* __restrict__ x, float* __restrict__ rotated, int8_t* __restrict__ codes,
+    float* __restrict__ scales, int rows, int k, int group, int mutant) {
+    const unsigned ugroup = static_cast<unsigned>(group);
+    const int threads = static_cast<int>(blockDim.x);
+    const int warps = threads >> 5;
+    if (rows <= 0 || k <= 0 || ugroup < 4u || (ugroup & (ugroup - 1u)) != 0u ||
+        ((__ffs(static_cast<int>(ugroup)) - 1) & 1) != 0 ||
+        (static_cast<unsigned>(k) & (ugroup - 1u)) != 0u || (k & 7) != 0 ||
+        (threads & 31) != 0 || threads <= 0 || threads > 1024 ||
+        ((reinterpret_cast<unsigned long long>(x) & 15ull) != 0ull) ||
+        ((reinterpret_cast<unsigned long long>(codes) & 7ull) != 0ull)) {
+        __trap();
+    }
+    const int row = static_cast<int>(blockIdx.x);
+    if (row >= rows) return;
+    extern __shared__ __align__(16) float fwht_smem[];
+    __shared__ float warp_peaks[32];
+    const int stages = (__ffs(static_cast<int>(ugroup)) - 1) >> 1;
+    const int in_warp_stages = stages < 4 ? stages : 4;
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int wid = tid >> 5;
+    const int chunks = (k + 255) >> 8;
+    const __nv_bfloat16* x_row = x + static_cast<long long>(row) * (SILU ? 2LL * k : k);
+    float peak = 0.0f;
+    for (int chunk = wid; chunk < chunks; chunk += warps) {
+        const int col = (chunk << 8) + (lane << 3);
+        float v[8];
+        convrot_fwht_load_row8<SILU>(x_row, k, col, v);
+        convrot_fwht_warp<PROBE>(v, in_warp_stages, stages > 4 ? 0 : mutant);
+        if (col < k) {
+            *reinterpret_cast<float4*>(fwht_smem + col) = make_float4(v[0], v[1], v[2], v[3]);
+            *reinterpret_cast<float4*>(fwht_smem + col + 4) = make_float4(v[4], v[5], v[6], v[7]);
+            if (stages <= 4) {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    peak = fmaxf(peak, fabsf(v[j]));
+                }
+            }
+        }
+    }
+    if (stages > 4) {
+        __syncthreads();
+        const int eff_stages = (PROBE && mutant == 1) ? (stages - 1) : stages;
+        const int total_bfly = k >> 2;
+        for (int s = 4; s < eff_stages; ++s) {
+            const int shift = s << 1;
+            const int stride = 1 << shift;
+            const int mask = stride - 1;
+            for (int b = tid; b < total_bfly; b += threads) {
+                const int blk = b >> shift;
+                const int off = b & mask;
+                const int idx = (blk << (shift + 2)) + off;
+                const float x0 = fwht_smem[idx];
+                const float x1 = fwht_smem[idx + stride];
+                const float x2 = fwht_smem[idx + (stride << 1)];
+                const float x3 = fwht_smem[idx + stride * 3];
+                const float sum = __fadd_rn(__fadd_rn(x0, x1), __fadd_rn(x2, x3));
+                const float opp0 = (PROBE && mutant == 2 && s == 4 && idx == 0) ? x3 : -x3;
+                const float y0 = fmaf(0.5f, sum, opp0);
+                const float y1 = fmaf(0.5f, sum, -x2);
+                const float y2 = fmaf(0.5f, sum, -x1);
+                const float y3 = fmaf(0.5f, sum, -x0);
+                fwht_smem[idx] = y0;
+                fwht_smem[idx + stride] = y1;
+                fwht_smem[idx + (stride << 1)] = y2;
+                fwht_smem[idx + stride * 3] = y3;
+                if (s + 1 == eff_stages) {
+                    peak = fmaxf(peak, fmaxf(fmaxf(fabsf(y0), fabsf(y1)), fmaxf(fabsf(y2), fabsf(y3))));
+                }
+            }
+            __syncthreads();
+        }
+        if (PROBE && eff_stages == 4) {
+            for (int col = tid; col < k; col += threads) {
+                peak = fmaxf(peak, fabsf(fwht_smem[col]));
+            }
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        peak = fmaxf(peak, __shfl_xor_sync(FF_WARP_MASK, peak, off));
+    }
+    if (lane == 0) warp_peaks[wid] = peak;
+    __syncthreads();
+    float w = (lane < warps) ? warp_peaks[lane] : 0.0f;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        w = fmaxf(w, __shfl_xor_sync(FF_WARP_MASK, w, off));
+    }
+    const float scale = __fdiv_rn(fmaxf(w, 1e-12f), 127.0f);
+    if (tid == 0) scales[row] = scale;
+    const float inv = __fdiv_rn(1.0f, scale);
+    int8_t* dst = codes + static_cast<long long>(row) * k;
+    float* rdst = PROBE ? (rotated + static_cast<long long>(row) * k) : nullptr;
+    for (int col = tid << 3; col < k; col += threads << 3) {
+        const float4 a = *reinterpret_cast<const float4*>(fwht_smem + col);
+        const float4 b = *reinterpret_cast<const float4*>(fwht_smem + col + 4);
+        if constexpr (PROBE) {
+            *reinterpret_cast<float4*>(rdst + col) = a;
+            *reinterpret_cast<float4*>(rdst + col + 4) = b;
+        }
+        const float v[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+        *reinterpret_cast<uint2*>(dst + col) = convrot_quantize_pack8(v, inv);
+    }
+}
+
+#if defined(__HIP__)
+#define CONVROT_FWHT_BOUNDS __launch_bounds__(1024, 1)
+#else
+#define CONVROT_FWHT_BOUNDS
+#endif
+
+extern "C" __global__ CONVROT_FWHT_BOUNDS void convrot_fwht_quantize_1(
+    const __nv_bfloat16* x, int8_t* codes, float* scales, int rows, int k, int group) {
+    convrot_fwht_quantize_reg<false, 1, false>(x, nullptr, codes, scales, rows, k, group, 0);
+}
+
+extern "C" __global__ CONVROT_FWHT_BOUNDS void convrot_fwht_quantize_2(
+    const __nv_bfloat16* x, int8_t* codes, float* scales, int rows, int k, int group) {
+    convrot_fwht_quantize_reg<false, 2, false>(x, nullptr, codes, scales, rows, k, group, 0);
+}
+
+extern "C" __global__ CONVROT_FWHT_BOUNDS void convrot_fwht_quantize_4(
+    const __nv_bfloat16* x, int8_t* codes, float* scales, int rows, int k, int group) {
+    convrot_fwht_quantize_reg<false, 4, false>(x, nullptr, codes, scales, rows, k, group, 0);
+}
+
+extern "C" __global__ CONVROT_FWHT_BOUNDS void convrot_fwht_quantize_silu_1(
+    const __nv_bfloat16* gu, int8_t* codes, float* scales, int rows, int k, int group) {
+    convrot_fwht_quantize_reg<true, 1, false>(gu, nullptr, codes, scales, rows, k, group, 0);
+}
+
+extern "C" __global__ CONVROT_FWHT_BOUNDS void convrot_fwht_quantize_silu_2(
+    const __nv_bfloat16* gu, int8_t* codes, float* scales, int rows, int k, int group) {
+    convrot_fwht_quantize_reg<true, 2, false>(gu, nullptr, codes, scales, rows, k, group, 0);
+}
+
+extern "C" __global__ CONVROT_FWHT_BOUNDS void convrot_fwht_quantize_silu_4(
+    const __nv_bfloat16* gu, int8_t* codes, float* scales, int rows, int k, int group) {
+    convrot_fwht_quantize_reg<true, 4, false>(gu, nullptr, codes, scales, rows, k, group, 0);
+}
+
+extern "C" __global__ CONVROT_FWHT_BOUNDS void convrot_fwht_quantize_smem(
+    const __nv_bfloat16* x, int8_t* codes, float* scales, int rows, int k, int group) {
+    convrot_fwht_quantize_smem_impl<false, false>(x, nullptr, codes, scales, rows, k, group, 0);
+}
+
+extern "C" __global__ CONVROT_FWHT_BOUNDS void convrot_fwht_quantize_silu_smem(
+    const __nv_bfloat16* gu, int8_t* codes, float* scales, int rows, int k, int group) {
+    convrot_fwht_quantize_smem_impl<true, false>(gu, nullptr, codes, scales, rows, k, group, 0);
+}
+
+extern "C" __global__ CONVROT_FWHT_BOUNDS void convrot_fwht_quantize_probe(
+    const __nv_bfloat16* x, float* rotated, int8_t* codes, float* scales, int rows, int k, int group, int mutant) {
+    convrot_fwht_quantize_reg<false, 4, true>(x, rotated, codes, scales, rows, k, group, mutant);
+}
+
+extern "C" __global__ CONVROT_FWHT_BOUNDS void convrot_fwht_quantize_silu_probe(
+    const __nv_bfloat16* gu, float* rotated, int8_t* codes, float* scales, int rows, int k, int group, int mutant) {
+    convrot_fwht_quantize_reg<true, 4, true>(gu, rotated, codes, scales, rows, k, group, mutant);
+}
+
+extern "C" __global__ CONVROT_FWHT_BOUNDS void convrot_fwht_quantize_smem_probe(
+    const __nv_bfloat16* x, float* rotated, int8_t* codes, float* scales, int rows, int k, int group, int mutant) {
+    convrot_fwht_quantize_smem_impl<false, true>(x, rotated, codes, scales, rows, k, group, mutant);
+}

@@ -1,11 +1,12 @@
 //! Int8 linear with a block-diagonal regular Hadamard rotate-quant prologue.
 //! `y = bf16((q(x R) @ qweight^T) * s_x * wscale)`, int32 products.
-//! `R` is `kron(H4 / 2, ...)` of `group` (a power of 4). At [`TENSOR_CORE_ROWS`] the device holds
-//! `group * group` bf16 entries, `table[col * group + row]`.
+//! `R` is `kron(H4 / 2, ...)` of `group` (a power of 4).
 //! Below [`TENSOR_CORE_ROWS`], `x` is f32 cast to bf16, each rotated group is an f32 dot rounded
 //! back to bf16, `s_x = max(|xR|, 1e-12) / 127`, and `q` is ties-to-even of `xR / s_x`.
-//! At [`TENSOR_CORE_ROWS`] and above, `x` is bf16. The device kernel's dot is `mma.m16n8k16` (bf16 in, f32
-//! accumulator, K in groups of 16) and `q` is ties-to-even of `xR * (1/s_x)`.
+//! At [`TENSOR_CORE_ROWS`] and above, `x` is bf16. The fused device kernel computes the Radix-4
+//! regular Hadamard transform in f32 round-to-nearest (register-resident up to `group = 256`,
+//! shared-memory staged above) and quantizes `q = rint(xR * (1/s_x))` in one pass with no
+//! intermediate f32 rotation buffer in global memory.
 //! The int8 product is `mma.m16n8k32` on a 128×256×64 tile, 512 threads, 49,152 or 61,440 bytes dynamic smem.
 //! [`linear`] is the below-[`TENSOR_CORE_ROWS`] form.
 #[cfg(any(test, feature = "cuda", feature = "rocm"))]
@@ -187,83 +188,164 @@ fn linear_omitting_rotation(
     int8_product(&codes, &scales, k, qweight, n, wscale)
 }
 
+/// Static shared bytes reserved for warp-peak reduction in the fused FWHT kernels (`32 * f32`).
 #[cfg(any(test, feature = "cuda", feature = "rocm"))]
-fn group_dot_b_smem(arch: &crate::backend::setup::DeviceArchitecture) -> u32 {
-    match arch {
-        crate::backend::setup::DeviceArchitecture::Cuda(_) => 2048,
-        crate::backend::setup::DeviceArchitecture::Hip(_) => 0,
-    }
+pub(crate) const FWHT_PEAK_SMEM_BYTES: usize = 128;
+
+/// Dynamic shared bytes available to the shared-memory FWHT kernel, 16-byte aligned.
+#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+pub(crate) fn fwht_max_dynamic_smem(optin: usize) -> Result<u32> {
+    let avail = optin.saturating_sub(FWHT_PEAK_SMEM_BYTES) / 16 * 16;
+    ensure!(avail >= 16, "convrot opt-in shared memory {optin}");
+    u32::try_from(avail).context("convrot opt-in shared memory")
 }
 
-/// Dynamic shared bytes of one 16-row group tile (CUDA adds eight 8×16 bf16 Hadamard tiles).
+/// Validates that `group` is a supported power of 4 and fits `optin` when staged in shared memory.
 #[cfg(any(test, feature = "cuda", feature = "rocm"))]
-pub(crate) fn group_dot_smem(group: u32) -> u32 {
-    #[cfg(feature = "rocm")]
-    {
-        32 * group
-    }
-    #[cfg(not(feature = "rocm"))]
-    {
-        32 * group + 2048
-    }
-}
-
-// A 32-row grid must fill at least one wave of resident CTAs.
-#[cfg(any(test, feature = "cuda", feature = "rocm"))]
-pub(crate) fn group_dot_32_fills_wave(rows: usize, k: usize, wave: Option<usize>) -> bool {
-    let ctas = rows.div_ceil(32) * (k / 256);
-    let enabled = rows >= TENSOR_CORE_ROWS && wave.is_some_and(|wave| ctas >= wave);
-    #[cfg(any(feature = "cuda", feature = "rocm"))]
-    if crate::backend::diagnostics_enabled() {
-        let tile_rows = if enabled { 32 } else { 16 };
-        let wave = wave.unwrap_or(0);
-        eprintln!(
-            "CONVROT_ROTATE_32_SELECT rows={rows} k={k} ctas={ctas} wave={wave} tile_rows={tile_rows}"
+pub(crate) fn ensure_group(group: u32, optin: usize) -> Result<()> {
+    let g = usize::try_from(group)?;
+    ensure!(
+        power_of_four(g),
+        "convrot group {group} is not a power of 4"
+    );
+    if g > 256 {
+        let need = g.checked_mul(4).context("convrot group smem")?;
+        let avail = usize::try_from(fwht_max_dynamic_smem(optin)?)?;
+        ensure!(
+            need <= avail,
+            "convrot group {group} requires {need} shared bytes (available {avail})"
         );
     }
-    enabled
+    Ok(())
 }
 
-/// Largest multiple of 16 whose [`group_dot_smem`] fits in `optin` bytes.
+/// Fused 1-pass Radix-4 FWHT + quantize execution plan, derived at setup from hardware resources.
 #[cfg(any(test, feature = "cuda", feature = "rocm"))]
-pub(crate) fn max_group(optin: usize) -> Result<u32> {
-    let bytes = u32::try_from(optin).context("convrot opt-in shared memory")?;
-    let b_smem = group_dot_smem(0);
-    ensure!(
-        bytes >= b_smem + 512,
-        "convrot opt-in shared memory {optin}"
-    );
-    let raw = (bytes - b_smem) / 32;
-    let group = raw / 16 * 16;
-    ensure!(group >= 16, "convrot opt-in shared memory {optin}");
-    ensure!(
-        group_dot_smem(group) <= bytes,
-        "convrot group {group} tile exceeds opt-in {optin}"
-    );
-    Ok(group)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RotatePlan {
+    /// Register-resident (`group <= 256`, `chunks_per_warp ∈ {1, 2, 4}`, `<= 128 B` static smem).
+    Register { chunks_per_warp: u8, threads: u32 },
+    /// Shared-memory staged (`group > 256` or `k` beyond register capacity; `smem_bytes = k * 4`).
+    Shared { threads: u32, smem_bytes: u32 },
 }
 
-/// `group` fits the tile derived from `optin`. Returns that tile.
 #[cfg(any(test, feature = "cuda", feature = "rocm"))]
-pub(crate) fn ensure_group(group: u32, optin: usize) -> Result<u32> {
-    let max = max_group(optin)?;
-    ensure!(
-        group <= max,
-        "convrot group {group} exceeds device tile {max}"
-    );
-    Ok(max)
+impl RotatePlan {
+    pub(crate) const fn symbol_name(self, fuse_silu: bool) -> &'static str {
+        match (self, fuse_silu) {
+            (
+                Self::Register {
+                    chunks_per_warp: 1, ..
+                },
+                false,
+            ) => "convrot_fwht_quantize_1",
+            (
+                Self::Register {
+                    chunks_per_warp: 2, ..
+                },
+                false,
+            ) => "convrot_fwht_quantize_2",
+            (
+                Self::Register {
+                    chunks_per_warp: 4, ..
+                },
+                false,
+            ) => "convrot_fwht_quantize_4",
+            (
+                Self::Register {
+                    chunks_per_warp: 1, ..
+                },
+                true,
+            ) => "convrot_fwht_quantize_silu_1",
+            (
+                Self::Register {
+                    chunks_per_warp: 2, ..
+                },
+                true,
+            ) => "convrot_fwht_quantize_silu_2",
+            (
+                Self::Register {
+                    chunks_per_warp: 4, ..
+                },
+                true,
+            ) => "convrot_fwht_quantize_silu_4",
+            (Self::Shared { .. }, false) => "convrot_fwht_quantize_smem",
+            (Self::Shared { .. }, true) => "convrot_fwht_quantize_silu_smem",
+            _ => unreachable!(),
+        }
+    }
 }
 
-/// Rows in one `convrot_quantize` tile: `optin / (k * 4)`.
+/// Derives the fused FWHT plan from detected device properties and per-variant `(chunks_per_warp, threads, local_bytes, active_ctas)`.
 #[cfg(any(test, feature = "cuda", feature = "rocm"))]
-pub(crate) fn quantize_rows(optin: usize, k: u32) -> Result<u32> {
-    let bytes = u32::try_from(optin).context("convrot opt-in shared memory")?;
-    let width = k.checked_mul(4).context("convrot quantize row")?;
+pub(crate) fn select_rotate_plan(
+    info: &crate::backend::setup::DeviceInfo,
+    k: usize,
+    group: usize,
+    reg_candidates: &[(u8, u32, i32, u32)],
+) -> Result<RotatePlan> {
     ensure!(
-        width > 0 && width <= bytes,
-        "convrot quantize k {k} exceeds opt-in {optin}"
+        info.warp == 32 && info.max_threads >= 32,
+        "convrot FWHT requires warp32 device (warp={} max_threads={})",
+        info.warp,
+        info.max_threads
     );
-    Ok(bytes / width)
+    ensure!(
+        power_of_four(group) && k > 0 && k.is_multiple_of(group) && k.is_multiple_of(8),
+        "convrot FWHT shape k={k} group={group}"
+    );
+    let max_warps = ((info.max_threads / 32) as usize).min(32);
+    let chunks = k.div_ceil(256);
+    if group <= 256 {
+        let mut best = None;
+        for &(chunks_per_warp, threads, local, active) in reg_candidates {
+            if !matches!(chunks_per_warp, 1 | 2 | 4)
+                || local != 0
+                || active == 0
+                || threads == 0
+                || !threads.is_multiple_of(32)
+                || threads as usize > max_warps * 32
+            {
+                continue;
+            }
+            let warps = (threads as usize) / 32;
+            if chunks > usize::from(chunks_per_warp) * warps {
+                continue;
+            }
+            let score = (
+                u64::from(active) * (chunks as u64) * u64::from(4 / chunks_per_warp),
+                active >= 2,
+                std::cmp::Reverse(chunks_per_warp),
+                active,
+            );
+            let plan = RotatePlan::Register {
+                chunks_per_warp,
+                threads,
+            };
+            if best.is_none_or(|(prev, _)| score > prev) {
+                best = Some((score, plan));
+            }
+        }
+        if let Some((_, plan)) = best {
+            return Ok(plan);
+        }
+    }
+    let avail = usize::try_from(fwht_max_dynamic_smem(info.optin_shared_bytes)?)?;
+    let need = k.checked_mul(4).context("convrot FWHT smem")?;
+    ensure!(
+        need <= avail,
+        "convrot FWHT k={k} group={group} requires {need} shared bytes (available {avail})"
+    );
+    let target_warps = if need * 2 <= avail {
+        chunks.clamp(1, 8)
+    } else {
+        chunks.clamp(1, 16)
+    }
+    .min(max_warps);
+    Ok(RotatePlan::Shared {
+        threads: u32::try_from(target_warps * 32)?,
+        smem_bytes: u32::try_from(need)?,
+    })
 }
 
 #[cfg(test)]
@@ -273,10 +355,145 @@ mod tests {
     use half::bf16;
 
     #[test]
-    fn group_dot_32_requires_a_full_wave() {
-        assert!(!super::group_dot_32_fills_wave(960, 5376, Some(640)));
-        assert!(super::group_dot_32_fills_wave(961, 5376, Some(640)));
-        assert!(super::group_dot_32_fills_wave(960, 5376, Some(630)));
+    fn fwht_rotate_plan_derives_register_and_shared_across_gpu_classes() -> Result<()> {
+        use super::{RotatePlan, ensure_group, select_rotate_plan};
+
+        let sm89 = mock_device_info(89, 128, 72 << 20, 101_376);
+        let sm80 = mock_device_info(80, 108, 40 << 20, 166_912);
+        let sm90 = mock_device_info(90, 132, 50 << 20, 232_448);
+        let sm75 = mock_device_info(75, 40, 6 << 20, 65_536);
+        let sm120 = mock_device_info(120, 188, 128 << 20, 101_376);
+        let gfx1100 = mock_hip_device_info("gfx1100", 48, 6 << 20, 65_536);
+
+        // sm89 / sm120 (48 warps/SM): K=5376 -> c=1 (21 warps, 2 CTAs); K=7168 -> c=2 (14 warps, 3 CTAs);
+        // K=14336 -> c=4 (14 warps, 2 CTAs beats 1 CTA at c=2; falls to c=2 if c=4 spills).
+        for info in [&sm89, &sm120] {
+            assert_eq!(
+                select_rotate_plan(
+                    info,
+                    5376,
+                    256,
+                    &[(1, 672, 0, 2), (2, 352, 0, 4), (4, 192, 0, 6)]
+                )?,
+                RotatePlan::Register {
+                    chunks_per_warp: 1,
+                    threads: 672
+                }
+            );
+            assert_eq!(
+                select_rotate_plan(
+                    info,
+                    7168,
+                    256,
+                    &[(1, 896, 0, 1), (2, 448, 0, 3), (4, 224, 0, 5)]
+                )?,
+                RotatePlan::Register {
+                    chunks_per_warp: 2,
+                    threads: 448
+                }
+            );
+            assert_eq!(
+                select_rotate_plan(info, 14336, 256, &[(2, 896, 0, 1), (4, 448, 0, 2)])?,
+                RotatePlan::Register {
+                    chunks_per_warp: 4,
+                    threads: 448
+                }
+            );
+            assert_eq!(
+                select_rotate_plan(info, 14336, 256, &[(2, 896, 0, 1), (4, 448, 16, 2)])?,
+                RotatePlan::Register {
+                    chunks_per_warp: 2,
+                    threads: 896
+                }
+            );
+        }
+        // sm80 / sm90 (64 warps/SM): K=5376 -> c=1 (3 CTAs); K=7168 -> c=1 (2 CTAs); K=14336 -> c=2 (2 CTAs).
+        for info in [&sm80, &sm90] {
+            assert_eq!(
+                select_rotate_plan(info, 5376, 256, &[(1, 672, 0, 3), (2, 352, 0, 5)])?,
+                RotatePlan::Register {
+                    chunks_per_warp: 1,
+                    threads: 672
+                }
+            );
+            assert_eq!(
+                select_rotate_plan(info, 7168, 256, &[(1, 896, 0, 2), (2, 448, 0, 4)])?,
+                RotatePlan::Register {
+                    chunks_per_warp: 1,
+                    threads: 896
+                }
+            );
+            assert_eq!(
+                select_rotate_plan(info, 14336, 256, &[(2, 896, 0, 2), (4, 448, 0, 4)])?,
+                RotatePlan::Register {
+                    chunks_per_warp: 2,
+                    threads: 896
+                }
+            );
+        }
+        // sm75 T4 (32 warps/SM): prefers 2 CTAs/SM over 1 CTA/SM at equal parallel chunks.
+        assert_eq!(
+            select_rotate_plan(&sm75, 5376, 256, &[(1, 672, 0, 1), (2, 352, 0, 2)])?,
+            RotatePlan::Register {
+                chunks_per_warp: 2,
+                threads: 352
+            }
+        );
+        // gfx1100 wave32: register-resident plan derived identically.
+        assert_eq!(
+            select_rotate_plan(&gfx1100, 7168, 256, &[(1, 896, 0, 1), (2, 448, 0, 2)])?,
+            RotatePlan::Register {
+                chunks_per_warp: 2,
+                threads: 448
+            }
+        );
+        // group > 256 derives Shared smem path; K beyond register capacity derives Shared on H100 and errors on sm89.
+        let smem_plan = select_rotate_plan(&sm89, 7168, 1024, &[])?;
+        assert_eq!(
+            smem_plan,
+            RotatePlan::Shared {
+                threads: 256,
+                smem_bytes: 28_672
+            }
+        );
+        assert_eq!(smem_plan.symbol_name(false), "convrot_fwht_quantize_smem");
+        assert_eq!(
+            smem_plan.symbol_name(true),
+            "convrot_fwht_quantize_silu_smem"
+        );
+        for (c, plain, silu) in [
+            (
+                1u8,
+                "convrot_fwht_quantize_1",
+                "convrot_fwht_quantize_silu_1",
+            ),
+            (2, "convrot_fwht_quantize_2", "convrot_fwht_quantize_silu_2"),
+            (4, "convrot_fwht_quantize_4", "convrot_fwht_quantize_silu_4"),
+        ] {
+            let p = RotatePlan::Register {
+                chunks_per_warp: c,
+                threads: 256,
+            };
+            assert_eq!(p.symbol_name(false), plain);
+            assert_eq!(p.symbol_name(true), silu);
+        }
+        assert_eq!(
+            select_rotate_plan(&sm90, 49_152, 256, &[])?,
+            RotatePlan::Shared {
+                threads: 512,
+                smem_bytes: 196_608
+            }
+        );
+        assert!(select_rotate_plan(&sm89, 49_152, 256, &[]).is_err());
+        // Unsupported non-power-of-4 groups and non-multiple k error (no fallback).
+        assert!(select_rotate_plan(&sm89, 5376, 128, &[]).is_err());
+        assert!(select_rotate_plan(&sm89, 5376, 3, &[]).is_err());
+        assert!(select_rotate_plan(&sm89, 5380, 256, &[]).is_err());
+        ensure_group(256, sm75.optin_shared_bytes)?;
+        ensure_group(1024, sm75.optin_shared_bytes)?;
+        assert!(ensure_group(128, sm89.optin_shared_bytes).is_err());
+        assert!(ensure_group(16_384, sm75.optin_shared_bytes).is_err());
+        Ok(())
     }
 
     fn mock_device_info(
@@ -323,9 +540,7 @@ mod tests {
 
     #[test]
     fn convrot_selectors_qualify_sm80_and_decline_sm86_by_resources() {
-        use super::{
-            ProductKernel, gate_up_products, group_dot_32_resource_limits, qkv_product_eligible,
-        };
+        use super::{ProductKernel, gate_up_products, qkv_product_eligible};
 
         use ProductKernel::{MFastLdsm, MFastStriped, NFast};
 
@@ -566,30 +781,6 @@ mod tests {
             gate_up_products(&gfx1030, 2, [1509, 37_717], gate_up),
             [NFast; 2]
         );
-
-        assert_eq!(
-            group_dot_32_resource_limits(&a100),
-            Some([(48, 5), (48, 5)])
-        );
-        assert_eq!(
-            group_dot_32_resource_limits(&a4000),
-            Some([(48, 5), (48, 5)])
-        );
-        assert_eq!(
-            group_dot_32_resource_limits(&rtx4090),
-            Some([(48, 5), (48, 5)])
-        );
-        assert_eq!(group_dot_32_resource_limits(&g4), Some([(48, 5), (56, 4)]));
-        assert_eq!(group_dot_32_resource_limits(&t4), None);
-        assert_eq!(
-            group_dot_32_resource_limits(&gfx1100),
-            Some([(96, 4), (96, 4)])
-        );
-        assert_eq!(group_dot_32_resource_limits(&gfx1030), None);
-        let too_small_smem = mock_device_info(80, 108, 40 << 20, 16_384);
-        assert_eq!(group_dot_32_resource_limits(&too_small_smem), None);
-        let tiny_hip_smem = mock_hip_device_info("gfx1100", 48, 6 << 20, 8_192);
-        assert_eq!(group_dot_32_resource_limits(&tiny_hip_smem), None);
     }
 
     fn row(r: usize, i: usize) -> f32 {
@@ -673,82 +864,21 @@ mod tests {
         );
         Ok(())
     }
-
-    #[test]
-    fn group_tile_fits_the_optin() -> Result<()> {
-        let optin = 99usize << 10;
-        let max = super::max_group(optin)?;
-        let expected_1024 = if cfg!(feature = "rocm") {
-            32_768
-        } else {
-            34_816
-        };
-        ensure!(
-            max >= 1024
-                && super::group_dot_smem(1024) == expected_1024
-                && usize::try_from(super::group_dot_smem(max))? <= optin
-                && super::ensure_group(1024, optin)? == max
-                && super::max_group(64usize << 10)? >= 1024,
-            "group tile optin={optin} max={max}"
-        );
-        ensure!(
-            super::ensure_group(max + 16, optin).is_err(),
-            "group above the tile was accepted"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn quantize_rows_fit_the_optin() -> Result<()> {
-        let optin = 99usize << 10;
-        ensure!(
-            super::quantize_rows(optin, 5376)? == 4
-                && super::quantize_rows(optin, 7168)? == 3
-                && super::quantize_rows(optin, 14336)? == 1,
-            "quantize rows optin={optin}"
-        );
-        ensure!(
-            super::quantize_rows(57_343, 14336).is_err(),
-            "k above the opt-in was accepted"
-        );
-        Ok(())
-    }
 }
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub struct ConvrotFns {
     linear: crate::backend::gpu::CudaFunction,
-    hadamard: crate::backend::gpu::CudaFunction,
-    group_dot: [crate::backend::gpu::CudaFunction; 2],
-    group_dot_32: [crate::backend::gpu::CudaFunction; 2],
-    quantize: crate::backend::gpu::CudaFunction,
+    fwht_reg: [[crate::backend::gpu::CudaFunction; 3]; 2],
+    fwht_smem: [crate::backend::gpu::CudaFunction; 2],
+    #[cfg(test)]
+    fwht_probe: [crate::backend::gpu::CudaFunction; 3],
     product: [crate::backend::gpu::CudaFunction; 3],
     arch: crate::backend::setup::DeviceArchitecture,
     striped: bool,
     m_fast_one_barrier: Option<crate::backend::gpu::CudaFunction>,
     n_fast_swizzled: [Option<crate::backend::gpu::CudaFunction>; 3],
-    table: std::sync::Mutex<Option<(u32, i32, crate::backend::gpu::CudaSlice<u16>)>>,
-    max_group: u32,
     optin: usize,
-}
-
-#[cfg(any(feature = "cuda", feature = "rocm"))]
-std::thread_local! {
-    static HADAMARD_FLIP: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
-}
-
-#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
-pub(crate) fn with_hadamard_flip<T>(index: i32, body: impl FnOnce() -> T) -> T {
-    struct Restore(i32);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            HADAMARD_FLIP.with(|cell| cell.set(self.0));
-        }
-    }
-    let restore = Restore(HADAMARD_FLIP.with(|cell| cell.replace(index)));
-    let result = body();
-    drop(restore);
-    result
 }
 
 #[cfg(any(test, feature = "cuda", feature = "rocm"))]
@@ -773,7 +903,6 @@ pub struct ConvrotArgs {
     pub qweight: u64,
     pub wscale: u64,
     pub y: u64,
-    pub rotated: u64,
     pub codes: u64,
     pub scales: u64,
     pub rows: i32,
@@ -782,7 +911,7 @@ pub struct ConvrotArgs {
     pub group: i32,
     pub product: ProductKernel,
     pub fuse_silu: bool,
-    pub rotate_32: bool,
+    pub rotate: Option<RotatePlan>,
 }
 
 #[cfg(any(test, feature = "cuda", feature = "rocm"))]
@@ -1154,56 +1283,107 @@ pub(crate) fn gate_up_product_order(
     Ok(selected)
 }
 
-#[cfg(any(test, feature = "cuda", feature = "rocm"))]
-fn group_dot_32_smem(arch: &crate::backend::setup::DeviceArchitecture) -> u32 {
-    2 * 8192 + group_dot_b_smem(arch)
-}
-
-#[cfg(any(test, feature = "cuda", feature = "rocm"))]
-pub(crate) fn group_dot_32_resource_limits(
-    info: &crate::backend::setup::DeviceInfo,
-) -> Option<[(i32, u32); 2]> {
-    use crate::backend::setup::DeviceArchitecture::{Cuda, Hip};
-    if info.warp != 32 || info.optin_shared_bytes < group_dot_32_smem(&info.arch) as usize {
-        return None;
-    }
-    match &info.arch {
-        Cuda(120) => Some([(48, 5), (56, 4)]),
-        Cuda(sm) if *sm >= 80 => Some([(48, 5), (48, 5)]),
-        Hip(gfx) if gfx.starts_with("gfx11") => Some([(96, 4), (96, 4)]),
-        _ => None,
-    }
-}
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+const FWHT_REG_NAMES: [[&str; 3]; 2] = [
+    [
+        "convrot_fwht_quantize_1",
+        "convrot_fwht_quantize_2",
+        "convrot_fwht_quantize_4",
+    ],
+    [
+        "convrot_fwht_quantize_silu_1",
+        "convrot_fwht_quantize_silu_2",
+        "convrot_fwht_quantize_silu_4",
+    ],
+];
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
-const GROUP_DOT_32_NAMES: [&str; 2] = ["convrot_group_dot_32", "convrot_group_dot_silu_32"];
+const FWHT_SMEM_NAMES: [&str; 2] = [
+    "convrot_fwht_quantize_smem",
+    "convrot_fwht_quantize_silu_smem",
+];
 
+#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+const FWHT_PROBE_NAMES: [&str; 3] = [
+    "convrot_fwht_quantize_probe",
+    "convrot_fwht_quantize_silu_probe",
+    "convrot_fwht_quantize_smem_probe",
+];
+
+/// Derives the fused 1-pass Radix-4 FWHT + quantize plan once at setup from hardware resources.
 #[cfg(any(feature = "cuda", feature = "rocm"))]
-pub(crate) fn group_dot_32_wave_sizes(
+pub(crate) fn derive_rotate_plan(
     device: &crate::backend::cuda::Device,
-) -> Result<[Option<usize>; 2]> {
-    let Some(limits) = group_dot_32_resource_limits(&device.info) else {
-        return Ok([None; 2]);
-    };
-    let smem = group_dot_32_smem(&device.info.arch) as usize;
+    k: usize,
+    group: usize,
+    fuse_silu: bool,
+) -> Result<RotatePlan> {
+    let info = &device.info;
+    ensure!(
+        info.warp == 32 && info.max_threads >= 32,
+        "convrot FWHT requires warp32 device (warp={} max_threads={})",
+        info.warp,
+        info.max_threads
+    );
+    ensure!(
+        power_of_four(group) && k > 0 && k.is_multiple_of(group) && k.is_multiple_of(8),
+        "convrot FWHT shape k={k} group={group}"
+    );
     let module = crate::backend::cuda::cubin::module(&device.ctx, "convrot")?;
-    let mut waves = [None; 2];
-    for ((wave, name), (max_regs, min_ctas)) in waves.iter_mut().zip(GROUP_DOT_32_NAMES).zip(limits)
-    {
-        let function = module.load_function(name)?;
-        let (registers, local, _) = function_attributes(&function)?;
-        let active = active_blocks(&function, 256, smem)?;
-        let enabled = registers <= max_regs && local == 0 && active >= min_ctas;
-        if enabled {
-            *wave = Some(device.info.sms * usize::try_from(active)?);
+    let silu = usize::from(fuse_silu);
+    let max_warps = ((info.max_threads / 32) as usize).min(32);
+    let chunks = k.div_ceil(256);
+    let mut reg_candidates = Vec::new();
+    if group <= 256 {
+        for (idx, chunks_per_warp) in [1u8, 2, 4].into_iter().enumerate() {
+            let warps = chunks.div_ceil(usize::from(chunks_per_warp));
+            if warps > max_warps {
+                continue;
+            }
+            let threads = u32::try_from(warps * 32)?;
+            let name = FWHT_REG_NAMES[silu][idx];
+            let function = module.load_function(name)?;
+            let (regs, local, _) = function_attributes(&function)?;
+            let active = active_blocks(&function, threads, 0)?;
+            if crate::backend::diagnostics_enabled() {
+                eprintln!(
+                    "CONVROT_FWHT_CANDIDATE kernel={name} k={k} group={group} threads={threads} regs={regs} local={local} active_ctas={active}"
+                );
+            }
+            reg_candidates.push((chunks_per_warp, threads, local, active));
         }
+    }
+    let plan = select_rotate_plan(info, k, group, &reg_candidates)?;
+    if let RotatePlan::Shared {
+        threads,
+        smem_bytes,
+    } = plan
+    {
+        let name = FWHT_SMEM_NAMES[silu];
+        let function = module.load_function(name)?;
+        crate::backend::cuda::set_max_dynamic_shared_bytes(
+            &function,
+            fwht_max_dynamic_smem(info.optin_shared_bytes)?,
+        )?;
+        let (regs, local, _) = function_attributes(&function)?;
+        let active = active_blocks(&function, threads, smem_bytes as usize)?;
+        ensure!(
+            local == 0 && active >= 1,
+            "ConvRot {name} regs={regs} local={local} active_ctas={active}"
+        );
         if crate::backend::diagnostics_enabled() {
             eprintln!(
-                "CONVROT_ROTATE_32_RESOURCE kernel={name} regs={registers} local={local} active_ctas={active} enabled={enabled}"
+                "CONVROT_FWHT_CANDIDATE kernel={name} k={k} group={group} threads={threads} smem={smem_bytes} regs={regs} local={local} active_ctas={active}"
             );
         }
     }
-    Ok(waves)
+    if crate::backend::diagnostics_enabled() {
+        eprintln!(
+            "CONVROT_FWHT_SELECT k={k} group={group} silu={fuse_silu} kernel={} plan={plan:?}",
+            plan.symbol_name(fuse_silu)
+        );
+    }
+    Ok(plan)
 }
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -1242,26 +1422,37 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
             (ctx.architecture().starts_with("gfx11"), false)
         }
     };
-    let hadamard = module.load_function("convrot_hadamard_table")?;
-    let group_dot = [
-        module.load_function("convrot_group_dot")?,
-        module.load_function("convrot_group_dot_silu")?,
+    let fwht_reg = [
+        [
+            module.load_function(FWHT_REG_NAMES[0][0])?,
+            module.load_function(FWHT_REG_NAMES[0][1])?,
+            module.load_function(FWHT_REG_NAMES[0][2])?,
+        ],
+        [
+            module.load_function(FWHT_REG_NAMES[1][0])?,
+            module.load_function(FWHT_REG_NAMES[1][1])?,
+            module.load_function(FWHT_REG_NAMES[1][2])?,
+        ],
     ];
-    let group_dot_32 = [
-        module.load_function(GROUP_DOT_32_NAMES[0])?,
-        module.load_function(GROUP_DOT_32_NAMES[1])?,
+    let fwht_smem = [
+        module.load_function(FWHT_SMEM_NAMES[0])?,
+        module.load_function(FWHT_SMEM_NAMES[1])?,
     ];
     let optin = crate::backend::cuda::optin_shared_bytes(ctx)?;
-    let max_group = max_group(optin)?;
-    for function in &group_dot {
-        crate::backend::cuda::set_max_dynamic_shared_bytes(function, group_dot_smem(max_group))?;
+    let fwht_dyn = fwht_max_dynamic_smem(optin)?;
+    for function in &fwht_smem {
+        crate::backend::cuda::set_max_dynamic_shared_bytes(function, fwht_dyn)?;
     }
-    for function in &group_dot_32 {
-        crate::backend::cuda::set_max_dynamic_shared_bytes(function, group_dot_32_smem(&arch))?;
-    }
-    let quantize = module.load_function("convrot_quantize")?;
-    let quant_dyn = u32::try_from(optin / 4 * 4).context("convrot quantize opt-in")?;
-    crate::backend::cuda::set_max_dynamic_shared_bytes(&quantize, quant_dyn)?;
+    #[cfg(test)]
+    let fwht_probe = {
+        let smem = module.load_function(FWHT_PROBE_NAMES[2])?;
+        crate::backend::cuda::set_max_dynamic_shared_bytes(&smem, fwht_dyn)?;
+        [
+            module.load_function(FWHT_PROBE_NAMES[0])?,
+            module.load_function(FWHT_PROBE_NAMES[1])?,
+            smem,
+        ]
+    };
     let n_fast_swizzled = {
         #[cfg(feature = "cuda")]
         {
@@ -1315,17 +1506,15 @@ pub fn load_convrot(ctx: &std::sync::Arc<crate::backend::gpu::CudaContext>) -> R
         };
     Ok(ConvrotFns {
         linear: module.load_function("convrot_linear")?,
-        hadamard,
-        group_dot,
-        group_dot_32,
-        quantize,
+        fwht_reg,
+        fwht_smem,
+        #[cfg(test)]
+        fwht_probe,
         arch,
         striped,
         n_fast_swizzled,
         m_fast_one_barrier,
         product,
-        table: std::sync::Mutex::new(None),
-        max_group,
         optin,
     })
 }
@@ -1457,83 +1646,7 @@ pub(crate) fn launch_product(
     Ok(())
 }
 
-/// Grid of `convrot_group_dot`: one block owns one row tile and one whole group.
-#[cfg(any(feature = "cuda", feature = "rocm"))]
-fn group_dot_grid(rows: u32, k: u32, group: u32, tile_rows: u32) -> (u32, u32, u32) {
-    (rows.div_ceil(tile_rows), 1, k / group)
-}
-
-#[cfg(any(feature = "cuda", feature = "rocm"))]
-fn launch_group_dot(
-    stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
-    fns: &ConvrotFns,
-    args: &ConvrotArgs,
-    rows: u32,
-    k: u32,
-    group: u32,
-) -> Result<()> {
-    use crate::backend::gpu::{DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
-    ensure!(
-        !args.rotate_32 || group == 256,
-        "32-row ConvRot requires group 256, got group {group}"
-    );
-    let flip = HADAMARD_FLIP.with(|cell| cell.get());
-    let mut slot = fns.table.lock().unwrap_or_else(|err| err.into_inner());
-    let hit = slot.as_ref().is_some_and(|(cached_group, cached_flip, _)| {
-        *cached_group == group && *cached_flip == flip
-    });
-    if !hit {
-        let entries = u64::from(group) * u64::from(group);
-        let count = u32::try_from(entries).context("convrot hadamard table")?;
-        let mut table = stream.alloc_zeros::<u16>(usize::try_from(count)?)?;
-        let group_i = i32::try_from(group)?;
-        {
-            let (ptr, _wrote) = table.device_ptr_mut(stream);
-            let threads = 256u32;
-            unsafe {
-                stream
-                    .launch_builder(&fns.hadamard)
-                    .arg(&ptr)
-                    .arg(&group_i)
-                    .arg(&flip)
-                    .launch(LaunchConfig {
-                        grid_dim: (count.div_ceil(threads), 1, 1),
-                        block_dim: (threads, 1, 1),
-                        shared_mem_bytes: 0,
-                    })?;
-            }
-        }
-        *slot = Some((group, flip, table));
-    }
-    let cached = slot.as_ref().context("convrot hadamard table")?;
-    let entry = usize::from(args.fuse_silu);
-    let (function, tile_rows, shared_mem_bytes) = if args.rotate_32 {
-        (&fns.group_dot_32[entry], 32, group_dot_32_smem(&fns.arch))
-    } else {
-        (&fns.group_dot[entry], 16, group_dot_smem(group))
-    };
-    {
-        let (table_ptr, _read) = cached.2.device_ptr(stream);
-        unsafe {
-            stream
-                .launch_builder(function)
-                .arg(&args.x)
-                .arg(&args.rotated)
-                .arg(&table_ptr)
-                .arg(&args.rows)
-                .arg(&args.k)
-                .arg(&args.group)
-                .launch(LaunchConfig {
-                    grid_dim: group_dot_grid(rows, k, group, tile_rows),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes,
-                })?;
-        }
-    }
-    Ok(())
-}
-
-/// `convrot_group_dot` then `convrot_quantize`. The product is a separate launch.
+/// Fused 1-pass Radix-4 FWHT + per-row INT8 quantize. The product is a separate launch.
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) fn launch_rotate_quant(
     stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
@@ -1542,35 +1655,69 @@ pub(crate) fn launch_rotate_quant(
 ) -> Result<()> {
     use crate::backend::gpu::{LaunchConfig, PushKernelArg};
     ensure!(
-        args.group > 0 && args.group % 16 == 0 && args.k % args.group == 0,
-        "convrot tensor-core shape"
+        args.rows > 0 && args.k > 0 && args.group > 0,
+        "convrot FWHT extent"
     );
-    let rows = args.rows as u32;
-    let group = args.group as u32;
-    let k = args.k as u32;
+    let rows = u32::try_from(args.rows)?;
+    let k = usize::try_from(args.k)?;
+    let group = usize::try_from(args.group)?;
     ensure!(
-        group <= fns.max_group,
-        "convrot group {group} exceeds device tile {}",
-        fns.max_group
+        power_of_four(group) && k.is_multiple_of(group) && k.is_multiple_of(8),
+        "convrot FWHT shape k={k} group={group}"
     );
-    launch_group_dot(stream, fns, args, rows, k, group)?;
-    let tile_rows = quantize_rows(fns.optin, k)?;
-    let tile = i32::try_from(tile_rows)?;
-    let smem =
-        u32::try_from(u64::from(tile_rows) * u64::from(k) * 4).context("convrot quantize tile")?;
+    let plan = args.rotate.context("convrot FWHT plan missing")?;
+    let silu = usize::from(args.fuse_silu);
+    let (function, threads, shared_mem_bytes) = match plan {
+        RotatePlan::Register {
+            chunks_per_warp,
+            threads,
+        } => {
+            ensure!(
+                group <= 256
+                    && threads > 0
+                    && threads.is_multiple_of(32)
+                    && threads <= 1024
+                    && k.div_ceil(256) <= usize::from(chunks_per_warp) * (threads as usize / 32),
+                "convrot FWHT register plan {plan:?} invalid for k={k} group={group}"
+            );
+            let idx = match chunks_per_warp {
+                1 => 0,
+                2 => 1,
+                4 => 2,
+                _ => anyhow::bail!("convrot FWHT chunks_per_warp {chunks_per_warp}"),
+            };
+            (&fns.fwht_reg[silu][idx], threads, 0u32)
+        }
+        RotatePlan::Shared {
+            threads,
+            smem_bytes,
+        } => {
+            let need = u32::try_from(k.checked_mul(4).context("convrot FWHT smem")?)?;
+            let avail = fwht_max_dynamic_smem(fns.optin)?;
+            ensure!(
+                smem_bytes == need
+                    && smem_bytes <= avail
+                    && threads > 0
+                    && threads.is_multiple_of(32)
+                    && threads <= 1024,
+                "convrot FWHT shared plan {plan:?} invalid for k={k} avail={avail}"
+            );
+            (&fns.fwht_smem[silu], threads, smem_bytes)
+        }
+    };
     unsafe {
         stream
-            .launch_builder(&fns.quantize)
-            .arg(&args.rotated)
+            .launch_builder(function)
+            .arg(&args.x)
             .arg(&args.codes)
             .arg(&args.scales)
             .arg(&args.rows)
             .arg(&args.k)
-            .arg(&tile)
+            .arg(&args.group)
             .launch(LaunchConfig {
-                grid_dim: (rows.div_ceil(tile_rows), 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: smem,
+                grid_dim: (rows, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes,
             })?;
     }
     Ok(())
@@ -1600,70 +1747,6 @@ mod device {
         16484, 16398, -16336, -16045, -16089, -15970, -16076, -16099, -16997, -16278, 16435, 16585,
         -16278, -16477, -16356, 16681, 16678, 16796, 16521, 16572, -16230, -16464, -16395, 16690,
         16435, -16199, -16213, -15994, -16089, -16161, -16219, -16128,
-    ];
-
-    #[cfg(feature = "cuda")]
-    const M17: [i16; 34] = [
-        16483, 16396, -16338, -16046, -16089, -15969, -16076, -16099, -16975, -16275, 16437, 16586,
-        -16278, -16487, -16358, 16681, 16679, 16796, 16520, 16569, -16231, -16467, -16394, 16689,
-        16437, -16199, -16213, -15994, -16088, -16157, -16221, -16131, 16469, 16529,
-    ];
-
-    #[cfg(feature = "cuda")]
-    const M20: [i16; 40] = [
-        16483, 16396, -16338, -16046, -16089, -15969, -16076, -16099, -16975, -16275, 16437, 16586,
-        -16278, -16487, -16358, 16681, 16679, 16796, 16520, 16569, -16231, -16467, -16394, 16689,
-        16437, -16199, -16213, -15994, -16088, -16157, -16221, -16131, 16469, 16529, -16495,
-        -16508, -16299, 16675, 16585, 16782,
-    ];
-
-    #[cfg(feature = "cuda")]
-    const M256: [i16; 512] = [
-        16483, 16396, -16338, -16046, -16089, -15969, -16076, -16099, -16975, -16275, 16437, 16586,
-        -16278, -16487, -16358, 16681, 16679, 16796, 16520, 16569, -16231, -16467, -16394, 16689,
-        16437, -16199, -16213, -15994, -16088, -16157, -16221, -16131, 16469, 16529, -16495,
-        -16508, -16299, 16675, 16585, 16782, 16642, 16560, -16256, -16247, -16366, 16725, 16483,
-        16396, -16338, -16046, -16089, -15969, -16076, -16099, -16975, -16275, 16437, 16586,
-        -16278, -16487, -16358, 16681, 16679, 16796, 16520, 16569, -16231, -16467, -16394, 16689,
-        16437, -16199, -16213, -15994, -16088, -16157, -16221, -16131, 16469, 16529, -16495,
-        -16508, -16299, 16675, 16585, 16782, 16642, 16560, -16256, -16247, -16366, 16725, 16483,
-        16396, -16338, -16046, -16089, -15969, -16076, -16099, -16975, -16275, 16437, 16586,
-        -16278, -16487, -16358, 16681, 16679, 16796, 16520, 16569, -16231, -16467, -16394, 16689,
-        16437, -16199, -16213, -15994, -16088, -16157, -16221, -16131, 16469, 16529, -16495,
-        -16508, -16299, 16675, 16585, 16782, 16642, 16560, -16256, -16247, -16366, 16725, 16483,
-        16396, -16338, -16046, -16089, -15969, -16076, -16099, -16975, -16275, 16437, 16586,
-        -16278, -16487, -16358, 16681, 16679, 16796, 16520, 16569, -16231, -16467, -16394, 16689,
-        16437, -16199, -16213, -15994, -16088, -16157, -16221, -16131, 16469, 16529, -16495,
-        -16508, -16299, 16675, 16585, 16782, 16642, 16560, -16256, -16247, -16366, 16725, 16483,
-        16396, -16338, -16046, -16089, -15969, -16076, -16099, -16975, -16275, 16437, 16586,
-        -16278, -16487, -16358, 16681, 16679, 16796, 16520, 16569, -16231, -16467, -16394, 16689,
-        16437, -16199, -16213, -15994, -16088, -16157, -16221, -16131, 16469, 16529, -16495,
-        -16508, -16299, 16675, 16585, 16782, 16642, 16560, -16256, -16247, -16366, 16725, 16483,
-        16396, -16338, -16046, -16089, -15969, -16076, -16099, -16975, -16275, 16437, 16586,
-        -16278, -16487, -16358, 16681, 16679, 16796, 16520, 16569, -16231, -16467, -16394, 16689,
-        16437, -16199, -16213, -15994, -16088, -16157, -16221, -16131, 16469, 16529, -16495,
-        -16508, -16299, 16675, 16585, 16782, 16642, 16560, -16256, -16247, -16366, 16725, 16483,
-        16396, -16338, -16046, -16089, -15969, -16076, -16099, -16975, -16275, 16437, 16586,
-        -16278, -16487, -16358, 16681, 16679, 16796, 16520, 16569, -16231, -16467, -16394, 16689,
-        16437, -16199, -16213, -15994, -16088, -16157, -16221, -16131, 16469, 16529, -16495,
-        -16508, -16299, 16675, 16585, 16782, 16642, 16560, -16256, -16247, -16366, 16725, 16483,
-        16396, -16338, -16046, -16089, -15969, -16076, -16099, -16975, -16275, 16437, 16586,
-        -16278, -16487, -16358, 16681, 16679, 16796, 16520, 16569, -16231, -16467, -16394, 16689,
-        16437, -16199, -16213, -15994, -16088, -16157, -16221, -16131, 16469, 16529, -16495,
-        -16508, -16299, 16675, 16585, 16782, 16642, 16560, -16256, -16247, -16366, 16725, 16483,
-        16396, -16338, -16046, -16089, -15969, -16076, -16099, -16975, -16275, 16437, 16586,
-        -16278, -16487, -16358, 16681, 16679, 16796, 16520, 16569, -16231, -16467, -16394, 16689,
-        16437, -16199, -16213, -15994, -16088, -16157, -16221, -16131, 16469, 16529, -16495,
-        -16508, -16299, 16675, 16585, 16782, 16642, 16560, -16256, -16247, -16366, 16725, 16483,
-        16396, -16338, -16046, -16089, -15969, -16076, -16099, -16975, -16275, 16437, 16586,
-        -16278, -16487, -16358, 16681, 16679, 16796, 16520, 16569, -16231, -16467, -16394, 16689,
-        16437, -16199, -16213, -15994, -16088, -16157, -16221, -16131, 16469, 16529, -16495,
-        -16508, -16299, 16675, 16585, 16782, 16642, 16560, -16256, -16247, -16366, 16725, 16483,
-        16396, -16338, -16046, -16089, -15969, -16076, -16099, -16975, -16275, 16437, 16586,
-        -16278, -16487, -16358, 16681, 16679, 16796, 16520, 16569, -16231, -16467, -16394, 16689,
-        16437, -16199, -16213, -15994, -16088, -16157, -16221, -16131, 16469, 16529, -16495,
-        -16508, -16299, 16675, 16585, 16782, 16642, 16560, -16256, -16247, -16366, 16725, 16483,
-        16396, -16338, -16046, -16089, -15969,
     ];
 
     fn row(r: usize, i: usize) -> f32 {
@@ -1698,39 +1781,6 @@ mod device {
             .collect()
     }
 
-    #[cfg(feature = "cuda")]
-    fn embedded(rows: usize, k: usize, n: usize) -> Option<&'static [i16]> {
-        if k != 256 || n != 2 {
-            return None;
-        }
-        match rows {
-            1 => Some(&M1),
-            16 => Some(&M16),
-            17 => Some(&M17),
-            20 => Some(&M20),
-            256 => Some(&M256),
-            _ => None,
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    fn definition_bits(rows: usize, k: usize, n: usize) -> Result<Vec<i16>> {
-        if let Some(bits) = embedded(rows, k, n) {
-            return Ok(bits.to_vec());
-        }
-        let dir =
-            std::env::var("FF_HYPERFLOW_CONVROT_BITS").context("FF_HYPERFLOW_CONVROT_BITS")?;
-        let path = std::path::Path::new(&dir).join(format!("m{rows}_k{k}_n{n}.i16"));
-        let bytes = std::fs::read(&path).context("convrot definition bits")?;
-        let nbytes = bytes.len();
-        let (words, rest) = bytes.as_chunks::<2>();
-        ensure!(
-            rest.is_empty() && words.len() == rows * n,
-            "convrot definition bit length rows={rows} n={n} bytes={nbytes}"
-        );
-        Ok(words.iter().map(|word| i16::from_le_bytes(*word)).collect())
-    }
-
     fn differ(y: &[bf16], expected: &[i16]) -> usize {
         let mismatched = y
             .iter()
@@ -1742,237 +1792,11 @@ mod device {
 
     struct Ran {
         y: Vec<bf16>,
-        rotated: Vec<f32>,
         codes: Vec<i8>,
         scales: Vec<f32>,
     }
 
-    /// fmax of fabs, f32 round-to-nearest division, `rintf`, clamp [-127, 127].
-    fn quantize_current(src: &[f32]) -> (Vec<i8>, f32) {
-        let mut peak = 0.0f32;
-        for &value in src {
-            peak = peak.max(value.abs());
-        }
-        let scale = peak.max(1.0e-12f32) / 127.0f32;
-        let inv = 1.0f32 / scale;
-        let codes = src
-            .iter()
-            .map(|&value| {
-                let q = (value * inv).round_ties_even().clamp(-127.0f32, 127.0f32);
-                q as i8
-            })
-            .collect();
-        (codes, scale)
-    }
-
-    fn code_scale_diff(rotated: &[f32], codes: &[i8], scales: &[f32], k: usize) -> (usize, usize) {
-        let mut code_diff = 0usize;
-        let mut scale_diff = 0usize;
-        for (r, scale) in scales.iter().enumerate() {
-            let (want, got_scale) = quantize_current(&rotated[r * k..(r + 1) * k]);
-            let got = &codes[r * k..(r + 1) * k];
-            code_diff += want.iter().zip(got).filter(|(a, b)| a != b).count();
-            if got_scale.to_bits() != scale.to_bits() {
-                scale_diff += 1;
-            }
-        }
-        (code_diff, scale_diff)
-    }
-
-    fn check_codes(
-        rotated: &[f32],
-        codes: &[i8],
-        scales: &[f32],
-        rows: usize,
-        k: usize,
-    ) -> Result<()> {
-        ensure!(
-            rotated.len() == rows * k && codes.len() == rows * k && scales.len() == rows,
-            "convrot quantize download rows={rows} k={k}"
-        );
-        let (code_diff, scale_diff) = code_scale_diff(rotated, codes, scales, k);
-        emit(&format!(
-            "CONVROT_QUANT rows={rows} k={k} codes={code_diff} scales={scale_diff}"
-        ));
-        ensure!(
-            code_diff == 0 && scale_diff == 0,
-            "convrot quantize rows={rows} k={k} codes {code_diff} scales {scale_diff}"
-        );
-        Ok(())
-    }
-
-    #[cfg(feature = "cuda")]
-    fn rotated_mismatch(x: &[f32], got: &[f32], k: usize, group: usize) -> Result<usize> {
-        ensure!(
-            k > 0 && x.len() == got.len() && x.len().is_multiple_of(k),
-            "convrot rotated shape"
-        );
-        let rows = x.len() / k;
-        let h = hadamard_terms(group);
-        let mut terms = Vec::new();
-        let mut xr = Vec::new();
-        let mut codes = vec![0i8; k];
-        let mut scale = 0.0f32;
-        let mut differ = 0usize;
-        for r in 0..rows {
-            mma_quantize_row(
-                &x[r * k..(r + 1) * k],
-                group,
-                &h,
-                &mut terms,
-                &mut xr,
-                &mut codes,
-                &mut scale,
-            );
-            differ += xr
-                .iter()
-                .zip(&got[r * k..(r + 1) * k])
-                .filter(|(a, b)| a.to_bits() != b.to_bits())
-                .count();
-        }
-        Ok(differ)
-    }
-
-    // 2x measured gfx1100 v_wmma_f32_16x16x16_bf16 vs exact f64 floor (activation / silu).
-    #[cfg(feature = "rocm")]
-    const ROCM_WMMA_ROT_MAX_ABS: f64 = 1.192_092_896e-7;
-    #[cfg(feature = "rocm")]
-    const ROCM_WMMA_ROT_RMSE: f64 = 2.132_190_794e-8;
-    #[cfg(feature = "rocm")]
-    const ROCM_WMMA_SILU_ROT_MAX_ABS: f64 = 2.086_162_568e-6;
-    #[cfg(feature = "rocm")]
-    const ROCM_WMMA_SILU_ROT_RMSE: f64 = 3.529_518_472e-7;
-
-    #[cfg(feature = "rocm")]
-    fn f64_rotated_stats(
-        x: &[f32],
-        got: &[f32],
-        k: usize,
-        group: usize,
-        row_period: Option<usize>,
-    ) -> Result<(f64, f64)> {
-        ensure!(
-            k > 0
-                && group >= 16
-                && k.is_multiple_of(group)
-                && x.len() == got.len()
-                && x.len().is_multiple_of(k),
-            "convrot f64 rotated shape"
-        );
-        let rows = x.len() / k;
-        let unique = row_period.map_or(rows, |period| rows.min(period));
-        let mut table = vec![0.0f64; group * group];
-        for col in 0..group {
-            for r in 0..group {
-                table[col * group + r] =
-                    f64::from(bf16::from_f32(super::hadamard(group, r, col)).to_f32());
-            }
-        }
-        let mut reference = vec![0.0f64; unique * k];
-        let groups = k / group;
-        let threads = std::thread::available_parallelism()
-            .map(|count| count.get())
-            .unwrap_or(1)
-            .clamp(1, 8)
-            .min(unique.max(1));
-        let rows_per = unique.div_ceil(threads);
-        std::thread::scope(|scope| {
-            let mut row0 = 0usize;
-            for part in reference.chunks_mut(rows_per * k) {
-                let rows_here = part.len() / k;
-                let start = row0;
-                row0 += rows_here;
-                let table = table.as_slice();
-                scope.spawn(move || {
-                    let mut x_bf16 = vec![0.0f64; k];
-                    for r in 0..rows_here {
-                        let src = &x[(start + r) * k..(start + r + 1) * k];
-                        for (dst, &v) in x_bf16.iter_mut().zip(src) {
-                            *dst = f64::from(bf16::from_f32(v).to_f32());
-                        }
-                        let out = &mut part[r * k..(r + 1) * k];
-                        for g in 0..groups {
-                            let base = g * group;
-                            for col in 0..group {
-                                let mut sum = 0.0f64;
-                                let hcol = &table[col * group..(col + 1) * group];
-                                for i in 0..group {
-                                    sum += x_bf16[base + i] * hcol[i];
-                                }
-                                out[base + col] = sum;
-                            }
-                        }
-                    }
-                });
-            }
-        });
-        let mut max_abs = 0.0f64;
-        let mut sum_sq = 0.0f64;
-        for r in 0..rows {
-            let ref_row = &reference[(r % unique) * k..(r % unique + 1) * k];
-            let got_row = &got[r * k..(r + 1) * k];
-            for (&want, &actual) in ref_row.iter().zip(got_row) {
-                ensure!(actual.is_finite(), "non-finite convrot rotated value");
-                let err = (f64::from(actual) - want).abs();
-                if err > max_abs {
-                    max_abs = err;
-                }
-                sum_sq += err * err;
-            }
-        }
-        let rmse = (sum_sq / (rows * k) as f64).sqrt();
-        Ok((max_abs, rmse))
-    }
-
-    #[cfg(feature = "rocm")]
-    fn check_rocm_rotation_and_product(
-        input: &HostLaunch<'_>,
-        ran: &Ran,
-        row_period: Option<usize>,
-    ) -> Result<()> {
-        let HostLaunch {
-            x,
-            k,
-            group,
-            qweight,
-            n,
-            wscale,
-            ..
-        } = *input;
-        let rows = x.len() / k;
-        let (max_abs, rmse) = f64_rotated_stats(x, &ran.rotated, k, group, row_period)?;
-        emit(&format!(
-            "CONVROT_ROCM_ROTATED rows={rows} k={k} group={group} max_abs={max_abs:.9e} rmse={rmse:.9e}"
-        ));
-        ensure!(
-            max_abs <= ROCM_WMMA_ROT_MAX_ABS && rmse <= ROCM_WMMA_ROT_RMSE,
-            "convrot rocm rotated rows={rows} k={k} group={group} max_abs={max_abs:.9e} rmse={rmse:.9e}"
-        );
-        check_codes(&ran.rotated, &ran.codes, &ran.scales, rows, k)?;
-        let host = host_product(&ran.codes, &ran.scales, k, qweight, n, wscale)?;
-        let mismatched = bit_diff(&ran.y, &host);
-        emit(&format!(
-            "CONVROT_MMA rows={rows} k={k} n={n} group={group} differ={mismatched}"
-        ));
-        ensure!(
-            mismatched == 0,
-            "convrot rocm product rows={rows} k={k} n={n} group={group} differing bits {mismatched}"
-        );
-        Ok(())
-    }
-
-    fn tile_row_offset_diff(rotated: &[f32], codes: &[i8], k: usize) -> usize {
-        let rows = codes.len() / k;
-        let mut differ = 0usize;
-        for r in 0..rows {
-            let src = (r + 1) % rows;
-            let (want, _) = quantize_current(&rotated[src * k..(src + 1) * k]);
-            let got = &codes[r * k..(r + 1) * k];
-            differ += want.iter().zip(got).filter(|(a, b)| a != b).count();
-        }
-        differ
-    }
-
+    #[derive(Clone, Copy)]
     struct HostLaunch<'a> {
         x: &'a [f32],
         k: usize,
@@ -1981,30 +1805,6 @@ mod device {
         n: usize,
         wscale: &'a [f32],
         keep: bool,
-    }
-
-    fn launch(
-        device: &Device,
-        x: &[f32],
-        k: usize,
-        group: usize,
-        qweight: &[i8],
-        n: usize,
-        wscale: &[f32],
-    ) -> Result<Vec<bf16>> {
-        Ok(launch_kept(
-            device,
-            HostLaunch {
-                x,
-                k,
-                group,
-                qweight,
-                n,
-                wscale,
-                keep: false,
-            },
-        )?
-        .y)
     }
 
     struct HeldActivation {
@@ -2028,7 +1828,6 @@ mod device {
         }
     }
 
-    // At TENSOR_CORE_ROWS and above, the device bytes are bf16::from_f32 of x.
     fn upload_activation(
         stream: &std::sync::Arc<crate::backend::gpu::CudaStream>,
         x: &[f32],
@@ -2056,11 +1855,58 @@ mod device {
         }
     }
 
-    fn launch_kept(device: &Device, input: HostLaunch<'_>) -> Result<Ran> {
-        launch_kept_tile(device, input, false)
+    fn launch(
+        device: &Device,
+        x: &[f32],
+        k: usize,
+        group: usize,
+        qweight: &[i8],
+        n: usize,
+        wscale: &[f32],
+    ) -> Result<Vec<bf16>> {
+        Ok(launch_kept(
+            device,
+            HostLaunch {
+                x,
+                k,
+                group,
+                qweight,
+                n,
+                wscale,
+                keep: false,
+            },
+        )?
+        .y)
     }
 
-    fn launch_kept_tile(device: &Device, input: HostLaunch<'_>, rotate_32: bool) -> Result<Ran> {
+    fn launch_kept(device: &Device, input: HostLaunch<'_>) -> Result<Ran> {
+        let rows = input.x.len() / input.k;
+        let rotate = if rows >= super::TENSOR_CORE_ROWS {
+            Some(super::derive_rotate_plan(
+                device,
+                input.k,
+                input.group,
+                false,
+            )?)
+        } else {
+            None
+        };
+        launch_kept_opt_plan(device, input, rotate)
+    }
+
+    fn launch_kept_plan(
+        device: &Device,
+        input: HostLaunch<'_>,
+        plan: super::RotatePlan,
+    ) -> Result<Ran> {
+        launch_kept_opt_plan(device, input, Some(plan))
+    }
+
+    fn launch_kept_opt_plan(
+        device: &Device,
+        input: HostLaunch<'_>,
+        rotate: Option<super::RotatePlan>,
+    ) -> Result<Ran> {
         let HostLaunch {
             x,
             k,
@@ -2087,7 +1933,6 @@ mod device {
         let weight_d = stream.clone_htod(qweight)?;
         let scale_d = stream.clone_htod(wscale)?;
         let y_d = stream.alloc_zeros::<bf16>(total)?;
-        let rotated = stream.alloc_zeros::<f32>(rows * k)?;
         let codes = stream.alloc_zeros::<i8>(rows * k)?;
         let scales = stream.alloc_zeros::<f32>(rows)?;
         let fns = load_convrot(&device.ctx)?;
@@ -2099,7 +1944,6 @@ mod device {
                 qweight: weight_d.device_ptr(stream).0,
                 wscale: scale_d.device_ptr(stream).0,
                 y: y_d.device_ptr(stream).0,
-                rotated: rotated.device_ptr(stream).0,
                 codes: codes.device_ptr(stream).0,
                 scales: scales.device_ptr(stream).0,
                 rows: i32::try_from(rows)?,
@@ -2108,271 +1952,18 @@ mod device {
                 group: i32::try_from(group)?,
                 product: ProductKernel::NFast,
                 fuse_silu: false,
-                rotate_32,
+                rotate,
             },
         )?;
         stream.synchronize()?;
         held.release();
         let y = stream.clone_dtoh(&y_d)?;
-        let (rotated, codes, scales) = if keep {
-            (
-                stream.clone_dtoh(&rotated)?,
-                stream.clone_dtoh(&codes)?,
-                stream.clone_dtoh(&scales)?,
-            )
+        let (codes, scales) = if keep {
+            (stream.clone_dtoh(&codes)?, stream.clone_dtoh(&scales)?)
         } else {
-            (Vec::new(), Vec::new(), Vec::new())
+            (Vec::new(), Vec::new())
         };
-        Ok(Ran {
-            y,
-            rotated,
-            codes,
-            scales,
-        })
-    }
-
-    #[cfg(feature = "cuda")]
-    fn exp2i(exp: i32) -> f64 {
-        if (-1022..=1023).contains(&exp) {
-            f64::from_bits(((exp + 1023) as u64) << 52)
-        } else if (-1074..-1022).contains(&exp) {
-            f64::from_bits(1u64 << (exp + 1074) as u32)
-        } else if exp < -1074 {
-            0.0
-        } else {
-            f64::INFINITY
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    fn frexp_half(x: f64) -> (f64, i32) {
-        let bits = x.to_bits();
-        let exp_field = ((bits >> 52) & 0x7ff) as i32;
-        if exp_field == 0 {
-            if bits & 0x000f_ffff_ffff_ffff == 0 {
-                return (0.0, 0);
-            }
-            let (mag, exp) = frexp_half(x * exp2i(54));
-            return (mag, exp - 54);
-        }
-        let mag = (bits & 0x000f_ffff_ffff_ffff) | 0x3fe0_0000_0000_0000;
-        (f64::from_bits(mag).copysign(x), exp_field - 1022)
-    }
-
-    #[cfg(feature = "cuda")]
-    fn sig_exp(x: f64) -> (f64, i32) {
-        if x.to_bits() & 0x7fff_ffff_ffff_ffff == 0 {
-            return (0.0, -126);
-        }
-        let (mag, exp) = frexp_half(x);
-        let mut significand = mag * 2.0;
-        let mut exponent = exp - 1;
-        if exponent < -126 {
-            significand *= exp2i(exponent + 126);
-            exponent = -126;
-        }
-        if significand.to_bits() & 0x7fff_ffff_ffff_ffff == 0 {
-            exponent = -126;
-        }
-        (significand, exponent)
-    }
-
-    #[cfg(feature = "cuda")]
-    fn rz_f32(sum: f64, e_max: i32) -> f32 {
-        let (mut significand, exp) = sig_exp(sum * exp2i(e_max));
-        significand = (significand * exp2i(23)).trunc() * exp2i(-23);
-        let out = (significand * exp2i(exp)) as f32;
-        if out.to_bits() & 0x7fff_ffff == 0 {
-            0.0
-        } else {
-            out
-        }
-    }
-
-    // m16n8k16 f32 accumulator: T-FDPA length 8, F=24, e_zero=-132, round toward zero to f32.
-    // k = 0..7, then k = 8..15, each consuming the running accumulator.
-    #[cfg(feature = "cuda")]
-    fn t_fdpa8(a: &[(f64, i32)], b: &[(f64, i32)], c: f32) -> f32 {
-        const F: i32 = 24;
-        const E_ZERO: i32 = -132;
-        let mut s = [0.0f64; 9];
-        let mut e = [0i32; 9];
-        for i in 0..8 {
-            let prod = a[i].0 * b[i].0;
-            s[i] = prod;
-            e[i] = if prod.to_bits() & 0x7fff_ffff_ffff_ffff == 0 {
-                E_ZERO
-            } else {
-                a[i].1 + b[i].1
-            };
-        }
-        let (sc, ec) = sig_exp(f64::from(c));
-        s[8] = sc;
-        e[8] = if sc.to_bits() & 0x7fff_ffff_ffff_ffff == 0 {
-            E_ZERO
-        } else {
-            ec
-        };
-        let mut e_max = e[0];
-        for &value in &e[1..] {
-            e_max = e_max.max(value);
-        }
-        let mut sum = 0.0f64;
-        for i in 0..9 {
-            sum += (s[i] * exp2i(e[i] - e_max + F)).trunc() * exp2i(-F);
-        }
-        rz_f32(sum, e_max)
-    }
-
-    #[cfg(feature = "cuda")]
-    fn mma_k16(a: &[f32; 16], b: &[f32; 16], c: f32) -> f32 {
-        let mut at = [(0.0f64, 0i32); 16];
-        let mut bt = [(0.0f64, 0i32); 16];
-        for i in 0..16 {
-            at[i] = sig_exp(f64::from(a[i]));
-            bt[i] = sig_exp(f64::from(b[i]));
-        }
-        let mid = t_fdpa8(&at[..8], &bt[..8], c);
-        t_fdpa8(&at[8..], &bt[8..], mid)
-    }
-
-    #[cfg(feature = "cuda")]
-    fn mma_k16_points() -> (f32, f32, f32) {
-        let mut a = [0.0f32; 16];
-        let mut b = [0.0f32; 16];
-        a[0] = -8192.0;
-        a[1] = -0.5;
-        a[2] = -0.25;
-        a[3] = -0.125;
-        b[0] = 1024.0;
-        b[1] = 1.0;
-        b[2] = 1.0;
-        b[3] = 1.0;
-        let paper = mma_k16(&a, &b, 8_388_608.0);
-        a = [0.0; 16];
-        b = [0.0; 16];
-        a[0] = 1.0;
-        b[0] = 1.0;
-        let one = mma_k16(&a, &b, 0.0);
-        a[1] = 1.0;
-        b[1] = 1.0;
-        let two = mma_k16(&a, &b, 0.0);
-        (paper, one, two)
-    }
-
-    #[cfg(feature = "cuda")]
-    fn hadamard_terms(group: usize) -> Vec<(f64, i32)> {
-        let mut terms = vec![(0.0f64, 0i32); group * group];
-        for col in 0..group {
-            for k_index in 0..group {
-                let value = bf16::from_f32(super::hadamard(group, k_index, col)).to_f32();
-                terms[col * group + k_index] = sig_exp(f64::from(value));
-            }
-        }
-        terms
-    }
-
-    #[cfg(feature = "cuda")]
-    fn mma_quantize_row(
-        src: &[f32],
-        group: usize,
-        h: &[(f64, i32)],
-        terms: &mut Vec<(f64, i32)>,
-        xr: &mut Vec<f32>,
-        codes: &mut [i8],
-        scale_out: &mut f32,
-    ) {
-        let k = src.len();
-        terms.clear();
-        xr.clear();
-        terms.resize(k, (0.0, 0));
-        xr.resize(k, 0.0);
-        for (i, &value) in src.iter().enumerate() {
-            let rounded = bf16::from_f32(value).to_f32();
-            terms[i] = sig_exp(f64::from(rounded));
-        }
-        let mut peak = 0.0f32;
-        let groups = k / group;
-        for g in 0..groups {
-            let base = g * group;
-            for col in 0..group {
-                let mut acc = 0.0f32;
-                let b_col = &h[col * group..(col + 1) * group];
-                let mut k0 = 0;
-                while k0 < group {
-                    acc = t_fdpa8(&terms[base + k0..base + k0 + 8], &b_col[k0..k0 + 8], acc);
-                    acc = t_fdpa8(
-                        &terms[base + k0 + 8..base + k0 + 16],
-                        &b_col[k0 + 8..k0 + 16],
-                        acc,
-                    );
-                    k0 += 16;
-                }
-                xr[base + col] = acc;
-                peak = peak.max(acc.abs());
-            }
-        }
-        let scale = peak.max(1e-12) / 127.0;
-        *scale_out = scale;
-        let inv = 1.0 / scale;
-        for i in 0..k {
-            let quantized = (xr[i] * inv).round_ties_even().clamp(-127.0, 127.0);
-            codes[i] = quantized as i8;
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    fn mma_rotate_quant(x: &[f32], k: usize, group: usize) -> Result<(Vec<i8>, Vec<f32>)> {
-        ensure!(
-            k > 0
-                && group >= 16
-                && group.is_multiple_of(16)
-                && k.is_multiple_of(group)
-                && x.len().is_multiple_of(k),
-            "convrot mma shape"
-        );
-        let rows = x.len() / k;
-        let mut codes = vec![0i8; rows * k];
-        let mut scales = vec![0.0f32; rows];
-        if rows == 0 {
-            return Ok((codes, scales));
-        }
-        let h = hadamard_terms(group);
-        let threads = std::thread::available_parallelism()
-            .map(|count| count.get())
-            .unwrap_or(1)
-            .clamp(1, 8)
-            .min(rows);
-        let rows_per = rows.div_ceil(threads);
-        std::thread::scope(|scope| {
-            let mut row0 = 0usize;
-            for (code_rows, scale_rows) in codes
-                .chunks_mut(rows_per * k)
-                .zip(scales.chunks_mut(rows_per))
-            {
-                let rows_here = scale_rows.len();
-                let start = row0;
-                row0 += rows_here;
-                let x_rows = &x[start * k..(start + rows_here) * k];
-                let h = h.as_slice();
-                scope.spawn(move || {
-                    let mut terms = Vec::new();
-                    let mut xr = Vec::new();
-                    for r in 0..rows_here {
-                        mma_quantize_row(
-                            &x_rows[r * k..(r + 1) * k],
-                            group,
-                            h,
-                            &mut terms,
-                            &mut xr,
-                            &mut code_rows[r * k..(r + 1) * k],
-                            &mut scale_rows[r],
-                        );
-                    }
-                });
-            }
-        });
-        Ok((codes, scales))
+        Ok(Ran { y, codes, scales })
     }
 
     fn emit(line: &str) {
@@ -2380,246 +1971,522 @@ mod device {
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
-    fn check_hadamard_table_mutant(device: &Device) -> Result<()> {
-        let rows = 17usize;
-        let k = 256usize;
-        let group = 256usize;
-        let n = 2usize;
-        let x = activation(rows, k);
-        let qweight = weight(n, k);
-        let wscale = wscale_row(n);
-        let input = || HostLaunch {
-            x: &x,
-            k,
-            group,
-            qweight: &qweight,
-            n,
-            wscale: &wscale,
-            keep: true,
-        };
-        let base = launch_kept(device, input())?;
-        let flipped = super::with_hadamard_flip(0, || launch_kept(device, input()))?;
-        let differ = count_f32(&flipped.rotated, &base.rotated);
-        emit(&format!("CONVROT_TABLE_MUTANT differ={differ}"));
+    #[derive(Clone, Copy, Debug)]
+    struct F64Distance {
+        rotated_max_abs: f64,
+        rotated_rmse: f64,
+        code_mismatch_count: usize,
+        code_mismatch_frac: f64,
+        code_max_abs_diff: i32,
+        non_tie_code_mismatch: usize,
+        scale_max_rel_err: f64,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct IncumbentBar {
+        rotated_max_abs: f64,
+        code_mismatch_count: usize,
+        code_mismatch_frac: f64,
+        scale_max_rel_err: f64,
+    }
+
+    // Measured sm89 incumbent MMA distance to the dense f64 Kronecker H4/2 definition.
+    const INCUMBENT_SYNTHETIC_BAR: IncumbentBar = IncumbentBar {
+        rotated_max_abs: 0.0,
+        code_mismatch_count: 0,
+        code_mismatch_frac: 0.0,
+        scale_max_rel_err: 4.907_208_338_175e-8,
+    };
+    const INCUMBENT_STEP_K5376_BAR: IncumbentBar = IncumbentBar {
+        rotated_max_abs: 8.940_696_716_309e-8,
+        code_mismatch_count: 195,
+        code_mismatch_frac: 195.0 / (37_717.0 * 5_376.0),
+        scale_max_rel_err: 1.045_093_079_238e-7,
+    };
+    const INCUMBENT_STEP_K7168_BAR: IncumbentBar = IncumbentBar {
+        rotated_max_abs: 5.215_406_417_847e-7,
+        code_mismatch_count: 236,
+        code_mismatch_frac: 236.0 / (37_717.0 * 7_168.0),
+        scale_max_rel_err: 1.555_275_536_410e-7,
+    };
+    const INCUMBENT_STEP_K14336_BAR: IncumbentBar = IncumbentBar {
+        rotated_max_abs: 2.338_886_260_987e-4,
+        code_mismatch_count: 691,
+        code_mismatch_frac: 691.0 / (37_717.0 * 14_336.0),
+        scale_max_rel_err: 2.867_293_573_185e-7,
+    };
+    const INCUMBENT_STEP_K14336_SILU_BAR: IncumbentBar = IncumbentBar {
+        rotated_max_abs: 2.338_886_260_987e-4,
+        code_mismatch_count: 691,
+        code_mismatch_frac: 691.0 / (37_717.0 * 14_336.0),
+        scale_max_rel_err: 2.867_293_573_185e-7,
+    };
+
+    fn hadamard_f64_table(group: usize) -> Vec<f64> {
+        let mut table = vec![0.0f64; group * group];
+        for col in 0..group {
+            for r in 0..group {
+                let mut sign = 1i32;
+                let mut scale = 1.0f64;
+                let mut n = group;
+                let mut rr = r;
+                let mut cc = col;
+                while n > 1 {
+                    n /= 4;
+                    let rb = rr / n;
+                    let cb = cc / n;
+                    rr %= n;
+                    cc %= n;
+                    sign *= super::H4[rb][cb];
+                    scale *= 0.5;
+                }
+                table[col * group + r] = f64::from(sign) * scale;
+            }
+        }
+        table
+    }
+
+    fn f64_distance_bf16(
+        x_bf16: &[bf16],
+        rotated: &[f32],
+        codes: &[i8],
+        scales: &[f32],
+        k: usize,
+        group: usize,
+        row_period: Option<usize>,
+    ) -> Result<F64Distance> {
         ensure!(
-            differ > 0,
-            "one hadamard table entry matched the unflipped tile"
+            k > 0
+                && super::power_of_four(group)
+                && k.is_multiple_of(group)
+                && x_bf16.len() == rotated.len()
+                && x_bf16.len() == codes.len()
+                && x_bf16.len().is_multiple_of(k),
+            "convrot f64 distance shape"
+        );
+        let rows = x_bf16.len() / k;
+        ensure!(scales.len() == rows, "convrot f64 distance scales");
+        let table = hadamard_f64_table(group);
+        let groups = k / group;
+        let threads = std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(1)
+            .clamp(1, 8)
+            .min(rows.max(1));
+
+        // When rows are periodic (synthetic fixtures), compute one period of exact f64 rows once.
+        let (ref_rot, ref_codes, ref_scales, unique) = if let Some(period) = row_period {
+            let unique = rows.min(period);
+            let mut rr = vec![0.0f64; unique * k];
+            let mut rc = vec![0i8; unique * k];
+            let mut rs = vec![0.0f64; unique];
+            let mut x_row = vec![0.0f64; k];
+            for r in 0..unique {
+                for (dst, &v) in x_row.iter_mut().zip(&x_bf16[r * k..(r + 1) * k]) {
+                    *dst = f64::from(v.to_f32());
+                }
+                let out = &mut rr[r * k..(r + 1) * k];
+                let mut peak = 0.0f64;
+                for g in 0..groups {
+                    let base = g * group;
+                    for col in 0..group {
+                        let mut sum = 0.0f64;
+                        let hcol = &table[col * group..(col + 1) * group];
+                        for i in 0..group {
+                            sum += x_row[base + i] * hcol[i];
+                        }
+                        out[base + col] = sum;
+                        peak = peak.max(sum.abs());
+                    }
+                }
+                let scale = peak.max(1.0e-12) / 127.0;
+                rs[r] = scale;
+                for i in 0..k {
+                    rc[r * k + i] = (out[i] / scale).round_ties_even().clamp(-127.0, 127.0) as i8;
+                }
+            }
+            (Some(rr), Some(rc), Some(rs), unique)
+        } else {
+            (None, None, None, 0)
+        };
+
+        let rows_per = rows.div_ceil(threads);
+        let mut partials = vec![(0.0f64, 0.0f64, 0usize, 0i32, 0usize, 0.0f64, false); threads];
+        std::thread::scope(|scope| {
+            let table = table.as_slice();
+            let ref_rot = ref_rot.as_deref();
+            let ref_codes = ref_codes.as_deref();
+            let ref_scales = ref_scales.as_deref();
+            for (tid, slot) in partials.iter_mut().enumerate() {
+                let start = tid * rows_per;
+                let end = (start + rows_per).min(rows);
+                if start >= end {
+                    continue;
+                }
+                scope.spawn(move || {
+                    let mut x_row = vec![0.0f64; k];
+                    let mut out_row = vec![0.0f64; k];
+                    let mut max_abs = 0.0f64;
+                    let mut sum_sq = 0.0f64;
+                    let mut code_mis = 0usize;
+                    let mut code_max_diff = 0i32;
+                    let mut non_tie = 0usize;
+                    let mut scale_rel = 0.0f64;
+                    let mut non_finite = false;
+                    for r in start..end {
+                        let got_rot = &rotated[r * k..(r + 1) * k];
+                        let got_codes = &codes[r * k..(r + 1) * k];
+                        let got_scale = f64::from(scales[r]);
+                        if !got_scale.is_finite() {
+                            non_finite = true;
+                        }
+                        let (want_rot, want_codes_opt, want_scale) = if let (
+                            Some(rr),
+                            Some(rc),
+                            Some(rs),
+                        ) =
+                            (ref_rot, ref_codes, ref_scales)
+                        {
+                            let idx = r % unique;
+                            (
+                                &rr[idx * k..(idx + 1) * k],
+                                Some(&rc[idx * k..(idx + 1) * k]),
+                                rs[idx],
+                            )
+                        } else {
+                            for (dst, &v) in x_row.iter_mut().zip(&x_bf16[r * k..(r + 1) * k]) {
+                                *dst = f64::from(v.to_f32());
+                            }
+                            let mut peak = 0.0f64;
+                            for g in 0..groups {
+                                let base = g * group;
+                                for col in 0..group {
+                                    let mut sum = 0.0f64;
+                                    let hcol = &table[col * group..(col + 1) * group];
+                                    for i in 0..group {
+                                        sum += x_row[base + i] * hcol[i];
+                                    }
+                                    out_row[base + col] = sum;
+                                    peak = peak.max(sum.abs());
+                                }
+                            }
+                            (out_row.as_slice(), None, peak.max(1.0e-12) / 127.0)
+                        };
+                        let srel = (got_scale - want_scale).abs() / want_scale;
+                        if srel > scale_rel {
+                            scale_rel = srel;
+                        }
+                        for i in 0..k {
+                            let actual = got_rot[i];
+                            if !actual.is_finite() {
+                                non_finite = true;
+                            }
+                            let err = (f64::from(actual) - want_rot[i]).abs();
+                            if err > max_abs {
+                                max_abs = err;
+                            }
+                            sum_sq += err * err;
+                            let scaled = want_rot[i] / want_scale;
+                            let want_q = want_codes_opt.map_or_else(
+                                || scaled.round_ties_even().clamp(-127.0, 127.0) as i8,
+                                |rc| rc[i],
+                            );
+                            if got_codes[i] != want_q {
+                                code_mis += 1;
+                                let d = (i32::from(got_codes[i]) - i32::from(want_q)).abs();
+                                if d > code_max_diff {
+                                    code_max_diff = d;
+                                }
+                                let tie_margin = (scaled - (scaled.floor() + 0.5)).abs();
+                                if d > 1 || tie_margin > 1.0e-4 {
+                                    non_tie += 1;
+                                }
+                            }
+                        }
+                    }
+                    *slot = (
+                        max_abs,
+                        sum_sq,
+                        code_mis,
+                        code_max_diff,
+                        non_tie,
+                        scale_rel,
+                        non_finite,
+                    );
+                });
+            }
+        });
+        let mut rotated_max_abs = 0.0f64;
+        let mut sum_sq = 0.0f64;
+        let mut code_mismatch_count = 0usize;
+        let mut code_max_abs_diff = 0i32;
+        let mut non_tie_code_mismatch = 0usize;
+        let mut scale_max_rel_err = 0.0f64;
+        for (ma, sq, cm, cd, nt, sr, nf) in partials {
+            ensure!(!nf, "non-finite convrot rotated or scale value");
+            rotated_max_abs = rotated_max_abs.max(ma);
+            sum_sq += sq;
+            code_mismatch_count += cm;
+            code_max_abs_diff = code_max_abs_diff.max(cd);
+            non_tie_code_mismatch += nt;
+            scale_max_rel_err = scale_max_rel_err.max(sr);
+        }
+        let total = (rows * k) as f64;
+        Ok(F64Distance {
+            rotated_max_abs,
+            rotated_rmse: (sum_sq / total).sqrt(),
+            code_mismatch_count,
+            code_mismatch_frac: code_mismatch_count as f64 / total,
+            code_max_abs_diff,
+            non_tie_code_mismatch,
+            scale_max_rel_err,
+        })
+    }
+
+    fn launch_fwht_probe(
+        device: &Device,
+        x_ptr: u64,
+        (rows, k, group): (usize, usize, usize),
+        fuse_silu: bool,
+        mutant: i32,
+    ) -> Result<(Vec<f32>, Vec<i8>, Vec<f32>)> {
+        use crate::backend::gpu::{LaunchConfig, PushKernelArg};
+        let stream = &device.stream;
+        let fns = load_convrot(&device.ctx)?;
+        let rotated_d = stream.alloc_zeros::<f32>(rows * k)?;
+        let codes_d = stream.alloc_zeros::<i8>(rows * k)?;
+        let scales_d = stream.alloc_zeros::<f32>(rows)?;
+        let rows_i = i32::try_from(rows)?;
+        let k_i = i32::try_from(k)?;
+        let group_i = i32::try_from(group)?;
+        let (function, threads, smem) = if group <= 256 {
+            let chunks = k.div_ceil(256);
+            let warps = chunks.div_ceil(4).clamp(1, 32);
+            (
+                &fns.fwht_probe[usize::from(fuse_silu)],
+                u32::try_from(warps * 32)?,
+                0u32,
+            )
+        } else {
+            ensure!(!fuse_silu, "smem probe only tests non-silu");
+            let need = u32::try_from(k * 4)?;
+            (&fns.fwht_probe[2], 256u32, need)
+        };
+        unsafe {
+            stream
+                .launch_builder(function)
+                .arg(&x_ptr)
+                .arg(&rotated_d.device_ptr(stream).0)
+                .arg(&codes_d.device_ptr(stream).0)
+                .arg(&scales_d.device_ptr(stream).0)
+                .arg(&rows_i)
+                .arg(&k_i)
+                .arg(&group_i)
+                .arg(&mutant)
+                .launch(LaunchConfig {
+                    grid_dim: (u32::try_from(rows)?, 1, 1),
+                    block_dim: (threads, 1, 1),
+                    shared_mem_bytes: smem,
+                })?;
+        }
+        stream.synchronize()?;
+        Ok((
+            stream.clone_dtoh(&rotated_d)?,
+            stream.clone_dtoh(&codes_d)?,
+            stream.clone_dtoh(&scales_d)?,
+        ))
+    }
+
+    fn check_within_bar(label: &str, dist: F64Distance, bar: IncumbentBar) -> Result<()> {
+        emit(&format!(
+            "CONVROT_FWHT_F64 label={label} rot_max={:.3e} (bar={:.3e}) rot_rmse={:.3e} codes={}/frac={:.3e} (bar={}/{:.3e}) max_cdiff={} non_tie={} scale_rel={:.3e} (bar={:.3e})",
+            dist.rotated_max_abs,
+            bar.rotated_max_abs,
+            dist.rotated_rmse,
+            dist.code_mismatch_count,
+            dist.code_mismatch_frac,
+            bar.code_mismatch_count,
+            bar.code_mismatch_frac,
+            dist.code_max_abs_diff,
+            dist.non_tie_code_mismatch,
+            dist.scale_max_rel_err,
+            bar.scale_max_rel_err,
+        ));
+        ensure!(
+            dist.rotated_max_abs <= bar.rotated_max_abs
+                && dist.code_max_abs_diff <= 1
+                && dist.non_tie_code_mismatch == 0
+                && dist.code_mismatch_count <= bar.code_mismatch_count
+                && dist.code_mismatch_frac <= bar.code_mismatch_frac
+                && dist.scale_max_rel_err <= bar.scale_max_rel_err,
+            "CONVROT_FWHT_F64 {label} exceeded incumbent bar: got {dist:?} vs {bar:?}"
         );
         Ok(())
     }
 
-    fn check_group_dot_tiles(device: &Device) -> Result<()> {
-        check_hadamard_table_mutant(device)?;
-        let group = 256usize;
-        let n = 40usize;
-        for rows in [17usize, 20, 42, 41770] {
-            for k in [5376usize, 7168, 14336] {
-                let (gx, gy, gz) = super::group_dot_grid(
-                    u32::try_from(rows)?,
-                    u32::try_from(k)?,
-                    u32::try_from(group)?,
-                    16,
-                );
-                ensure!(
-                    gx == u32::try_from(rows)?.div_ceil(16)
-                        && gy == 1
-                        && gz == u32::try_from(k)? / u32::try_from(group)?
-                        && gy != u32::try_from(group)? / 8,
-                    "group_dot grid rows={rows} k={k} got {gx},{gy},{gz}"
-                );
-                emit(&format!("CONVROT_MMA rows={rows} k={k} n={n} begin"));
-                let x = activation(rows, k);
-                let qweight = weight(n, k);
-                let wscale = wscale_row(n);
-                #[cfg(feature = "cuda")]
-                let (host_codes, host_scales) = mma_rotate_quant(&x, k, group)?;
-                #[cfg(feature = "cuda")]
-                let host = host_product(&host_codes, &host_scales, k, &qweight, n, &wscale)?;
-                let quant = cfg!(feature = "rocm") || rows == 17 || rows == 20 || rows == 42;
-                let launch_input = HostLaunch {
-                    x: &x,
-                    k,
-                    group,
-                    qweight: &qweight,
-                    n,
-                    wscale: &wscale,
-                    keep: quant,
-                };
-                let ran = launch_kept(device, launch_input)?;
-                #[cfg(feature = "cuda")]
-                {
-                    let mismatched = bit_diff(&ran.y, &host);
-                    emit(&format!(
-                        "CONVROT_MMA rows={rows} k={k} n={n} differ={mismatched}"
-                    ));
-                    ensure!(
-                        mismatched == 0,
-                        "convrot mma rows={rows} k={k} n={n} differing bits {mismatched}"
-                    );
-                    if quant {
-                        check_codes(&ran.rotated, &ran.codes, &ran.scales, rows, k)?;
-                        let rotated_diff = rotated_mismatch(&x, &ran.rotated, k, group)?;
-                        emit(&format!(
-                            "CONVROT_ROTATED rows={rows} k={k} n={n} differ={rotated_diff}"
-                        ));
-                        ensure!(
-                            rotated_diff == 0,
-                            "convrot rotated rows={rows} k={k} differing bits {rotated_diff}"
-                        );
-                        let host_code_diff = count_i8(&host_codes, &ran.codes);
-                        let host_scale_diff = count_f32(&host_scales, &ran.scales);
-                        emit(&format!(
-                            "CONVROT_HOST rows={rows} k={k} codes={host_code_diff} scales={host_scale_diff}"
-                        ));
-                        ensure!(
-                            host_code_diff == 0 && host_scale_diff == 0,
-                            "convrot host rows={rows} k={k} codes {host_code_diff} scales {host_scale_diff}"
-                        );
-                    }
-                }
-                #[cfg(feature = "rocm")]
-                check_rocm_rotation_and_product(
-                    &HostLaunch {
-                        x: &x,
-                        k,
-                        group,
-                        qweight: &qweight,
-                        n,
-                        wscale: &wscale,
-                        keep: true,
-                    },
-                    &ran,
-                    Some(23),
-                )?;
-                if rows == 20 && k == 5376 {
-                    let (seq_codes, seq_scales) = super::rotate_quant(&x, k, group)?;
-                    let sequential =
-                        super::int8_product(&seq_codes, &seq_scales, k, &qweight, n, &wscale)?;
-                    let seq_diff = bit_diff(&ran.y, &sequential);
-                    emit(&format!(
-                        "CONVROT_SEQUENTIAL rows=20 k=5376 n=40 differ={seq_diff}"
-                    ));
-                    ensure!(seq_diff > 0, "sequential quantize matched the device");
-                    let tile_diff = tile_row_offset_diff(&ran.rotated, &ran.codes, k);
-                    emit(&format!(
-                        "CONVROT_TILE_ROW rows=20 k=5376 differ={tile_diff}"
-                    ));
-                    ensure!(tile_diff > 0, "tile row offset reproduced the device codes");
-                    let mut shifted = vec![0.0f32; rows * k];
-                    for r in 0..rows {
-                        for c in 0..k {
-                            shifted[r * k + c] = x[r * k + (c + 1) % k];
-                        }
-                    }
-                    #[cfg(feature = "cuda")]
-                    let shift_codes = mma_rotate_quant(&shifted, k, group)?.0;
-                    #[cfg(feature = "rocm")]
-                    let shift_codes = launch_kept(
-                        device,
-                        HostLaunch {
-                            x: &shifted,
-                            k,
-                            group,
-                            qweight: &qweight,
-                            n,
-                            wscale: &wscale,
-                            keep: true,
-                        },
-                    )?
-                    .codes;
-                    let col_diff = count_i8(&shift_codes, &ran.codes);
-                    emit(&format!(
-                        "CONVROT_BF16_COL rows=20 k=5376 differ={col_diff}"
-                    ));
-                    ensure!(
-                        col_diff > 0,
-                        "bf16 column offset reproduced the device codes"
-                    );
-                }
-                if rows == 41770 && k == 5376 {
-                    let mut swapped = x;
-                    swapped.swap(0, 16);
-                    let mutant = launch(device, &swapped, k, group, &qweight, n, &wscale)?;
-                    let mut_diff = bit_diff(&mutant, &ran.y);
-                    emit(&format!("CONVROT_GROUP_DOT_MUTANT differ={mut_diff}"));
-                    ensure!(mut_diff > 0, "column swap reproduced the device product");
-                }
-            }
+    fn check_planted_mutants(
+        device: &Device,
+        x_bf16: &[bf16],
+        (rows, k, group): (usize, usize, usize),
+        bar: IncumbentBar,
+    ) -> Result<()> {
+        let x_d = device.stream.clone_htod(x_bf16)?;
+        let x_ptr = x_d.device_ptr(&device.stream).0;
+        for (mutant, kind) in [(1i32, "stage_omitted"), (2i32, "sign_flipped")] {
+            let (rot, codes, scales) =
+                launch_fwht_probe(device, x_ptr, (rows, k, group), false, mutant)?;
+            let dist = f64_distance_bf16(x_bf16, &rot, &codes, &scales, k, group, Some(23))?;
+            emit(&format!(
+                "CONVROT_FWHT_MUTANT kind={kind} group={group} rot_max={:.3e} codes={} non_tie={} scale_rel={:.3e}",
+                dist.rotated_max_abs,
+                dist.code_mismatch_count,
+                dist.non_tie_code_mismatch,
+                dist.scale_max_rel_err
+            ));
+            ensure!(
+                dist.rotated_max_abs > bar.rotated_max_abs.max(1.0e-3)
+                    && dist.code_mismatch_count > bar.code_mismatch_count,
+                "planted mutant {kind} group={group} did not fail the gate"
+            );
         }
-        let wide = 1024usize;
-        let rows = 20usize;
-        let k = 7168usize;
-        let max = super::max_group(device.info.optin_shared_bytes)?;
-        ensure!(
-            u32::try_from(wide)? <= max,
-            "device tile {max} excludes group {wide}"
-        );
-        emit(&format!(
-            "CONVROT_MAX_GROUP optin={} max={max}",
-            device.info.optin_shared_bytes
-        ));
-        let (gx, gy, gz) = super::group_dot_grid(
-            u32::try_from(rows)?,
-            u32::try_from(k)?,
-            u32::try_from(wide)?,
-            16,
-        );
-        ensure!(
-            gx == u32::try_from(rows)?.div_ceil(16)
-                && gy == 1
-                && gz == u32::try_from(k)? / u32::try_from(wide)?
-                && gy != u32::try_from(wide)? / 8,
-            "group_dot grid rows={rows} k={k} group={wide} got {gx},{gy},{gz}"
-        );
-        emit(&format!(
-            "CONVROT_MMA rows={rows} k={k} n={n} group={wide} begin"
-        ));
+        Ok(())
+    }
+
+    fn check_fwht_shape(
+        device: &Device,
+        (rows, k, n, group): (usize, usize, usize, usize),
+        bar: IncumbentBar,
+    ) -> Result<()> {
         let x = activation(rows, k);
         let qweight = weight(n, k);
         let wscale = wscale_row(n);
-        #[cfg(feature = "cuda")]
-        {
-            let host = {
-                let (codes, scales) = mma_rotate_quant(&x, k, wide)?;
-                host_product(&codes, &scales, k, &qweight, n, &wscale)?
-            };
-            let y = launch(device, &x, k, wide, &qweight, n, &wscale)?;
-            let mismatched = bit_diff(&y, &host);
-            emit(&format!(
-                "CONVROT_MMA rows={rows} k={k} n={n} group={wide} differ={mismatched}"
-            ));
+        let ran = launch_kept(
+            device,
+            HostLaunch {
+                x: &x,
+                k,
+                group,
+                qweight: &qweight,
+                n,
+                wscale: &wscale,
+                keep: true,
+            },
+        )?;
+        let host = host_product(&ran.codes, &ran.scales, k, &qweight, n, &wscale)?;
+        let prod_diff = bit_diff(&ran.y, &host);
+        ensure!(
+            prod_diff == 0,
+            "convrot product rows={rows} k={k} n={n} group={group} differ {prod_diff}"
+        );
+        let x_bf16: Vec<bf16> = x.iter().copied().map(bf16::from_f32).collect();
+        let x_d = device.stream.clone_htod(&x_bf16)?;
+        let (rot, p_codes, p_scales) = launch_fwht_probe(
+            device,
+            x_d.device_ptr(&device.stream).0,
+            (rows, k, group),
+            false,
+            0,
+        )?;
+        ensure!(
+            count_i8(&ran.codes, &p_codes) == 0 && count_f32(&ran.scales, &p_scales) == 0,
+            "production FWHT diverged from mutant=0 probe rows={rows} k={k} group={group}"
+        );
+        let dist = f64_distance_bf16(&x_bf16, &rot, &ran.codes, &ran.scales, k, group, Some(23))?;
+        check_within_bar(&format!("syn_m{rows}_k{k}_g{group}"), dist, bar)?;
+        Ok(())
+    }
+
+    fn load_bf16_file(path: &std::path::Path, expected_elems: usize) -> Result<Vec<bf16>> {
+        let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        let (chunks, rest) = bytes.as_chunks::<2>();
+        ensure!(
+            rest.is_empty() && chunks.len() == expected_elems,
+            "{} len {} != expected {}",
+            path.display(),
+            bytes.len(),
+            expected_elems * 2
+        );
+        Ok(chunks
+            .iter()
+            .map(|b| bf16::from_bits(u16::from_le_bytes(*b)))
+            .collect())
+    }
+
+    fn check_real_step_inputs(device: &Device, dir: &std::path::Path) -> Result<()> {
+        let stream = &device.stream;
+        let fns = load_convrot(&device.ctx)?;
+        let rows = 37_717usize;
+        let group = 256usize;
+        let x_k14336_ref = load_bf16_file(&dir.join("x_k14336.bf16"), rows * 14_336)?;
+        let cases = [
+            (
+                "step_k5376",
+                "x_k5376.bf16",
+                5376usize,
+                false,
+                INCUMBENT_STEP_K5376_BAR,
+            ),
+            (
+                "step_k7168",
+                "x_k7168.bf16",
+                7168usize,
+                false,
+                INCUMBENT_STEP_K7168_BAR,
+            ),
+            (
+                "step_k14336",
+                "x_k14336.bf16",
+                14336usize,
+                false,
+                INCUMBENT_STEP_K14336_BAR,
+            ),
+            (
+                "step_k14336_silu",
+                "gu_k14336.bf16",
+                14336usize,
+                true,
+                INCUMBENT_STEP_K14336_SILU_BAR,
+            ),
+        ];
+        for (label, file, k, fuse_silu, bar) in cases {
+            let cols = k * (1 + usize::from(fuse_silu));
+            let x_raw = load_bf16_file(&dir.join(file), rows * cols)?;
+            let x_d = stream.clone_htod(&x_raw)?;
+            let x_ptr = x_d.device_ptr(stream).0;
+            let plan = super::derive_rotate_plan(device, k, group, fuse_silu)?;
+            let codes_d = stream.alloc_zeros::<i8>(rows * k)?;
+            let scales_d = stream.alloc_zeros::<f32>(rows)?;
+            super::launch_rotate_quant(
+                stream,
+                &fns,
+                &ConvrotArgs {
+                    x: x_ptr,
+                    qweight: 0,
+                    wscale: 0,
+                    y: 0,
+                    codes: codes_d.device_ptr(stream).0,
+                    scales: scales_d.device_ptr(stream).0,
+                    rows: i32::try_from(rows)?,
+                    k: i32::try_from(k)?,
+                    n: 0,
+                    group: i32::try_from(group)?,
+                    product: ProductKernel::NFast,
+                    fuse_silu,
+                    rotate: Some(plan),
+                },
+            )?;
+            stream.synchronize()?;
+            let prod_codes = stream.clone_dtoh(&codes_d)?;
+            let prod_scales = stream.clone_dtoh(&scales_d)?;
+            let (rot, p_codes, p_scales) =
+                launch_fwht_probe(device, x_ptr, (rows, k, group), fuse_silu, 0)?;
             ensure!(
-                mismatched == 0,
-                "convrot mma rows={rows} k={k} n={n} group={wide} differing bits {mismatched}"
+                count_i8(&prod_codes, &p_codes) == 0 && count_f32(&prod_scales, &p_scales) == 0,
+                "production FWHT diverged from probe on {label}"
             );
-        }
-        #[cfg(feature = "rocm")]
-        {
-            let ran = launch_kept(
-                device,
-                HostLaunch {
-                    x: &x,
-                    k,
-                    group: wide,
-                    qweight: &qweight,
-                    n,
-                    wscale: &wscale,
-                    keep: true,
-                },
-            )?;
-            check_rocm_rotation_and_product(
-                &HostLaunch {
-                    x: &x,
-                    k,
-                    group: wide,
-                    qweight: &qweight,
-                    n,
-                    wscale: &wscale,
-                    keep: true,
-                },
-                &ran,
-                Some(23),
-            )?;
+            let ref_in = if fuse_silu { &x_k14336_ref } else { &x_raw };
+            let dist = f64_distance_bf16(ref_in, &rot, &prod_codes, &prod_scales, k, group, None)?;
+            check_within_bar(label, dist, bar)?;
         }
         Ok(())
     }
@@ -2627,107 +2494,77 @@ mod device {
     #[test]
     #[ignore = "requires a reserved GPU window"]
     fn convrot_kernel_matches_the_definition() -> Result<()> {
-        #[cfg(feature = "cuda")]
-        {
-            let (paper, one, two) = mma_k16_points();
-            ensure!(
-                paper.to_bits() == (-0.5f32).to_bits()
-                    && one.to_bits() == 1.0f32.to_bits()
-                    && two.to_bits() == 2.0f32.to_bits(),
-                "mma k16 self-check paper={paper} one={one} two={two}"
-            );
-        }
         let device = Device::new(0)?;
         let group = 256usize;
-        let shapes = [
-            (1usize, 256usize, 2usize),
-            (16, 256, 2),
-            (17, 256, 2),
-            (20, 256, 2),
-            (256, 256, 2),
-            (17, 5376, 7168),
-            (17, 7168, 5376),
-            (17, 14336, 5376),
-        ];
-        for (rows, k, n) in shapes {
+        // Below 17 rows: convrot_linear stays bit-exact to the embedded definition.
+        for (rows, expected) in [(1usize, &M1[..]), (16usize, &M16[..])] {
+            let x = activation(rows, 256);
+            let qweight = weight(2, 256);
+            let wscale = wscale_row(2);
+            let y = launch(&device, &x, 256, group, &qweight, 2, &wscale)?;
+            let mismatched = differ(&y, expected);
+            ensure!(
+                mismatched == 0,
+                "convrot M={rows} differing bits {mismatched}"
+            );
+        }
+        for (rows, k, n, g) in [
+            (17usize, 256usize, 2usize, 256usize),
+            (20, 256, 2, 256),
+            (256, 256, 2, 256),
+            (17, 5376, 7168, 256),
+            (17, 7168, 5376, 256),
+            (17, 14336, 5376, 256),
+            (20, 5376, 40, 256),
+            (42, 5376, 40, 256),
+            (20, 7168, 40, 1024),
+        ] {
+            check_fwht_shape(&device, (rows, k, n, g), INCUMBENT_SYNTHETIC_BAR)?;
+        }
+        // Production-scale synthetic row count + negative column-swap control.
+        {
+            let (rows, k, n) = (41_770usize, 5376usize, 40usize);
             let x = activation(rows, k);
             let qweight = weight(n, k);
             let wscale = wscale_row(n);
-            #[cfg(feature = "cuda")]
-            {
-                let expected = definition_bits(rows, k, n)?;
-                let quant = rows == 17 && k != 256;
-                let ran = launch_kept(
-                    &device,
-                    HostLaunch {
-                        x: &x,
-                        k,
-                        group,
-                        qweight: &qweight,
-                        n,
-                        wscale: &wscale,
-                        keep: quant,
-                    },
-                )?;
-                let mismatched = differ(&ran.y, &expected);
-                ensure!(
-                    mismatched == 0,
-                    "convrot kernel M={rows} K={k} N={n} differing bits {mismatched}"
-                );
-                if quant {
-                    check_codes(&ran.rotated, &ran.codes, &ran.scales, rows, k)?;
-                    let rotated_diff = rotated_mismatch(&x, &ran.rotated, k, group)?;
-                    emit(&format!(
-                        "CONVROT_ROTATED rows={rows} k={k} n={n} differ={rotated_diff}"
-                    ));
-                    ensure!(
-                        rotated_diff == 0,
-                        "convrot rotated rows={rows} k={k} differing bits {rotated_diff}"
-                    );
-                }
-            }
-            #[cfg(feature = "rocm")]
-            {
-                let keep = rows >= super::TENSOR_CORE_ROWS;
-                let ran = launch_kept(
-                    &device,
-                    HostLaunch {
-                        x: &x,
-                        k,
-                        group,
-                        qweight: &qweight,
-                        n,
-                        wscale: &wscale,
-                        keep,
-                    },
-                )?;
-                if rows == 1 {
-                    let mismatched = differ(&ran.y, &M1);
-                    ensure!(mismatched == 0, "convrot M=1 differing bits {mismatched}");
-                } else if rows == 16 {
-                    let mismatched = differ(&ran.y, &M16);
-                    ensure!(mismatched == 0, "convrot M=16 differing bits {mismatched}");
-                } else {
-                    check_rocm_rotation_and_product(
-                        &HostLaunch {
-                            x: &x,
-                            k,
-                            group,
-                            qweight: &qweight,
-                            n,
-                            wscale: &wscale,
-                            keep: true,
-                        },
-                        &ran,
-                        Some(23),
-                    )?;
-                }
-            }
+            let ran = launch_kept(
+                &device,
+                HostLaunch {
+                    x: &x,
+                    k,
+                    group,
+                    qweight: &qweight,
+                    n,
+                    wscale: &wscale,
+                    keep: true,
+                },
+            )?;
+            let host = host_product(&ran.codes, &ran.scales, k, &qweight, n, &wscale)?;
+            ensure!(
+                bit_diff(&ran.y, &host) == 0,
+                "production synthetic product diff"
+            );
+            let mut swapped = x;
+            swapped.swap(0, 16);
+            let mutant = launch(&device, &swapped, k, group, &qweight, n, &wscale)?;
+            let mut_diff = bit_diff(&mutant, &ran.y);
+            emit(&format!("CONVROT_FWHT_SWAP_MUTANT differ={mut_diff}"));
+            ensure!(mut_diff > 0, "column swap reproduced the device product");
         }
-        check_group_dot_tiles(&device)?;
-        let rows = 17usize;
-        let k = 256usize;
-        let n = 2usize;
+        // Planted mutants (stage omitted & sign flipped) on both REG (group=256) and SMEM (group=1024).
+        let x256: Vec<bf16> = activation(17, 256)
+            .into_iter()
+            .map(bf16::from_f32)
+            .collect();
+        check_planted_mutants(&device, &x256, (17, 256, 256), INCUMBENT_SYNTHETIC_BAR)?;
+        let x1024: Vec<bf16> = activation(20, 7168)
+            .into_iter()
+            .map(bf16::from_f32)
+            .collect();
+        check_planted_mutants(&device, &x1024, (20, 7168, 1024), INCUMBENT_SYNTHETIC_BAR)?;
+
+        // Doubled wscale and omitted-rotation negative controls.
+        let (rows, k, n) = (17usize, 256usize, 2usize);
         let x = activation(rows, k);
         let qweight = weight(n, k);
         let wscale = wscale_row(n);
@@ -2735,31 +2572,20 @@ mod device {
         let mut shifted = wscale.clone();
         shifted[0] *= 2.0;
         let scale_off = launch(&device, &x, k, group, &qweight, n, &shifted)?;
-        #[cfg(feature = "cuda")]
-        ensure!(
-            differ(&scale_off, &definition_bits(rows, k, n)?) > 0,
-            "a doubled wscale reproduced the definition bits"
-        );
-        #[cfg(feature = "rocm")]
         ensure!(
             bit_diff(&scale_off, &y) > 0,
-            "a doubled wscale reproduced the device output"
+            "doubled wscale reproduced output"
         );
         let omitted = super::linear_omitting_rotation(&x, k, &qweight, n, &wscale)?;
-        #[cfg(feature = "cuda")]
-        ensure!(
-            differ(&omitted, &definition_bits(rows, k, n)?) > 0
-                && differ(
-                    &omitted,
-                    &y.iter().map(|v| v.to_bits() as i16).collect::<Vec<_>>()
-                ) > 0,
-            "omitting the rotation reproduced the definition bits"
-        );
-        #[cfg(feature = "rocm")]
         ensure!(
             bit_diff(&omitted, &y) > 0,
-            "omitting the rotation reproduced the device output"
+            "omitting rotation reproduced output"
         );
+
+        // Real-step production-scale [37717, K] tensors for K in {5376, 7168, 14336} + fused SiLU.
+        if let Ok(dir) = std::env::var("FF_HYPERFLOW_CONVROT_STEP_INPUTS") {
+            check_real_step_inputs(&device, std::path::Path::new(&dir))?;
+        }
         Ok(())
     }
 
@@ -2888,7 +2714,6 @@ mod device {
                 qweight: weight_d.device_ptr(stream).0,
                 wscale: wscale_d.device_ptr(stream).0,
                 y: y_d.device_ptr(stream).0,
-                rotated: 0,
                 codes: codes_d.device_ptr(stream).0,
                 scales: scales_d.device_ptr(stream).0 + scale_off * 4,
                 rows: i32::try_from(rows)?,
@@ -2897,7 +2722,7 @@ mod device {
                 group: 256,
                 product,
                 fuse_silu: false,
-                rotate_32: false,
+                rotate: None,
             },
         )?;
         stream.synchronize()?;
@@ -3536,16 +3361,24 @@ mod device {
 
     #[cfg(feature = "cuda")]
     #[test]
-    fn convrot_group_dot_sass_loads_the_table() -> Result<()> {
+    fn convrot_fwht_sass_is_register_butterfly_and_spill_free() -> Result<()> {
         let sms = crate::backend::cuda::cubin::arches();
         ensure!(!sms.is_empty(), "convrot cubin missing");
+        let kernels = [
+            "convrot_fwht_quantize_1",
+            "convrot_fwht_quantize_2",
+            "convrot_fwht_quantize_4",
+            "convrot_fwht_quantize_silu_1",
+            "convrot_fwht_quantize_silu_2",
+            "convrot_fwht_quantize_silu_4",
+            "convrot_fwht_quantize_smem",
+            "convrot_fwht_quantize_silu_smem",
+        ];
         for &sm in sms {
             let bytes = crate::backend::cuda::cubin::bytes("convrot", sm)
                 .with_context(|| format!("convrot cubin sm_{sm}"))?;
-            let path = std::env::temp_dir().join(format!(
-                "convrot-group-dot-{}-{sm}.cubin",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("convrot-fwht-{}-{sm}.cubin", std::process::id()));
             std::fs::write(&path, bytes).context("convrot cubin")?;
             let output = std::process::Command::new(cuobjdump_bin())
                 .arg("-sass")
@@ -3565,20 +3398,6 @@ mod device {
                 "cuobjdump sm_{sm} status {} {err}",
                 output.status
             );
-            let body = function_sass(&text, "convrot_group_dot")
-                .context("convrot_group_dot missing from cuobjdump")?;
-            let ops = sass_ops(body);
-            let ldg128 = ops.iter().filter(|op| **op == "LDG.E.128").count();
-            let u16 = ops.iter().filter(|op| op.starts_with("LDG.E.U16")).count();
-            let e64 = ops.iter().filter(|op| op.starts_with("LDG.E.64")).count();
-            let constant = ops.iter().filter(|op| op.contains("CONSTANT")).count();
-            let hmma = ops
-                .iter()
-                .filter(|op| **op == "HMMA.16816.F32.BF16")
-                .count();
-            let ldsm2 = ops.iter().filter(|op| **op == "LDSM.16.M88.2").count();
-            let ldsm4 = ops.iter().filter(|op| **op == "LDSM.16.M88.4").count();
-            let mufu = ops.iter().filter(|op| op.starts_with("MUFU")).count();
             let usage = String::from_utf8_lossy(&resources.stdout);
             let usage_err = String::from_utf8_lossy(&resources.stderr);
             ensure!(
@@ -3586,54 +3405,36 @@ mod device {
                 "cuobjdump resources sm_{sm} status {} {usage_err}",
                 resources.status
             );
-            let (reg, stack, local) = function_resources(&usage, "convrot_group_dot")?;
-            println!(
-                "CONVROT_GROUP_DOT_SASS sm_{sm} LDG.E.128={ldg128} U16={u16} E64={e64} CONSTANT={constant} HMMA={hmma} LDSM2={ldsm2} LDSM4={ldsm4} MUFU={mufu} REG={reg} STACK={stack} LOCAL={local}"
-            );
-            if sm < 80 {
-                let trap = ops.iter().filter(|op| **op == "BPT.TRAP").count();
-                ensure!(
-                    hmma == 0
-                        && trap >= 1
-                        && u16 == 0
-                        && e64 == 0
-                        && constant == 0
-                        && mufu == 0
-                        && stack == 0
-                        && local == 0,
-                    "sm_{sm} convrot_group_dot HMMA={hmma} TRAP={trap} U16={u16} E64={e64} CONSTANT={constant} MUFU={mufu} STACK={stack} LOCAL={local}"
+            for name in kernels {
+                let body = function_sass(&text, name)
+                    .with_context(|| format!("sm_{sm} {name} missing from cuobjdump"))?;
+                let ops = sass_ops(body);
+                let ldg128 = ops.iter().filter(|op| **op == "LDG.E.128").count();
+                let stg64 = ops.iter().filter(|op| **op == "STG.E.64").count();
+                let shfl = ops.iter().filter(|op| op.starts_with("SHFL")).count();
+                let hmma = ops.iter().filter(|op| op.starts_with("HMMA")).count();
+                let (reg, stack, local) = function_resources(&usage, name)
+                    .with_context(|| format!("sm_{sm} {name} resources"))?;
+                println!(
+                    "CONVROT_FWHT_SASS sm_{sm} {name} LDG.E.128={ldg128} STG.E.64={stg64} SHFL={shfl} HMMA={hmma} REG={reg} STACK={stack} LOCAL={local}"
                 );
-                continue;
+                ensure!(
+                    ldg128 >= 1 && stg64 >= 1 && shfl >= 1 && hmma == 0 && stack == 0 && local == 0,
+                    "sm_{sm} {name} LDG.E.128={ldg128} STG.E.64={stg64} SHFL={shfl} HMMA={hmma} REG={reg} STACK={stack} LOCAL={local}"
+                );
             }
-            ensure!(
-                ldg128 >= 2
-                    && u16 == 0
-                    && e64 == 0
-                    && constant == 0
-                    && hmma >= 1
-                    && ldsm2 >= 1
-                    && ldsm4 >= 1
-                    && mufu == 0
-                    && stack == 0
-                    && local == 0,
-                "sm_{sm} convrot_group_dot LDG.E.128={ldg128} U16={u16} E64={e64} CONSTANT={constant} HMMA={hmma} LDSM2={ldsm2} LDSM4={ldsm4} MUFU={mufu} STACK={stack} LOCAL={local}"
-            );
-            if sm >= 80 {
-                let max_silu_reg = if sm == 120 { 56u32 } else { 48 };
-                for (name, max_reg) in [
-                    ("convrot_group_dot_32", 48u32),
-                    ("convrot_group_dot_silu_32", max_silu_reg),
-                ] {
-                    let (reg, stack, local) = function_resources(&usage, name)
-                        .with_context(|| format!("sm_{sm} {name} resources"))?;
-                    println!(
-                        "CONVROT_GROUP_DOT_32_SASS sm_{sm} {name} REG={reg} STACK={stack} LOCAL={local}"
-                    );
-                    ensure!(
-                        reg <= max_reg && stack == 0 && local == 0,
-                        "sm_{sm} {name} REG={reg} STACK={stack} LOCAL={local}"
-                    );
-                }
+            for removed in [
+                "convrot_hadamard_table",
+                "convrot_group_dot",
+                "convrot_group_dot_32",
+                "convrot_group_dot_silu",
+                "convrot_group_dot_silu_32",
+                "convrot_quantize",
+            ] {
+                ensure!(
+                    function_sass(&text, removed).is_none(),
+                    "sm_{sm} obsolete kernel {removed} still present"
+                );
             }
         }
         Ok(())
@@ -3778,11 +3579,15 @@ mod device {
             );
             let disasm_text = String::from_utf8_lossy(&disasm.stdout);
             let notes_text = String::from_utf8_lossy(&notes.stdout);
-            for (name, want_bf16, max_vgprs) in [
-                ("convrot_group_dot", 1usize, 96u32),
-                ("convrot_group_dot_silu", 1, 96),
-                ("convrot_group_dot_32", 2, 96),
-                ("convrot_group_dot_silu_32", 2, 96),
+            for (name, max_vgprs) in [
+                ("convrot_fwht_quantize_1", 96u32),
+                ("convrot_fwht_quantize_2", 128),
+                ("convrot_fwht_quantize_4", 160),
+                ("convrot_fwht_quantize_silu_1", 96),
+                ("convrot_fwht_quantize_silu_2", 128),
+                ("convrot_fwht_quantize_silu_4", 160),
+                ("convrot_fwht_quantize_smem", 96),
+                ("convrot_fwht_quantize_silu_smem", 96),
             ] {
                 let body = rocm_kernel_disasm(&disasm_text, name)
                     .with_context(|| format!("{arch} {name} missing from llvm-objdump"))?;
@@ -3791,10 +3596,10 @@ mod device {
                     body.matches("scratch_load").count() + body.matches("scratch_store").count();
                 let (vgprs, priv_bytes) = rocm_kernel_metadata(&notes_text, name)?;
                 println!(
-                    "CONVROT_GROUP_DOT_ISA {arch} {name} BF16_WMMA={bf16} VGPR={vgprs} PRIV={priv_bytes} SCRATCH={scratch}"
+                    "CONVROT_FWHT_ISA {arch} {name} BF16_WMMA={bf16} VGPR={vgprs} PRIV={priv_bytes} SCRATCH={scratch}"
                 );
                 ensure!(
-                    bf16 == want_bf16 && vgprs <= max_vgprs && priv_bytes == 0 && scratch == 0,
+                    bf16 == 0 && vgprs <= max_vgprs && priv_bytes == 0 && scratch == 0,
                     "{arch} {name} BF16_WMMA={bf16} VGPR={vgprs} PRIV={priv_bytes} SCRATCH={scratch}"
                 );
             }
@@ -3843,57 +3648,39 @@ mod device {
 
     fn check_rotation_bits(
         base: &Ran,
-        wide: &Ran,
+        other: &Ran,
         (rows, k, n): (usize, usize, usize),
-        fused: bool,
+        label: &str,
     ) -> Result<()> {
-        let xr = count_f32(&base.rotated, &wide.rotated);
-        let codes = count_i8(&base.codes, &wide.codes);
-        let scales = count_f32(&base.scales, &wide.scales);
-        let y = bit_diff(&base.y, &wide.y);
+        let codes = count_i8(&base.codes, &other.codes);
+        let scales = count_f32(&base.scales, &other.scales);
+        let y = bit_diff(&base.y, &other.y);
         println!(
-            "CONVROT_ROTATE_32 rows={rows} k={k} n={n} fused={fused} xr={xr} codes={codes} scales={scales} y={y}"
+            "CONVROT_FWHT_PARITY label={label} rows={rows} k={k} n={n} codes={codes} scales={scales} y={y}"
         );
         ensure!(
-            xr == 0 && codes == 0 && scales == 0 && y == 0,
-            "32-row ConvRot differs"
+            codes == 0 && scales == 0 && y == 0,
+            "ConvRot FWHT {label} differs rows={rows} k={k} codes={codes} scales={scales} y={y}"
         );
         Ok(())
     }
 
     #[test]
     #[ignore = "requires a reserved GPU window"]
-    fn convrot_32_rows_matches_16_rows() -> Result<()> {
+    fn convrot_fwht_variants_and_smem_agree() -> Result<()> {
         let device = Device::new(0)?;
-        let [ordinary, _] = super::group_dot_32_wave_sizes(&device)?;
-        use crate::backend::setup::DeviceArchitecture::Cuda;
-        if !super::arch_supported(&device.info.arch) {
-            return Ok(());
-        }
-        ensure!(
-            ordinary.is_some(),
-            "32-row ConvRot resource gate did not admit the ordinary kernel"
-        );
-        let sm120 = device.info.arch == Cuda(120);
-        if sm120 {
-            for k in [5376, 7168] {
-                ensure!(
-                    !super::group_dot_32_fills_wave(1000, k, ordinary),
-                    "sm120 ordinary 32-row grid fills a wave at M=1000 K={k}"
-                );
-            }
-        }
-        for (rows, k, n) in [
-            (17, 256, 40),
-            (37717, 5376, 7168),
-            (37717, 7168, 5376),
-            (1509, 5376, 28672),
-            (1501, 5376, 28672),
+        for (rows, k, n, group) in [
+            (17usize, 256usize, 40usize, 256usize),
+            (17, 256, 40, 64),
+            (1501, 5376, 40, 256),
+            (37_717, 5376, 40, 256),
+            (37_717, 7168, 40, 256),
+            (1501, 14_336, 40, 256),
         ] {
             let x = activation(rows, k);
             let qweight = weight(n, k);
             let wscale = wscale_row(n);
-            let input = |group| HostLaunch {
+            let input = HostLaunch {
                 x: &x,
                 k,
                 group,
@@ -3902,24 +3689,43 @@ mod device {
                 wscale: &wscale,
                 keep: true,
             };
-            let selected = super::group_dot_32_fills_wave(rows, k, ordinary);
-            if !sm120 || matches!(rows, 17 | 37717) {
-                ensure!(
-                    selected == (rows != 17),
-                    "ordinary 32-row selection M={rows} K={k}"
-                );
+            let derived = super::derive_rotate_plan(&device, k, group, false)?;
+            let base = launch_kept_plan(&device, input, derived)?;
+            let chunks = k.div_ceil(256);
+            for chunks_per_warp in [1u8, 2, 4] {
+                let warps = chunks.div_ceil(usize::from(chunks_per_warp));
+                if warps > 32 {
+                    continue;
+                }
+                let plan = super::RotatePlan::Register {
+                    chunks_per_warp,
+                    threads: u32::try_from(warps * 32)?,
+                };
+                if plan == derived {
+                    continue;
+                }
+                let alt = launch_kept_plan(&device, input, plan)?;
+                check_rotation_bits(
+                    &base,
+                    &alt,
+                    (rows, k, n),
+                    &format!("reg_c{chunks_per_warp}"),
+                )?;
             }
-            let base = launch_kept_tile(&device, input(256), false)?;
-            let wide = launch_kept_tile(&device, input(256), true)?;
-            check_rotation_bits(&base, &wide, (rows, k, n), false)?;
-            if rows == 17 {
-                launch_kept_tile(&device, input(64), false)?;
-                ensure!(
-                    launch_kept_tile(&device, input(64), true).is_err(),
-                    "32-row ConvRot accepted group 64"
-                );
+            let smem_need = u32::try_from(k * 4)?;
+            if smem_need <= super::fwht_max_dynamic_smem(device.info.optin_shared_bytes)? {
+                let smem_plan = super::RotatePlan::Shared {
+                    threads: 256,
+                    smem_bytes: smem_need,
+                };
+                let alt = launch_kept_plan(&device, input, smem_plan)?;
+                check_rotation_bits(&base, &alt, (rows, k, n), "smem")?;
             }
         }
+        ensure!(
+            super::derive_rotate_plan(&device, 5376, 128, false).is_err(),
+            "derive_rotate_plan accepted non-power-of-4 group 128"
+        );
         Ok(())
     }
 
@@ -3933,21 +3739,10 @@ mod device {
         let fns = load_convrot(&device.ctx)?;
         let silu =
             crate::backend::cuda::cubin::module(&device.ctx, "act")?.load_function("silu_mul")?;
-        let [ordinary_32, fused_32] = super::group_dot_32_wave_sizes(&device)?;
-        if super::arch_supported(&device.info.arch) {
-            ensure!(
-                fused_32.is_some(),
-                "fused 32-row ConvRot resource gate did not admit the kernel on {}",
-                device.info.arch
-            );
-            ensure!(
-                super::group_dot_32_fills_wave(1000, 14336, fused_32),
-                "fused 32-row grid did not qualify at M=1000 K=14336 on {}",
-                device.info.arch
-            );
-        }
         let large_fused = device.ctx.mem_get_info()?.1 >= 32 << 30;
         let (k, n, group) = (14336usize, 5376usize, 256usize);
+        let plan_plain = super::derive_rotate_plan(&device, k, group, false)?;
+        let plan_silu = super::derive_rotate_plan(&device, k, group, true)?;
         let weight = stream.clone_htod(&salted_weight(n, k, 0))?;
         let scale = stream.clone_htod(&salted_wscale(n, 0))?;
 
@@ -3989,8 +3784,7 @@ mod device {
                     .launch(cfg)?;
             }
 
-            let run = |x, fuse_silu, rotate_32| -> Result<Ran> {
-                let rotated = stream.alloc_zeros::<f32>((rows + 1) * k)?;
+            let run = |x, fuse_silu, plan| -> Result<Ran> {
                 let codes = stream.alloc_zeros::<i8>((rows + 1) * k)?;
                 let scales = stream.alloc_zeros::<f32>(rows + 1)?;
                 let y = stream.alloc_zeros::<bf16>((rows + 1) * n)?;
@@ -4002,7 +3796,6 @@ mod device {
                         qweight: weight.device_ptr(stream).0,
                         wscale: scale.device_ptr(stream).0,
                         y: y.device_ptr(stream).0,
-                        rotated: rotated.device_ptr(stream).0,
                         codes: codes.device_ptr(stream).0,
                         scales: scales.device_ptr(stream).0,
                         rows: rows_i,
@@ -4011,19 +3804,17 @@ mod device {
                         group: i32::try_from(group)?,
                         product: ProductKernel::NFast,
                         fuse_silu,
-                        rotate_32,
+                        rotate: Some(plan),
                     },
                 )?;
                 stream.synchronize()?;
                 let ran = Ran {
                     y: stream.clone_dtoh(&y)?,
-                    rotated: stream.clone_dtoh(&rotated)?,
                     codes: stream.clone_dtoh(&codes)?,
                     scales: stream.clone_dtoh(&scales)?,
                 };
                 ensure!(
-                    ran.rotated[rows * k..].iter().all(|v| v.to_bits() == 0)
-                        && ran.codes[rows * k..].iter().all(|&v| v == 0)
+                    ran.codes[rows * k..].iter().all(|&v| v == 0)
                         && ran.scales[rows].to_bits() == 0
                         && ran.y[rows * n..].iter().all(|v| v.to_bits() == 0),
                     "ConvRot SiLU tail guard rows={rows} fused={fuse_silu}"
@@ -4031,45 +3822,16 @@ mod device {
                 Ok(ran)
             };
 
-            let separate = run(gap, false, false)?;
-            let fused = run(gup, true, false)?;
-            let xr = count_f32(&separate.rotated, &fused.rotated);
+            let separate = run(gap, false, plan_plain)?;
+            let fused = run(gup, true, plan_silu)?;
             let codes = count_i8(&separate.codes, &fused.codes);
             let scales = count_f32(&separate.scales, &fused.scales);
             let y = bit_diff(&separate.y, &fused.y);
-            println!(
-                "CONVROT_SILU rows={rows} k={k} n={n} xr={xr} codes={codes} scales={scales} y={y}"
-            );
+            println!("CONVROT_SILU rows={rows} k={k} n={n} codes={codes} scales={scales} y={y}");
             ensure!(
-                xr == 0 && codes == 0 && scales == 0 && y == 0,
+                codes == 0 && scales == 0 && y == 0,
                 "fused SiLU rows={rows} differs"
             );
-            #[cfg(feature = "rocm")]
-            if rows == 17 {
-                let gated_host: Vec<f32> = stream
-                    .clone_dtoh(&gated)?
-                    .into_iter()
-                    .map(bf16::to_f32)
-                    .collect();
-                let (max_abs, rmse) =
-                    f64_rotated_stats(&gated_host, &fused.rotated[..rows * k], k, group, None)?;
-                println!(
-                    "CONVROT_SILU_ROCM_F64 rows={rows} k={k} max_abs={max_abs:.9e} rmse={rmse:.9e}"
-                );
-                ensure!(
-                    max_abs <= ROCM_WMMA_SILU_ROT_MAX_ABS && rmse <= ROCM_WMMA_SILU_ROT_RMSE,
-                    "fused SiLU rocm f64 rows={rows} k={k} max_abs={max_abs:.9e} rmse={rmse:.9e}"
-                );
-            }
-            if fused_32.is_some() {
-                let selected = super::group_dot_32_fills_wave(rows, k, fused_32);
-                ensure!(
-                    selected == (rows != 17),
-                    "fused 32-row selection M={rows} K={k}"
-                );
-                let wide = run(gup, true, true)?;
-                check_rotation_bits(&fused, &wide, (rows, k, n), true)?;
-            }
 
             if rows == 1501 {
                 let actual = stream.clone_dtoh(&gated.slice(control..control + 1))?;
@@ -4081,15 +3843,15 @@ mod device {
                     &[bf16::from_f32(1.65625)],
                     &mut gated.slice_mut(control..control + 1),
                 )?;
-                let mutant = run(gap, false, ordinary_32.is_some())?;
-                let differing = count_f32(&separate.rotated, &mutant.rotated);
+                let mutant = run(gap, false, plan_plain)?;
+                let differing = count_i8(&separate.codes, &mutant.codes);
                 let target = control..control + group;
-                let inside = count_f32(&separate.rotated[target.clone()], &mutant.rotated[target]);
+                let inside = count_i8(&separate.codes[target.clone()], &mutant.codes[target]);
                 println!(
                     "CONVROT_SILU_ROUND_CONTROL rows={rows} differ={differing} inside={inside}"
                 );
                 ensure!(
-                    differing == group && inside == group,
+                    differing > 0 && differing == inside,
                     "one-round SiLU control escaped selected group"
                 );
             }
@@ -4125,9 +3887,13 @@ mod device {
         let weight_d = stream.clone_htod(qweight)?;
         let scale_d = stream.clone_htod(wscale)?;
         let y_d = stream.alloc_zeros::<bf16>(rows * n)?;
-        let rotated = stream.alloc_zeros::<f32>(rows * k)?;
         let codes = stream.alloc_zeros::<i8>(rows * k)?;
         let scales = stream.alloc_zeros::<f32>(rows)?;
+        let rotate = if rows >= super::TENSOR_CORE_ROWS {
+            Some(super::derive_rotate_plan(device, k, group, false)?)
+        } else {
+            None
+        };
         launch_device(
             stream,
             fns,
@@ -4136,7 +3902,6 @@ mod device {
                 qweight: weight_d.device_ptr(stream).0,
                 wscale: scale_d.device_ptr(stream).0,
                 y: y_d.device_ptr(stream).0,
-                rotated: rotated.device_ptr(stream).0,
                 codes: codes.device_ptr(stream).0,
                 scales: scales.device_ptr(stream).0,
                 rows: i32::try_from(rows)?,
@@ -4145,7 +3910,7 @@ mod device {
                 group: i32::try_from(group)?,
                 product: ProductKernel::NFast,
                 fuse_silu: false,
-                rotate_32: false,
+                rotate,
             },
         )?;
         stream.synchronize()?;
@@ -4170,9 +3935,9 @@ mod device {
         let x = activation(rows, k);
         let stream = &device.stream;
         let held = upload_activation(stream, &x, rows)?;
-        let rotated = stream.alloc_zeros::<f32>(rows * k)?;
         let codes_d = stream.alloc_zeros::<i8>(rows * k)?;
         let scales_d = stream.alloc_zeros::<f32>(rows)?;
+        let rotate = super::derive_rotate_plan(device, k, group, false)?;
         super::launch_rotate_quant(
             stream,
             fns,
@@ -4181,7 +3946,6 @@ mod device {
                 qweight: 0,
                 wscale: 0,
                 y: 0,
-                rotated: rotated.device_ptr(stream).0,
                 codes: codes_d.device_ptr(stream).0,
                 scales: scales_d.device_ptr(stream).0,
                 rows: i32::try_from(rows)?,
@@ -4190,12 +3954,11 @@ mod device {
                 group: i32::try_from(group)?,
                 product: ProductKernel::NFast,
                 fuse_silu: false,
-                rotate_32: false,
+                rotate: Some(rotate),
             },
         )?;
         stream.synchronize()?;
         held.release();
-        drop(rotated);
         let shared_codes: Vec<i8> = stream.clone_dtoh(&codes_d)?;
         let shared_scales: Vec<f32> = stream.clone_dtoh(&scales_d)?;
         let mut codes_differ = 0usize;
@@ -4221,7 +3984,6 @@ mod device {
                     qweight: weight_d.device_ptr(stream).0,
                     wscale: wscale_d.device_ptr(stream).0,
                     y: y_d.device_ptr(stream).0,
-                    rotated: 0,
                     codes: codes_d.device_ptr(stream).0,
                     scales: scales_d.device_ptr(stream).0,
                     rows: i32::try_from(rows)?,
@@ -4230,7 +3992,7 @@ mod device {
                     group: i32::try_from(group)?,
                     product,
                     fuse_silu: false,
-                    rotate_32: false,
+                    rotate: None,
                 },
             )?;
             stream.synchronize()?;
