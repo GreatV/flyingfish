@@ -1298,6 +1298,15 @@ fn ffn_chunk(rows: usize) -> usize {
     rows.div_ceil(rows.div_ceil(FFN_CHUNK_ROWS))
 }
 
+fn ffn_projection_family(base_family: bool, index: usize) -> bool {
+    index >= 2 || base_family
+}
+
+#[cfg(any(test, feature = "cuda"))]
+fn qualification_plan_family(base_family: bool, ff_in: bool) -> bool {
+    ff_in && base_family
+}
+
 #[derive(Clone, Copy, Debug)]
 struct FfnPlan {
     chunk: usize,
@@ -2336,6 +2345,29 @@ impl BlockWork {
     /// chunks.
     pub(crate) fn prepare<const LORA: bool>(&self, blas: &Blas, spec: &H3Spec) -> Result<()> {
         let (h, width, f, r) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn, self.rank);
+        #[cfg(feature = "cuda")]
+        let base_family = blas.bf16_row_family();
+        #[cfg(not(feature = "cuda"))]
+        let base_family = false;
+        #[cfg(feature = "cuda")]
+        if base_family {
+            blas.bind_base_ffn_family(
+                crate::backend::setup::LinearShape {
+                    rows: FFN_CHUNK_ROWS,
+                    output: 2 * f,
+                    input: h,
+                },
+                false,
+            )?;
+            blas.bind_base_ffn_family(
+                crate::backend::setup::LinearShape {
+                    rows: FFN_CHUNK_ROWS,
+                    output: h,
+                    input: f,
+                },
+                true,
+            )?;
+        }
         let mut shapes = vec![(self.rows, width, h, false), (self.rows, h, width, false)];
         if LORA {
             shapes.extend([(self.rows, 3 * r, h, false), (self.rows, r, width, false)]);
@@ -2344,7 +2376,7 @@ impl BlockWork {
             .into_iter()
             .filter(|&n| n > 0)
         {
-            shapes.extend([(rows, 2 * f, h, false), (rows, h, f, false)]);
+            shapes.extend([(rows, 2 * f, h, base_family), (rows, h, f, base_family)]);
             if LORA {
                 shapes.extend([(rows, r, h, self.fixed_lora), (rows, r, f, self.fixed_lora)]);
                 if self.fixed_lora {
@@ -2353,12 +2385,14 @@ impl BlockWork {
             }
         }
         for (rows, output, input, family) in shapes {
+            let shape = crate::backend::setup::LinearShape {
+                rows,
+                output,
+                input,
+            };
             if family {
-                blas.prepare_row_family(crate::backend::setup::LinearShape {
-                    rows,
-                    output,
-                    input,
-                })?;
+                blas.prepare_row_family(shape)?;
+                blas.bind_workspace(blas.fixed_workspace(shape, true)?)?;
             } else {
                 blas.prepare_fixed(
                     u32::try_from(rows)?,
@@ -2441,6 +2475,10 @@ impl BlockWork {
             tensor_cost: 0.0,
             launches: 0,
         };
+        #[cfg(feature = "cuda")]
+        let base_family = blas.bf16_row_family();
+        #[cfg(not(feature = "cuda"))]
+        let base_family = false;
         for (rows, count) in [(chunk, self.rows / chunk), (self.rows % chunk, 1)] {
             if rows == 0 || count == 0 {
                 continue;
@@ -2456,25 +2494,16 @@ impl BlockWork {
             ];
             let counted = if LORA { shapes.len() } else { 2 };
             for (index, &(output, input)) in shapes[..counted].iter().enumerate() {
-                let (wave_cost, reduction) = blas.fixed_plan_cost(
-                    crate::backend::setup::LinearShape {
-                        rows,
-                        output,
-                        input,
-                    },
-                    describe,
-                    index >= 2,
-                )?;
+                let family = ffn_projection_family(base_family, index);
+                let shape = crate::backend::setup::LinearShape {
+                    rows,
+                    output,
+                    input,
+                };
+                let (wave_cost, reduction) = blas.fixed_plan_cost(shape, describe, family)?;
                 plan.tensor_cost +=
                     2.0 * rows as f64 * output as f64 * input as f64 * count as f64 * wave_cost;
-                plan.workspace = plan.workspace.max(blas.fixed_workspace(
-                    crate::backend::setup::LinearShape {
-                        rows,
-                        output,
-                        input,
-                    },
-                    index >= 2,
-                )?);
+                plan.workspace = plan.workspace.max(blas.fixed_workspace(shape, family)?);
                 launches += 1 + reduction;
             }
             plan.launches += count * launches;
@@ -2632,15 +2661,21 @@ impl BlockWork {
         );
         self.fixed_lora = true;
         self.prepare::<LORA>(blas, spec)?;
-        for rows in [self.chunk, self.rows % self.chunk]
-            .into_iter()
-            .filter(|&rows| rows > 0)
-        {
-            blas.bind_lower_wave(crate::backend::setup::LinearShape {
-                rows,
-                output: spec.hidden,
-                input: spec.ffn,
-            })?;
+        #[cfg(feature = "cuda")]
+        let per_m_lower_wave = !blas.bf16_row_family();
+        #[cfg(not(feature = "cuda"))]
+        let per_m_lower_wave = true;
+        if per_m_lower_wave {
+            for rows in [self.chunk, self.rows % self.chunk]
+                .into_iter()
+                .filter(|&rows| rows > 0)
+            {
+                blas.bind_lower_wave(crate::backend::setup::LinearShape {
+                    rows,
+                    output: spec.hidden,
+                    input: spec.ffn,
+                })?;
+            }
         }
         if self.rows > FFN_CHUNK_ROWS {
             self.ffn_cost::<LORA>(blas, spec, self.chunk, true)?;
@@ -3581,6 +3616,15 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
             ptrs.rotate_32 = index == FF_IN && rotate_32[FF_IN][tail];
             ptrs
         });
+        #[cfg(feature = "cuda")]
+        if let BlockLinear::Dense { weight, .. } = &w.linears[index]
+            && wide.is_none()
+            && c.blas.bf16_row_family()
+        {
+            return c
+                .blas
+                .linear_row_family(*weight, x, &mut TensorMut(y), 1.0, 0.0);
+        }
         apply_linear(c, &w.linears[index], x, y, scratch)
     };
     for start in (0..rows).step_by(chunk) {
@@ -5705,6 +5749,7 @@ impl Dit {
                 copies,
                 &table.blocks,
                 (role == FF_IN).then_some(work.rows % work.chunk),
+                qualification_plan_family(blas.bf16_row_family(), role == FF_IN),
             )
         };
         let q = matrix(&work.q_raw, stream, work.rows, work.q_raw.len() / work.rows)?;
@@ -8436,6 +8481,25 @@ mod tests {
         }
         assert!(FfnPlan::alias_capacity((usize::MAX, usize::MAX), usize::MAX).is_err());
         assert!(FfnPlan::alias_capacity((1, 1), 0).is_err());
+        let family_ws = 8_192usize;
+        let row_ws = 1_024usize;
+        let priced = |base_family, index| {
+            if ffn_projection_family(base_family, index) {
+                family_ws
+            } else {
+                row_ws
+            }
+        };
+        assert_eq!([priced(true, 0), priced(true, 1)], [family_ws, family_ws]);
+        assert_eq!([priced(false, 0), priced(false, 1)], [row_ws, row_ws]);
+        assert_eq!(priced(false, 2), family_ws);
+        let old = |index| {
+            if index >= 2 { family_ws } else { row_ws }
+        };
+        assert!(priced(true, 0) > old(0) && priced(true, 1) > old(1));
+        assert!(qualification_plan_family(true, true));
+        assert!(!qualification_plan_family(true, false));
+        assert!(!qualification_plan_family(false, true));
         assert!(
             FfnPlan::select(
                 &[FfnPlan {
@@ -11095,6 +11159,60 @@ mod tests {
         let mut source = Source::new(&dir, &manifest, device.info.arch.fp16_stored_half());
         let mut defects = 0;
         let mut cells = 0;
+        #[cfg(feature = "cuda")]
+        {
+            ensure!(
+                blas.bf16_row_family(),
+                "base FFN row family requires BF16 Lt"
+            );
+            let mut required = std::collections::BTreeSet::new();
+            for &rows in &[40_045usize, 60_431] {
+                for &other in &partitions {
+                    for chunk in [1008usize, other] {
+                        for n in [chunk, rows % chunk] {
+                            if n > 0 {
+                                required.insert(n);
+                            }
+                        }
+                    }
+                }
+            }
+            let mut identity_defects = 0usize;
+            for (output, input, lower_wave) in [
+                (2 * spec.ffn, spec.hidden, false),
+                (spec.hidden, spec.ffn, true),
+            ] {
+                blas.bind_base_ffn_family(
+                    crate::backend::setup::LinearShape {
+                        rows: FFN_CHUNK_ROWS,
+                        output,
+                        input,
+                    },
+                    lower_wave,
+                )?;
+                let mut ids = std::collections::BTreeSet::new();
+                for &n in &required {
+                    let shape = crate::backend::setup::LinearShape {
+                        rows: n,
+                        output,
+                        input,
+                    };
+                    blas.prepare_row_family(shape)?;
+                    blas.bind_workspace(blas.fixed_workspace(shape, true)?)?;
+                    ids.insert(blas.row_family_identity(shape)?);
+                }
+                println!(
+                    "H3_BASE_ROW_IDENTITY output={output} input={input} rows={} identities={}",
+                    required.len(),
+                    ids.len()
+                );
+                identity_defects += usize::from(ids.len() != 1);
+            }
+            ensure!(
+                identity_defects == 0,
+                "DEFECT base FFN Lt identity count={identity_defects}"
+            );
+        }
         for layer in [0, spec.layers / 2] {
             for (name, output, input) in [
                 ("ff.net.0.proj", 2 * spec.ffn, spec.hidden),
@@ -11107,6 +11225,7 @@ mod tests {
                 )?;
                 for rows in [40_045usize, 60_431] {
                     for &other in &partitions {
+                        #[cfg(not(feature = "cuda"))]
                         for chunk in [1008, other] {
                             for n in [chunk, rows % chunk].into_iter().filter(|&n| n > 0) {
                                 blas.prepare_fixed(
@@ -11131,13 +11250,17 @@ mod tests {
                                 &host,
                             )?;
                             let y = stream.alloc_zeros::<bf16>(n * output)?;
+                            let weight = matrix(&weight, stream, output, input)?;
+                            let x = matrix(&x, stream, n, input)?;
+                            let mut y_view = TensorMut(matrix(&y, stream, n, output)?);
+                            #[cfg(feature = "cuda")]
+                            blas.linear_row_family(weight, x, &mut y_view, 1.0, 0.0)?;
+                            #[cfg(not(feature = "cuda"))]
                             blas.linear_typed(
                                 crate::op_contract::ExecutionPhase::Prefill,
-                                crate::backend::cuda::linear::LinearWeightRef::Bf16(matrix(
-                                    &weight, stream, output, input,
-                                )?),
-                                matrix(&x, stream, n, input)?,
-                                &mut TensorMut(matrix(&y, stream, n, output)?),
+                                crate::backend::cuda::linear::LinearWeightRef::Bf16(weight),
+                                x,
+                                &mut y_view,
                             )?;
                             let actual = stream.clone_dtoh(&y)?;
                             ensure!(
@@ -17560,6 +17683,140 @@ mod tests {
             Ok(())
         })();
         let cleanup = std::fs::remove_dir_all(runtime);
+        result?;
+        cleanup?;
+        Ok(())
+    }
+
+    /// Resident non-HyperFlow video setup qualifies FF_IN against the prepared family plan.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_LORA"]
+    fn video_ff_in_qualification_uses_the_family_plan() -> Result<()> {
+        use crate::backend::setup::LinearShape;
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let path = |key: &str| {
+            std::env::var_os(key)
+                .map(PathBuf::from)
+                .with_context(|| format!("{key} missing"))
+        };
+        let model = path("FF_MODEL")?;
+        let lora_path = path("FF_H3_LORA")?;
+        let spec = H3Spec::read(&model)?;
+        ensure!(!spec.is_hyperflow()?, "non-HyperFlow video");
+        let geometry = Geometry::resolve(&spec, 768, 1344, 124)?;
+        let text = vec![TEXT_TAG; 4];
+        let layout = PackedLayout::build(&spec, &geometry, &text, &[KeyframeAnchor::First])?;
+        let rows = layout.rows();
+        let initial = ffn_chunk(rows);
+        let output = 2 * spec.ffn;
+        let comparison = rows * spec.heads * spec.head_dim;
+        let fit = |chunk: usize| {
+            let tail = rows % chunk;
+            let ff_in = chunk * output;
+            let tail_elements = tail * output;
+            let fits = ff_in <= comparison && (tail == 0 || tail_elements <= comparison);
+            (tail, ff_in, fits)
+        };
+        let (tail, ff_in, fits) = fit(initial);
+        println!(
+            "H3_VIDEO_GATE_QUALIFY rows={rows} chunk={initial} tail={tail} ff_in_elements={ff_in} comparison_elements={comparison} fits={fits}"
+        );
+        let transformer = model.join("transformer");
+        let base_checkpoint =
+            MappedCheckpoint::open_component(&transformer, "diffusion_pytorch_model")?;
+        let manifest = base_checkpoint.minimax_h3_manifest(&spec)?;
+        let lora_dir = lora_path.parent().context("LoRA directory")?.to_owned();
+        let stem = lora_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".safetensors"))
+            .context("LoRA file stem")?;
+        let lora_checkpoint = MappedCheckpoint::open_component(&lora_dir, stem)?;
+        let (lora_manifest, adapter) = lora_checkpoint.minimax_h3_lora_manifest(&spec)?;
+        let video_grid = Schedule::new(9, 6.0)?;
+        let audio_grid = Schedule::new(9, 3.0)?;
+        let plan = row_timestep_plan(&layout, &video_grid, &audio_grid)?;
+        let adaln_plan = AdalnPlan::build(&layout, &plan)?;
+        let device = Device::new(0)?;
+        ensure!(
+            !device.info.arch.fp16_stored_half(),
+            "BF16 CUDA qualification"
+        );
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let runtime =
+            std::env::temp_dir().join(format!("ff-h3-video-qualify-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let result = (|| -> Result<()> {
+            let mut blas = open_blas(
+                &device,
+                &ops,
+                &runtime,
+                Rc::new(Closure::new(true, "MiniMax-H3 video qualify".into())),
+            )?;
+            ensure!(blas.bf16_row_family(), "base FFN row family");
+            let table = AdalnTable::build(
+                &device,
+                &mut blas,
+                &transformer,
+                &manifest,
+                &spec,
+                &adaln_plan,
+            )?;
+            let visits = crate::prefill::placement_visits(plan.len(), 1)?;
+            let dit = crate::backend::with_verbose(true, || {
+                Dit::new(
+                    &device,
+                    &mut blas,
+                    &spec,
+                    (adapter.rank, &layout, &table),
+                    Source::new(&transformer, &manifest, device.info.arch.fp16_stored_half()),
+                    Some(Source::new(
+                        &lora_dir,
+                        &lora_manifest,
+                        device.info.arch.fp16_stored_half(),
+                    )),
+                    (Placement::Derived, visits),
+                )
+            })?;
+            let chunk = dit.work.chunk;
+            let (tail, ff_in, fits) = fit(chunk);
+            println!(
+                "H3_VIDEO_GATE_QUALIFY rows={} chunk={chunk} tail={tail} ff_in_elements={ff_in} comparison_elements={comparison} fits={fits}",
+                dit.work.rows
+            );
+            ensure!(
+                dit.work.rows == rows && fits,
+                "FF_IN qualify skipped for lack of comparison buffer"
+            );
+            let shape = |rows| LinearShape {
+                rows,
+                output,
+                input: spec.hidden,
+            };
+            ensure!(
+                blas.dense_parent_count(shape(chunk), true) == 1,
+                "family gate/up parent missing"
+            );
+            ensure!(
+                blas.dense_parent_count(shape(chunk), false) == 0,
+                "ordinary gate/up parent was prepared"
+            );
+            if tail > 0 {
+                ensure!(
+                    blas.dense_parent_count(shape(tail), true) == 1
+                        && blas.dense_parent_count(shape(tail), false) == 0,
+                    "tail family parent missing or ordinary tail parent prepared"
+                );
+            }
+            println!("H3_VIDEO_GATE_QUALIFY PASS family_parent=1 ordinary_parent=0");
+            Ok(())
+        })();
+        let cleanup = fs::remove_dir_all(&runtime);
         result?;
         cleanup?;
         Ok(())

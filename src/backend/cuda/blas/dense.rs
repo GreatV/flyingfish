@@ -314,6 +314,8 @@ struct Descriptor {
     alignment: [u32; 4],
     workspace: usize,
     ffn_tail: Option<usize>,
+    incumbent: LtAlgorithm,
+    family: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -699,6 +701,7 @@ impl Blas {
         copies: [Tensor<bf16, 2>; 2],
         source: &cudarc::driver::CudaSlice<bf16>,
         ffn_tail: Option<usize>,
+        family: bool,
     ) -> Result<()> {
         use crate::backend::cuda::contracts::no_overlap;
         let setup_start = std::time::Instant::now();
@@ -716,6 +719,7 @@ impl Blas {
             input: input.shape[1] as usize,
             output: weight.shape[0] as usize,
         };
+        let adopt_gate = ffn_tail.is_some_and(|tail| shape.rows != tail);
         ensure!(
             weight.shape[1] == input.shape[1]
                 && output.shape == [input.shape[0], weight.shape[0]]
@@ -739,88 +743,140 @@ impl Blas {
             "dense Lt calibration inside stream capture"
         );
         self.closure.require_setup()?;
-        let key = (shape.rows, shape.output, shape.input, 0, false);
-        let mut plans = self.plans.borrow_mut();
-        let plan = plans
-            .get_mut(&key)
-            .context("dense Lt projection lacks an incumbent")?;
-        let desc = Descriptor {
-            key: self.calibration.key.clone(),
-            sm: super::cubin::capability(self.stream.context())?,
-            shape,
-            alignment: operands.alignments(),
-            workspace: self.workspace_bytes(),
-            ffn_tail,
-        };
-        let (choice, filled) = desc.selection(self.calibration.runtime(), || {
-            let bytes = input
-                .span_bytes
-                .min(u64::from(input.shape[0]) * u64::from(input.shape[1]) * 2)
-                as usize;
-            let (src, _guard) = source.device_ptr(&self.stream);
-            let source_bytes = std::mem::size_of::<bf16>() * source.len();
-            ensure!(source_bytes > 0, "dense setup activation is empty");
-            for at in (0..bytes).step_by(source_bytes) {
-                unsafe {
-                    cudarc::driver::result::memcpy_dtod_async(
-                        input.ptr + at as u64,
-                        src,
-                        source_bytes.min(bytes - at),
-                        self.stream.cu_stream(),
-                    )?;
+        let key = (shape.rows, shape.output, shape.input, 0, family);
+        let algo = {
+            let mut plans = self.plans.borrow_mut();
+            let plan = plans
+                .get_mut(&key)
+                .context("dense Lt projection lacks an incumbent")?;
+            let incumbent = plan.identity()?;
+            let desc = Descriptor {
+                key: self.calibration.key.clone(),
+                sm: super::cubin::capability(self.stream.context())?,
+                shape,
+                alignment: operands.alignments(),
+                workspace: self.workspace_bytes(),
+                ffn_tail,
+                incumbent,
+                family,
+            };
+            let (choice, filled) = desc.selection(self.calibration.runtime(), || {
+                let bytes = input
+                    .span_bytes
+                    .min(u64::from(input.shape[0]) * u64::from(input.shape[1]) * 2)
+                    as usize;
+                let (src, _guard) = source.device_ptr(&self.stream);
+                let source_bytes = std::mem::size_of::<bf16>() * source.len();
+                ensure!(source_bytes > 0, "dense setup activation is empty");
+                for at in (0..bytes).step_by(source_bytes) {
+                    unsafe {
+                        cudarc::driver::result::memcpy_dtod_async(
+                            input.ptr + at as u64,
+                            src,
+                            source_bytes.min(bytes - at),
+                            self.stream.cu_stream(),
+                        )?;
+                    }
                 }
-            }
-            self.fill_dense(plan, desc.clone(), &operands, copies.map(|t| t.ptr))
-        })?;
-        let algo = self.restore_dense_algo(choice.algorithm)?;
-        let bound = Plan::build(
-            self.handle,
-            (shape.rows, shape.output, shape.input, shape.input),
-            desc.workspace,
-            None,
-            super::PlanOperands {
-                ab: self.half_dtype,
-                c: self.half_dtype,
-                device_alpha: false,
-            },
-            super::PlanAlgo::Fixed(algo),
-        )?;
-        ensure!(
-            bound.workspace == choice.required_workspace,
-            "dense Lt cache workspace recheck differs"
-        );
-        if crate::backend::diagnostics_enabled() {
-            eprintln!(
-                "{}",
-                serde_json::json!({"dense_lt":{"filled":filled,"setup_seconds":setup_start.elapsed().as_secs_f64(),"selection":choice}})
+                self.fill_dense(plan, desc.clone(), &operands, copies.map(|t| t.ptr))
+            })?;
+            let algo = self.restore_dense_algo(choice.algorithm)?;
+            let bound = Plan::build(
+                self.handle,
+                (shape.rows, shape.output, shape.input, shape.input),
+                desc.workspace,
+                None,
+                super::PlanOperands {
+                    ab: self.half_dtype,
+                    c: self.half_dtype,
+                    device_alpha: false,
+                },
+                super::PlanAlgo::Fixed(algo),
+            )?;
+            ensure!(
+                bound.workspace == choice.required_workspace,
+                "dense Lt cache workspace recheck differs"
             );
+            if crate::backend::diagnostics_enabled() {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"dense_lt":{"filled":filled,"setup_seconds":setup_start.elapsed().as_secs_f64(),"selection":choice}})
+                );
+            }
+            if !family {
+                let original = std::mem::replace(plan, bound);
+                #[cfg(test)]
+                self.dense_parents
+                    .borrow_mut()
+                    .insert((shape, false), original);
+                #[cfg(not(test))]
+                drop(original);
+            }
+            algo
+        };
+        if adopt_gate {
+            self.adopt_qualified_gate_family(shape.output, shape.input, algo)?;
         }
-        let original = std::mem::replace(plan, bound);
-        #[cfg(test)]
-        self.dense_parents.borrow_mut().insert(shape, original);
-        #[cfg(not(test))]
-        drop(original);
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn exchange_dense_parents<T>(
+        parents: &mut std::collections::BTreeMap<(LinearShape, bool), T>,
+        plans: &mut std::collections::BTreeMap<(usize, usize, usize, u32, bool), T>,
+    ) -> Result<usize> {
+        for ((shape, family), old) in parents.iter_mut() {
+            let current = plans
+                .get_mut(&(shape.rows, shape.output, shape.input, 0, *family))
+                .context("dense test binding missing")?;
+            std::mem::swap(current, old);
+        }
+        Ok(parents.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dense_parent_count(&self, shape: LinearShape, family: bool) -> usize {
+        usize::from(self.dense_parents.borrow().contains_key(&(shape, family)))
     }
 
     #[cfg(test)]
     pub(crate) fn swap_dense_parents(&self) -> Result<usize> {
         self.stream.synchronize()?;
-        let mut parents = self.dense_parents.borrow_mut();
-        let mut plans = self.plans.borrow_mut();
-        for (s, old) in parents.iter_mut() {
-            let current = plans
-                .get_mut(&(s.rows, s.output, s.input, 0, false))
-                .context("dense test binding missing")?;
-            std::mem::swap(current, old);
-        }
-        Ok(parents.len())
+        Self::exchange_dense_parents(
+            &mut self.dense_parents.borrow_mut(),
+            &mut self.plans.borrow_mut(),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swap_restores_the_pre_qualification_family_plan() -> Result<()> {
+        let shape = LinearShape {
+            rows: 1024,
+            output: 28_672,
+            input: 5_376,
+        };
+        let key = |family| (shape.rows, shape.output, shape.input, 0, family);
+        let qualified = 21u8;
+        let previous = 6u8;
+        let mut plans =
+            std::collections::BTreeMap::from([(key(false), qualified), (key(true), qualified)]);
+        let mut parents = std::collections::BTreeMap::from([
+            ((shape, false), previous),
+            ((shape, true), previous),
+        ]);
+        let bound = Blas::exchange_dense_parents(&mut parents, &mut plans)?;
+        assert_eq!(bound, 2);
+        assert_eq!(plans[&key(true)], previous);
+        assert_eq!(plans[&key(false)], previous);
+        Blas::exchange_dense_parents(&mut parents, &mut plans)?;
+        assert_eq!(plans[&key(true)], qualified);
+        Ok(())
+    }
 
     #[test]
     fn dense_cache_rejects_an_unmeasured_or_noise_level_switch() -> Result<()> {
@@ -852,6 +908,8 @@ mod tests {
             alignment: [256; 4],
             workspace: 0,
             ffn_tail: None,
+            incumbent: parent,
+            family: false,
         };
         let mut cached = Selection {
             descriptor: descriptor.clone(),
@@ -891,5 +949,77 @@ mod tests {
         assert_ne!(warm.algorithm, reordered[0]);
         std::fs::remove_dir_all(dir)?;
         Ok(())
+    }
+
+    #[test]
+    fn dense_cache_entries_differ_by_incumbent() -> Result<()> {
+        let parent = LtAlgorithm {
+            id: 21,
+            tile: 15,
+            split_k: 1,
+            reduction: 0,
+            swizzle: 0,
+            custom: 0,
+            stages: 12,
+            inner: 0,
+            cluster: 0,
+        };
+        let alt = LtAlgorithm { id: 5, ..parent };
+        let describe = |incumbent: LtAlgorithm, family: bool| Descriptor {
+            key: CacheKey {
+                device_uuid: "gpu".into(),
+                driver_version: "driver".into(),
+                binary_version: "binary".into(),
+                cublaslt_version: 1,
+            },
+            sm: 89,
+            shape: LinearShape {
+                rows: 2278,
+                input: 5376,
+                output: 28672,
+            },
+            alignment: [256; 4],
+            workspace: 0,
+            ffn_tail: Some(2274),
+            incumbent,
+            family,
+        };
+        let entry = |descriptor: Descriptor| {
+            let incumbent = descriptor.incumbent;
+            Selection {
+                descriptor,
+                incumbent,
+                algorithm: alt,
+                required_workspace: 0,
+                medians_ms: vec![(incumbent, 100.0), (alt, 97.0)],
+                challenger_margin: Some(0.03),
+                fill_seconds: 1.0,
+            }
+        };
+        let family = describe(parent, true);
+        let other = describe(LtAlgorithm { id: 6, ..parent }, true);
+        let ordinary = describe(parent, false);
+        let dir =
+            std::env::temp_dir().join(format!("ff-dense-lt-incumbent-{}", std::process::id()));
+        std::fs::create_dir(&dir)?;
+        let result = (|| -> Result<()> {
+            let (_first, filled) = family.selection(&dir, || Ok(entry(family.clone())))?;
+            assert!(filled);
+            let (_second, filled) = other.selection(&dir, || Ok(entry(other.clone())))?;
+            assert!(filled);
+            let (_third, filled) = ordinary.selection(&dir, || Ok(entry(ordinary.clone())))?;
+            assert!(filled);
+            let files = std::fs::read_dir(&dir)?
+                .filter(|entry| {
+                    entry.as_ref().is_ok_and(|found| {
+                        found.path().extension().is_some_and(|ext| ext == "json")
+                    })
+                })
+                .count();
+            assert_eq!(files, 3);
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir)?;
+        result
     }
 }
