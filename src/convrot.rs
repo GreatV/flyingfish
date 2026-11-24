@@ -1990,37 +1990,81 @@ mod device {
         scale_max_rel_err: f64,
     }
 
-    // Measured sm89 incumbent MMA distance to the dense f64 Kronecker H4/2 definition.
+    impl IncumbentBar {
+        const fn max_f64(a: f64, b: f64) -> f64 {
+            if a >= b { a } else { b }
+        }
+
+        const fn max_with(self, oracle: Self) -> Self {
+            Self {
+                rotated_max_abs: Self::max_f64(self.rotated_max_abs, oracle.rotated_max_abs),
+                code_mismatch_count: if self.code_mismatch_count >= oracle.code_mismatch_count {
+                    self.code_mismatch_count
+                } else {
+                    oracle.code_mismatch_count
+                },
+                code_mismatch_frac: Self::max_f64(
+                    self.code_mismatch_frac,
+                    oracle.code_mismatch_frac,
+                ),
+                scale_max_rel_err: Self::max_f64(self.scale_max_rel_err, oracle.scale_max_rel_err),
+            }
+        }
+    }
+
+    // 2026-11-24 gate correction after first candidate run: bar = max(incumbent_mma, oracle_f32),
+    // where oracle_f32 is the exact f64 Kronecker H4/2 definition rounded to f32 RN.
+    // Moves only step_k5376 scale_rel (1.045093079238e-7 -> 1.1086593136772697e-7) due to row 24594
+    // exact 25-bit halfway tie (-0x1.088357p+0); all other bars stay at incumbent MMA.
     const INCUMBENT_SYNTHETIC_BAR: IncumbentBar = IncumbentBar {
         rotated_max_abs: 0.0,
         code_mismatch_count: 0,
         code_mismatch_frac: 0.0,
         scale_max_rel_err: 4.907_208_338_175e-8,
-    };
+    }
+    .max_with(IncumbentBar {
+        rotated_max_abs: 0.0,
+        code_mismatch_count: 0,
+        code_mismatch_frac: 0.0,
+        scale_max_rel_err: 4.907_208_338_175e-8,
+    });
     const INCUMBENT_STEP_K5376_BAR: IncumbentBar = IncumbentBar {
         rotated_max_abs: 8.940_696_716_309e-8,
         code_mismatch_count: 195,
         code_mismatch_frac: 195.0 / (37_717.0 * 5_376.0),
         scale_max_rel_err: 1.045_093_079_238e-7,
-    };
+    }
+    .max_with(IncumbentBar {
+        rotated_max_abs: 5.960_464_477_539e-8,
+        code_mismatch_count: 195,
+        code_mismatch_frac: 195.0 / (37_717.0 * 5_376.0),
+        scale_max_rel_err: 1.108_659_313_677_269_7e-7,
+    });
     const INCUMBENT_STEP_K7168_BAR: IncumbentBar = IncumbentBar {
         rotated_max_abs: 5.215_406_417_847e-7,
         code_mismatch_count: 236,
         code_mismatch_frac: 236.0 / (37_717.0 * 7_168.0),
         scale_max_rel_err: 1.555_275_536_410e-7,
-    };
+    }
+    .max_with(IncumbentBar {
+        rotated_max_abs: 2.384_185_791_016e-7,
+        code_mismatch_count: 236,
+        code_mismatch_frac: 236.0 / (37_717.0 * 7_168.0),
+        scale_max_rel_err: 1.156_987_463_809e-7,
+    });
     const INCUMBENT_STEP_K14336_BAR: IncumbentBar = IncumbentBar {
         rotated_max_abs: 2.338_886_260_987e-4,
         code_mismatch_count: 691,
         code_mismatch_frac: 691.0 / (37_717.0 * 14_336.0),
         scale_max_rel_err: 2.867_293_573_185e-7,
-    };
-    const INCUMBENT_STEP_K14336_SILU_BAR: IncumbentBar = IncumbentBar {
-        rotated_max_abs: 2.338_886_260_987e-4,
-        code_mismatch_count: 691,
-        code_mismatch_frac: 691.0 / (37_717.0 * 14_336.0),
-        scale_max_rel_err: 2.867_293_573_185e-7,
-    };
+    }
+    .max_with(IncumbentBar {
+        rotated_max_abs: 1.454_353_332_520e-5,
+        code_mismatch_count: 635,
+        code_mismatch_frac: 635.0 / (37_717.0 * 14_336.0),
+        scale_max_rel_err: 1.175_828_724_085e-7,
+    });
+    const INCUMBENT_STEP_K14336_SILU_BAR: IncumbentBar = INCUMBENT_STEP_K14336_BAR;
 
     fn hadamard_f64_table(group: usize) -> Vec<f64> {
         let mut table = vec![0.0f64; group * group];

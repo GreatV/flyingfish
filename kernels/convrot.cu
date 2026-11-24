@@ -1207,7 +1207,7 @@ extern "C" __global__ __launch_bounds__(512, 1) void convrot_product_n_fast_ldsm
 
 // Fused 1-pass Radix-4 regular Hadamard + per-row INT8 quantize (CUDA sm75+ and HIP wave32).
 // Grid: (rows, 1, 1). Each warp processes 256-element chunks (8 consecutive elements per lane).
-// H4/2 butterfly: s = 0.5 * ((x0 + x1) + (x2 + x3)), y_q = s - x_{3-q} in f32 round-to-nearest.
+// H4/2 cancel-free butterfly: a0 = x0+x1, d0 = x0-x1, a1 = x2+x3, d1 = x2-x3; y = 0.5 * (a ± d_other) in f32 RN.
 __device__ __forceinline__ uint4 convrot_fwht_load_u128(const void* p) {
 #if defined(__HIP__)
     return *reinterpret_cast<const uint4*>(p);
@@ -1250,7 +1250,7 @@ __device__ __forceinline__ void convrot_fwht_load_row8(const __nv_bfloat16* __re
 }
 
 template <bool PROBE>
-__device__ __forceinline__ void convrot_fwht_warp(float (&v)[8], int stages, int mutant) {
+__device__ __forceinline__ void convrot_fwht_warp(float (&v)[8], int stages, int lane, int mutant) {
     const int eff_stages = (PROBE && mutant == 1) ? (stages > 0 ? stages - 1 : 0) : stages;
     if (eff_stages >= 1) {
         #pragma unroll
@@ -1259,12 +1259,14 @@ __device__ __forceinline__ void convrot_fwht_warp(float (&v)[8], int stages, int
             const float x1 = v[base + 1];
             const float x2 = v[base + 2];
             const float x3 = v[base + 3];
-            const float sum = __fadd_rn(__fadd_rn(x0, x1), __fadd_rn(x2, x3));
-            const float opp0 = (PROBE && mutant == 2 && base == 0) ? x3 : -x3;
-            v[base + 0] = fmaf(0.5f, sum, opp0);
-            v[base + 1] = fmaf(0.5f, sum, -x2);
-            v[base + 2] = fmaf(0.5f, sum, -x1);
-            v[base + 3] = fmaf(0.5f, sum, -x0);
+            const float a0 = __fadd_rn(x0, x1);
+            const float d0 = __fsub_rn(x0, x1);
+            const float a1 = __fadd_rn(x2, x3);
+            const float d1 = __fsub_rn(x2, x3);
+            v[base + 0] = __fadd_rn(a0, (PROBE && mutant == 2 && base == 0) ? a1 : d1);
+            v[base + 1] = __fsub_rn(a0, d1);
+            v[base + 2] = __fadd_rn(a1, d0);
+            v[base + 3] = __fsub_rn(a1, d0);
         }
     }
     if (eff_stages >= 2) {
@@ -1272,32 +1274,41 @@ __device__ __forceinline__ void convrot_fwht_warp(float (&v)[8], int stages, int
         for (int j = 0; j < 4; ++j) {
             const float lo = v[j];
             const float hi = v[j + 4];
-            const float lo_p = __shfl_xor_sync(FF_WARP_MASK, lo, 1);
-            const float hi_p = __shfl_xor_sync(FF_WARP_MASK, hi, 1);
-            const float sum = __fadd_rn(__fadd_rn(lo, hi), __fadd_rn(lo_p, hi_p));
-            v[j] = fmaf(0.5f, sum, -hi_p);
-            v[j + 4] = fmaf(0.5f, sum, -lo_p);
+            const float a = __fadd_rn(lo, hi);
+            const float d = __fsub_rn(lo, hi);
+            const float d_other = __shfl_xor_sync(FF_WARP_MASK, d, 1);
+            v[j] = __fadd_rn(a, d_other);
+            v[j + 4] = __fsub_rn(a, d_other);
         }
     }
     if (eff_stages >= 3) {
+        const bool odd3 = (lane & 2) != 0;
         #pragma unroll
         for (int j = 0; j < 8; ++j) {
             const float x = v[j];
-            const float t1 = __fadd_rn(x, __shfl_xor_sync(FF_WARP_MASK, x, 2));
-            const float sum = __fadd_rn(t1, __shfl_xor_sync(FF_WARP_MASK, t1, 4));
-            const float opp = __shfl_xor_sync(FF_WARP_MASK, x, 6);
-            v[j] = fmaf(0.5f, sum, -opp);
+            const float p = __shfl_xor_sync(FF_WARP_MASK, x, 2);
+            const float a = __fadd_rn(x, p);
+            const float d = odd3 ? __fsub_rn(p, x) : __fsub_rn(x, p);
+            const float d_other = __shfl_xor_sync(FF_WARP_MASK, d, 4);
+            v[j] = odd3 ? __fsub_rn(a, d_other) : __fadd_rn(a, d_other);
         }
     }
     if (eff_stages >= 4) {
+        const bool odd4 = (lane & 8) != 0;
         #pragma unroll
         for (int j = 0; j < 8; ++j) {
             const float x = v[j];
-            const float t1 = __fadd_rn(x, __shfl_xor_sync(FF_WARP_MASK, x, 8));
-            const float sum = __fadd_rn(t1, __shfl_xor_sync(FF_WARP_MASK, t1, 16));
-            const float opp = __shfl_xor_sync(FF_WARP_MASK, x, 24);
-            v[j] = fmaf(0.5f, sum, -opp);
+            const float p = __shfl_xor_sync(FF_WARP_MASK, x, 8);
+            const float a = __fadd_rn(x, p);
+            const float d = odd4 ? __fsub_rn(p, x) : __fsub_rn(x, p);
+            const float d_other = __shfl_xor_sync(FF_WARP_MASK, d, 16);
+            v[j] = odd4 ? __fsub_rn(a, d_other) : __fadd_rn(a, d_other);
         }
+    }
+    const float norm = (stages == 4) ? 0.0625f : (stages == 3 ? 0.125f : (stages == 2 ? 0.25f : 0.5f));
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        v[j] = __fmul_rn(v[j], norm);
     }
 }
 
@@ -1350,7 +1361,7 @@ __device__ __forceinline__ void convrot_fwht_quantize_reg(
         if ((chunk << 8) < k) {
             const int col = (chunk << 8) + (lane << 3);
             convrot_fwht_load_row8<SILU>(x_row, k, col, out[c]);
-            convrot_fwht_warp<PROBE>(out[c], stages, mutant);
+            convrot_fwht_warp<PROBE>(out[c], stages, lane, mutant);
             if (col < k) {
                 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
@@ -1371,9 +1382,9 @@ __device__ __forceinline__ void convrot_fwht_quantize_reg(
     for (int off = 16; off > 0; off >>= 1) {
         w = fmaxf(w, __shfl_xor_sync(FF_WARP_MASK, w, off));
     }
-    const float scale = __fdiv_rn(fmaxf(w, 1e-12f), 127.0f);
-    if (tid == 0) scales[row] = scale;
-    const float inv = __fdiv_rn(1.0f, scale);
+    const float peak_clamped = fmaxf(w, 1e-12f);
+    if (tid == 0) scales[row] = __fdiv_rn(peak_clamped, 127.0f);
+    const float inv = __fdiv_rn(127.0f, peak_clamped);
     int8_t* dst = codes + static_cast<long long>(row) * k;
     float* rdst = PROBE ? (rotated + static_cast<long long>(row) * k) : nullptr;
     #pragma unroll
@@ -1423,7 +1434,7 @@ __device__ __forceinline__ void convrot_fwht_quantize_smem_impl(
         const int col = (chunk << 8) + (lane << 3);
         float v[8];
         convrot_fwht_load_row8<SILU>(x_row, k, col, v);
-        convrot_fwht_warp<PROBE>(v, in_warp_stages, stages > 4 ? 0 : mutant);
+        convrot_fwht_warp<PROBE>(v, in_warp_stages, lane, stages > 4 ? 0 : mutant);
         if (col < k) {
             *reinterpret_cast<float4*>(fwht_smem + col) = make_float4(v[0], v[1], v[2], v[3]);
             *reinterpret_cast<float4*>(fwht_smem + col + 4) = make_float4(v[4], v[5], v[6], v[7]);
@@ -1451,12 +1462,14 @@ __device__ __forceinline__ void convrot_fwht_quantize_smem_impl(
                 const float x1 = fwht_smem[idx + stride];
                 const float x2 = fwht_smem[idx + (stride << 1)];
                 const float x3 = fwht_smem[idx + stride * 3];
-                const float sum = __fadd_rn(__fadd_rn(x0, x1), __fadd_rn(x2, x3));
-                const float opp0 = (PROBE && mutant == 2 && s == 4 && idx == 0) ? x3 : -x3;
-                const float y0 = fmaf(0.5f, sum, opp0);
-                const float y1 = fmaf(0.5f, sum, -x2);
-                const float y2 = fmaf(0.5f, sum, -x1);
-                const float y3 = fmaf(0.5f, sum, -x0);
+                const float a0 = __fmul_rn(0.5f, __fadd_rn(x0, x1));
+                const float d0 = __fmul_rn(0.5f, __fsub_rn(x0, x1));
+                const float a1 = __fmul_rn(0.5f, __fadd_rn(x2, x3));
+                const float d1 = __fmul_rn(0.5f, __fsub_rn(x2, x3));
+                const float y0 = __fadd_rn(a0, (PROBE && mutant == 2 && s == 4 && idx == 0) ? a1 : d1);
+                const float y1 = __fsub_rn(a0, d1);
+                const float y2 = __fadd_rn(a1, d0);
+                const float y3 = __fsub_rn(a1, d0);
                 fwht_smem[idx] = y0;
                 fwht_smem[idx + stride] = y1;
                 fwht_smem[idx + (stride << 1)] = y2;
@@ -1484,9 +1497,9 @@ __device__ __forceinline__ void convrot_fwht_quantize_smem_impl(
     for (int off = 16; off > 0; off >>= 1) {
         w = fmaxf(w, __shfl_xor_sync(FF_WARP_MASK, w, off));
     }
-    const float scale = __fdiv_rn(fmaxf(w, 1e-12f), 127.0f);
-    if (tid == 0) scales[row] = scale;
-    const float inv = __fdiv_rn(1.0f, scale);
+    const float peak_clamped = fmaxf(w, 1e-12f);
+    if (tid == 0) scales[row] = __fdiv_rn(peak_clamped, 127.0f);
+    const float inv = __fdiv_rn(127.0f, peak_clamped);
     int8_t* dst = codes + static_cast<long long>(row) * k;
     float* rdst = PROBE ? (rotated + static_cast<long long>(row) * k) : nullptr;
     for (int col = tid << 3; col < k; col += threads << 3) {
