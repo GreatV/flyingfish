@@ -383,6 +383,19 @@ pub(crate) struct DenseStage<'a> {
     pub device_staging: usize,
 }
 
+/// Host bytes a disk supply holds while `disk_layers` of a plan stay on disk: one slot of
+/// `slot_bytes` and one `scratch` buffer per worker, `workers` at most and never more than
+/// the disk layers, which is the slot count the supply spawns.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub(crate) fn supply_reserve(
+    (slot_bytes, scratch, disk_layers, workers): (usize, usize, usize, usize),
+) -> Result<usize> {
+    slot_bytes
+        .checked_add(scratch)
+        .and_then(|per_worker| workers.min(disk_layers).checked_mul(per_worker))
+        .context("dense supply reserve overflow")
+}
+
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 impl DenseStage<'_> {
     pub(crate) fn minimum_device_bytes(self, page: usize) -> Result<usize> {
@@ -494,19 +507,6 @@ impl DenseStage<'_> {
         plan.disk_bytes -= bytes;
     }
 
-    /// Host bytes the disk supply holds while `disk_layers` of a plan stay on disk: one slot and
-    /// one largest-tensor bounce buffer per worker, `ring_workers` at most and never more than
-    /// the disk layers, which is the slot count the supply spawns.
-    fn supply_reserve(
-        self,
-        (ring_slot, disk_layers, ring_workers): (usize, usize, usize),
-    ) -> Result<usize> {
-        ring_slot
-            .checked_add(self.load_scratch)
-            .and_then(|per_worker| ring_workers.min(disk_layers).checked_mul(per_worker))
-            .context("resident ring worker reserve overflow")
-    }
-
     fn host_options(
         self,
         plan: &DensePlacement,
@@ -515,38 +515,64 @@ impl DenseStage<'_> {
     ) -> Result<HostOptions> {
         let disk_layers = plan.slots.iter().flatten().count();
         let ring_slot = plan.slot_bytes.max(self.device_staging);
-        let reserve =
-            |pinned: usize| self.supply_reserve((ring_slot, disk_layers - pinned, ring_workers));
-        let mut plan = plan.clone();
-        let mut best = self.price(&plan, rates);
+        let reserve = |pinned: usize| {
+            supply_reserve((
+                ring_slot,
+                self.load_scratch,
+                disk_layers - pinned,
+                ring_workers,
+            ))
+        };
         let full = reserve(0)?;
+        let mut plan = plan.clone();
         let mut choices = vec![HostChoice {
             held: full,
             reserve: full,
             layers: 0,
-            seconds: best,
+            seconds: self.price(&plan, rates),
         }];
         let mut layers = 0;
         for layer in 0..plan.slots.len() {
             if plan.slots[layer].is_some() {
                 self.pin(&mut plan, layer);
                 layers += 1;
-                let seconds = self.price(&plan, rates);
-                if seconds < best {
-                    let reserve = reserve(layers)?;
-                    choices.push(HostChoice {
-                        held: plan
-                            .host_bytes
-                            .checked_add(reserve)
-                            .context("resident host tier extent overflow")?,
-                        reserve,
-                        layers,
-                        seconds,
-                    });
-                    best = seconds;
-                }
+                let reserve = reserve(layers)?;
+                choices.push(HostChoice {
+                    held: plan
+                        .host_bytes
+                        .checked_add(reserve)
+                        .context("resident host tier extent overflow")?,
+                    reserve,
+                    layers,
+                    seconds: self.price(&plan, rates),
+                });
             }
         }
+        // A choice dominated on both seconds and held bytes by another leaves the set.
+        let mut order: Vec<usize> = (0..choices.len()).collect();
+        order.sort_by(|&a, &b| {
+            choices[a]
+                .seconds
+                .total_cmp(&choices[b].seconds)
+                .then_with(|| choices[a].held.cmp(&choices[b].held))
+        });
+        let mut keep = vec![true; choices.len()];
+        let (mut below, mut run) = (usize::MAX, usize::MAX);
+        let mut previous: Option<usize> = None;
+        for &index in &order {
+            if previous.is_some_and(|last| choices[last].seconds != choices[index].seconds) {
+                below = below.min(run);
+                run = usize::MAX;
+            }
+            keep[index] = choices[index].held < below && choices[index].held < run;
+            run = run.min(choices[index].held);
+            previous = Some(index);
+        }
+        let choices: Vec<_> = choices
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(choice, keep)| keep.then_some(choice))
+            .collect();
         Ok(HostOptions {
             tail: choices.partition_point(|choice| choice.reserve == full),
             least: choices.iter().map(|choice| choice.held).min().unwrap_or(0),
@@ -577,8 +603,9 @@ struct HostChoice {
 }
 
 /// The host choices of one stage beside one base placement, in recorded order: seconds fall
-/// with every later choice. The leading run holds every ring worker's reserve; the tail holds
-/// fewer once pinning leaves the stage fewer disk layers than ring workers.
+/// with every later choice, and no choice holds both no more seconds and no more host bytes
+/// than another. The leading run holds every ring worker's reserve; the tail holds fewer once
+/// pinning leaves the stage fewer disk layers than ring workers.
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 struct HostOptions {
     choices: Vec<HostChoice>,
@@ -833,6 +860,23 @@ mod tests {
         assert_eq!(converted.device_bytes, [8, 8, 328]);
         assert_eq!(converted.plans[2].slot_bytes, 80);
         assert_eq!(converted.plans[2].disk_bytes, 960);
+        // A pin that leaves the modelled time unchanged and holds less host memory stays a
+        // choice: the all-host plan fits at 3000 host bytes and nowhere below.
+        let three = DenseStage {
+            device: &[1000; 3],
+            source: &[1000; 3],
+            visits: 1,
+            load_scratch: 100,
+            device_staging: 0,
+        };
+        let stages = [three, small, small];
+        let equal = price_dense_stages(stages, (2021, 3000, 1), (1.0, 100.0), 4)?;
+        assert_eq!(equal.plans[0].host_bytes, 3000);
+        assert_eq!(equal.plans[0].disk_bytes, 0);
+        assert!(
+            price_dense_stages(stages, (2021, 2999, 1), (1.0, 100.0), 4).is_err(),
+            "a host limit below the all-host plan placed a stage"
+        );
         Ok(())
     }
 
@@ -840,11 +884,11 @@ mod tests {
     #[test]
     fn ring_worker_reserve_prices_the_spawned_slots_at_production_shapes() -> anyhow::Result<()> {
         use super::{DensePlacement, DenseStage, PricedDense, price_dense_stages};
-        use anyhow::{Context as _, ensure};
+        use anyhow::ensure;
         // Cold text-to-image shapes: conditioner and DiT dense stages of 50 layers averaging
         // 505,054,494 B, decoder 393 tensors averaging 4,110,337 B with 1,615,562,080 B F32
-        // staging, largest dense tensor 262,144,000 B, device budget 23,183,563,776 B, host
-        // 44 GiB; pinned H2D 19.9 GB/s, disk 2.0 GB/s (measured concurrent fill 1.3-2.4 GB/s).
+        // staging, largest dense tensor 262,144,000 B, device budget 23,183,563,776 B; pinned
+        // H2D 19.9 GB/s, disk 2.0 GB/s.
         let conditioner = vec![505_054_494; 50];
         let dit = vec![505_054_494; 50];
         let decoder = vec![4_110_337; 393];
@@ -873,13 +917,20 @@ mod tests {
                 },
             ]
         };
-        let limits = (23_183_563_776usize, 44usize << 30, 2_097_152);
+        let (device_limit, page) = (23_183_563_776usize, 2_097_152usize);
         let rates = (19.9e9, 2.0e9);
         let disk_layers = |plan: &DensePlacement| {
             plan.slots
                 .iter()
                 .zip(&plan.host)
                 .filter(|(slot, host)| slot.is_some() && !**host)
+                .count()
+        };
+        let host_layers = |plan: &DensePlacement| {
+            plan.slots
+                .iter()
+                .zip(&plan.host)
+                .filter(|(slot, host)| slot.is_some() && **host)
                 .count()
         };
         // Host bytes the supplies of a plan hold: min(workers, the stage's disk layers) slots,
@@ -899,13 +950,6 @@ mod tests {
                 })
                 .sum::<usize>()
         };
-        let shape = |priced: &PricedDense| {
-            priced
-                .plans
-                .iter()
-                .map(|plan| (plan.host_bytes, disk_layers(plan)))
-                .collect::<Vec<_>>()
-        };
         let host_bytes = |priced: &PricedDense| {
             priced
                 .plans
@@ -913,88 +957,76 @@ mod tests {
                 .map(|plan| plan.host_bytes)
                 .sum::<usize>()
         };
-        let wide = price_dense_stages(stages(40), limits, rates, 2)?;
-        let knee = price_dense_stages(stages(40), limits, rates, 4)?;
-        let many = price_dense_stages(stages(40), limits, rates, 8)?;
-        for (workers, plan) in [(2usize, &wide), (4, &knee), (8, &many)] {
+        let shape = |priced: &PricedDense| {
+            priced
+                .plans
+                .iter()
+                .map(|plan| (host_layers(plan), disk_layers(plan)))
+                .collect::<Vec<_>>()
+        };
+        let place = |host: usize, workers: usize| {
+            price_dense_stages(stages(40), (device_limit, host, page), rates, workers)
+        };
+        // A pin that leaves the modelled time unchanged and holds less host memory stays a
+        // choice. At 31,313,378,628 B of host budget every streamed layer is on the host tier,
+        // the conditioner's 50 and the DiT's 12 beside 38 resident DiT layers, and no supply
+        // spawns; one byte less leaves disk layers in the conditioner.
+        let whole = place(31_313_378_628, 8)?;
+        ensure!(
+            shape(&whole) == [(50, 0), (12, 0), (0, 0)]
+                && host_bytes(&whole) == 31_313_378_628
+                && charge(&whole, 8) == 0
+                && whole.plans[2].slot_bytes == 0,
+            "the all-host plan at its own size: {:?} host={} charge={}",
+            shape(&whole),
+            host_bytes(&whole),
+            charge(&whole, 8)
+        );
+        let below = place(31_313_378_627, 2)?;
+        ensure!(
+            disk_layers(&below.plans[0]) > 0 && host_bytes(&below) < 31_313_378_628,
+            "one byte below the all-host plan keeps every streamed layer on the host tier: {:?}",
+            shape(&below)
+        );
+        // 28 GiB of host budget leave the conditioner 6, 9 and 15 disk layers at 2, 4 and 8
+        // workers; the DiT keeps 12 host layers and the decoder stays resident.
+        for (workers, disk, host, reserve) in [
+            (2usize, 6usize, 28_283_051_664usize, 1_534_396_988usize),
+            (4, 9, 26_767_888_182, 3_068_793_976),
+            (8, 15, 23_737_561_218, 6_137_587_952),
+        ] {
+            let priced = place(28usize << 30, workers)?;
             ensure!(
-                host_bytes(plan) > 0,
-                "worker count {workers} admits no host tier"
+                shape(&priced) == [(50 - disk, disk), (12, 0), (0, 0)]
+                    && charge(&priced, workers) == reserve
+                    && host_bytes(&priced) == host,
+                "workers {workers}: {:?} charge={} host={}",
+                shape(&priced),
+                charge(&priced, workers),
+                host_bytes(&priced)
+            );
+            // The charge is what the plan's supply holds: a host budget of that charge and
+            // the plan's own host tiers places the same tiers.
+            let exact = place(reserve + host, workers)?;
+            ensure!(
+                shape(&exact) == shape(&priced) && host_bytes(&exact) == host,
+                "workers {workers}: the plan's charge does not place its host tiers: {:?} host={}",
+                shape(&exact),
+                host_bytes(&exact)
+            );
+            // One scratch per streamed stage is below that charge and places fewer host tiers.
+            let one_scratch = workers.min(disk) * 505_054_494 + 262_144_000;
+            ensure!(
+                one_scratch < reserve,
+                "workers {workers}: one scratch per stage is not below the charge: {one_scratch} vs {reserve}"
+            );
+            let single = place(one_scratch + host, workers)?;
+            ensure!(
+                host_bytes(&single) < host,
+                "workers {workers}: one scratch per stage places the full host tier: {} vs {host}",
+                host_bytes(&single)
             );
         }
-        // The multi-visited DiT stage keeps a nonzero host tier at the calibrated knee under
-        // the 44 GiB host limit.
-        ensure!(
-            knee.plans[1].host_bytes > 0,
-            "calibrated knee leaves the multi-visited DiT stage with no host tier"
-        );
-        // The charge follows the slots the supplies spawn. This plan leaves every streamed
-        // stage fewer disk layers than workers, so 2, 4 and 8 workers price it alike.
-        let charge2 = charge(&wide, 2);
-        ensure!(charge2 > 0, "the 44 GiB host limit streams nothing");
-        for (workers, plan) in [(4usize, &knee), (8, &many)] {
-            ensure!(
-                shape(plan) == shape(&wide) && charge(plan, workers) == charge2,
-                "worker count {workers} does not price the plan by the slots its supplies spawn: {:?} at {} vs {:?} at {charge2}",
-                shape(plan),
-                charge(plan, workers),
-                shape(&wide)
-            );
-        }
-        // Every worker's bounce buffer is charged: a host limit equal to the knee plan's own
-        // charge reproduces its host tiers, and one built from a single scratch per streamed
-        // stage admits less.
-        let host4 = host_bytes(&knee);
-        let reserve4 = charge(&knee, 4);
-        let one_scratch: usize = knee
-            .plans
-            .iter()
-            .zip(stages(40))
-            .map(|(plan, stage)| {
-                if plan.slot_bytes == 0 {
-                    0
-                } else {
-                    4.min(disk_layers(plan)) * plan.slot_bytes.max(stage.device_staging)
-                        + stage.load_scratch
-                }
-            })
-            .sum();
-        ensure!(
-            one_scratch < reserve4,
-            "one scratch per streamed stage does not undercharge the knee plan: {one_scratch} vs {reserve4}"
-        );
-        let per_worker = price_dense_stages(
-            stages(40),
-            (
-                limits.0,
-                reserve4.checked_add(host4).context("per-worker host")?,
-                limits.2,
-            ),
-            rates,
-            4,
-        )?;
-        let single = price_dense_stages(
-            stages(40),
-            (
-                limits.0,
-                one_scratch
-                    .checked_add(host4)
-                    .context("single-scratch host")?,
-                limits.2,
-            ),
-            rates,
-            4,
-        )?;
-        let per_worker_host: usize = per_worker.plans.iter().map(|plan| plan.host_bytes).sum();
-        let single_host: usize = single.plans.iter().map(|plan| plan.host_bytes).sum();
-        ensure!(
-            host4 > 0 && per_worker_host == host4,
-            "per-worker reserve does not reproduce the plan: {per_worker_host} vs {host4}"
-        );
-        ensure!(
-            single_host < host4,
-            "one scratch per stage still admits the full host tier: {single_host} vs {host4}"
-        );
         Ok(())
     }
 

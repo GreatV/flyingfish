@@ -1998,6 +1998,29 @@ impl SupplyState {
             ),
         }
     }
+
+    /// Ends the layer's entry without an upload: a queued read leaves `pending`, a published
+    /// slot frees. `false` when the layer holds no entry.
+    fn release(&mut self, layer: usize) -> bool {
+        if matches!(
+            self.layer[layer],
+            SupplyLayer::Waiting | SupplyLayer::Consumed
+        ) {
+            return false;
+        }
+        if let SupplyLayer::Ready(slot) = self.layer[layer] {
+            self.free[slot] = true;
+        }
+        if matches!(self.layer[layer], SupplyLayer::Queued) {
+            self.pending.retain(|queued| *queued != layer);
+        }
+        self.layer[layer] = SupplyLayer::Consumed;
+        self.outstanding = self
+            .outstanding
+            .checked_sub(1)
+            .expect("dense supply entry without outstanding count");
+        true
+    }
 }
 
 /// State shared between the dense consumer and the supply workers.
@@ -2022,8 +2045,8 @@ unsafe impl Sync for SupplyShared {}
 /// Concurrent disk supply of a dense streaming tier: `workers` threads read whole disk
 /// layers through the aligned direct reader into per-layer pinned slots; the consumer
 /// uploads from a slot and retires it by event, and a worker reuses a slot only after its
-/// event completed. A failed read replays on every demand; `Drop` joins the workers
-/// before the slots free.
+/// event completed. A failed read replays on every demand; `Drop` joins the workers and
+/// synchronizes the context before the slots free.
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) struct LayerSupply {
     shared: Arc<SupplyShared>,
@@ -2183,18 +2206,31 @@ impl LayerSupply {
     fn retire(&self, layer: usize, slot: usize, stream: &Arc<CudaStream>) -> Result<()> {
         self.shared.events[slot].record(stream)?;
         let mut state = self.shared.state.lock().expect("dense supply lock");
-        state.layer[layer] = SupplyLayer::Consumed;
-        state.free[slot] = true;
-        state.outstanding = state
-            .outstanding
-            .checked_sub(1)
-            .context("dense supply retire without outstanding layer")?;
+        state.release(layer);
         state.retired = state
             .retired
             .checked_add(1)
             .expect("dense supply retired overflow");
         drop(state);
         self.shared.changed.notify_all();
+        Ok(())
+    }
+
+    /// Ends the read-ahead entry of a layer the consumer finds loaded in its device slot, so
+    /// no upload reads it. An entry whose read is in flight is waited for.
+    fn release(&self, layer: usize) -> Result<()> {
+        let mut state = self.shared.state.lock().expect("dense supply lock");
+        while matches!(state.layer[layer], SupplyLayer::Reading) && state.failure.is_none() {
+            state = self.shared.changed.wait(state).expect("dense supply lock");
+        }
+        if let Some(failure) = &state.failure {
+            bail!("dense supply read failed: {failure}");
+        }
+        let released = state.release(layer);
+        drop(state);
+        if released {
+            self.shared.changed.notify_all();
+        }
         Ok(())
     }
 
@@ -2231,9 +2267,11 @@ impl Drop for LayerSupply {
             let _ = handle.join();
         }
         let context = self.shared.context.clone();
+        let _ = context.bind_to_thread();
+        let _ = context.synchronize();
         for (address, _) in self.registrations.drain(..) {
-            let _ = context.bind_to_thread();
-            // SAFETY: the workers joined; no access remains to the registered range.
+            // SAFETY: the workers joined and the context is synchronized; no access remains
+            // to the registered range.
             #[cfg(feature = "cuda")]
             let _ = unsafe {
                 cudarc::driver::sys::cuMemHostUnregister(address as *mut std::ffi::c_void)
@@ -2855,6 +2893,12 @@ impl DenseStreaming {
             return Ok(());
         };
         if self.slots[slot_index].loaded == Some(index) {
+            if self.layers[index].host.is_none() {
+                self.supply
+                    .as_ref()
+                    .context("dense disk supply missing at a loaded disk layer")?
+                    .release(index)?;
+            }
             self.pump_disk();
             return Ok(());
         }
@@ -3207,6 +3251,7 @@ impl WeightCatalog {
         ranges: &[(usize, u64, u64, u64)],
         budget: usize,
         available_host: usize,
+        supply_workers: usize,
     ) -> Result<(usize, crate::prefill::DensePlacement)> {
         use crate::prefill::DensePlacement;
         let mut layer_staging = vec![0usize; layers.len()];
@@ -3222,7 +3267,6 @@ impl WeightCatalog {
             !layers.is_empty() && layer_staging.iter().all(|&n| n > 0),
             "invalid dense layer staging extent"
         );
-        let preliminary = DensePlacement::new(layers, None, budget, 0)?;
         let base_reserve = 4usize << 30;
         if available_host >= base_reserve {
             let host_only =
@@ -3231,30 +3275,36 @@ impl WeightCatalog {
                 return Ok((base_reserve, host_only));
             }
         }
-        let mut disk_staging = 0usize;
-        for _ in 0..=layers.len() {
-            let host_fixed = preliminary
-                .slot_bytes
-                .checked_mul(2)
-                .and_then(|n| n.checked_add(disk_staging))
-                .and_then(|n| n.checked_add(base_reserve))
-                .context("dense host staging overflow")?;
+        // The charge assumed never falls below the charge the plan needs: one slot and one
+        // largest aligned extent per worker the plan's disk layers spawn.
+        let mut host_fixed = base_reserve;
+        let passes = (layers.len() + 1)
+            .checked_mul(supply_workers + 1)
+            .context("dense host staging overflow")?;
+        for _ in 0..=passes {
             ensure!(
                 available_host >= host_fixed,
                 "dense pinned staging and host reserve exceed available RAM: need={host_fixed} available={available_host}"
             );
             let plan = DensePlacement::new(layers, None, budget, available_host - host_fixed)?;
-            let required_staging = layer_staging
-                .iter()
-                .enumerate()
-                .filter(|&(i, _)| plan.slots[i].is_some() && !plan.host[i])
-                .map(|(_, &bytes)| bytes)
-                .max()
-                .unwrap_or(0);
-            if required_staging <= disk_staging {
+            let disk: Vec<usize> = (0..layers.len())
+                .filter(|&i| plan.slots[i].is_some() && !plan.host[i])
+                .collect();
+            let required = crate::prefill::supply_reserve((
+                disk.iter().map(|&layer| layers[layer]).max().unwrap_or(0),
+                disk.iter()
+                    .map(|&layer| layer_staging[layer])
+                    .max()
+                    .unwrap_or(0),
+                disk.len(),
+                supply_workers,
+            ))?
+            .checked_add(base_reserve)
+            .context("dense host staging overflow")?;
+            if required <= host_fixed {
                 return Ok((host_fixed, plan));
             }
-            disk_staging = required_staging;
+            host_fixed = required;
         }
         anyhow::bail!("dense disk staging extent did not converge")
     }
@@ -3341,7 +3391,9 @@ impl WeightCatalog {
         let available_host = available_host
             .checked_sub(host_bytes)
             .context("dense host feature reservation exceeds available RAM")?;
-        let (_, plan) = Self::dense_host_fixed(&layers, &ranges, budget, available_host)?;
+        let supply_workers = super::engine::minimax_h3::dense_supply_workers(dir, &manifest)?;
+        let (_, plan) =
+            Self::dense_host_fixed(&layers, &ranges, budget, available_host, supply_workers)?;
         let memory_bus_bits = d
             .ctx
             .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH)?;
@@ -3990,6 +4042,34 @@ mod tests {
             error.contains("layer 1") && error.contains("visit 2"),
             "{error}"
         );
+        // A layer the consumer finds loaded in its device slot ends its entry without an
+        // upload, and the entry's capacity returns to the supply.
+        let mut loaded = fresh();
+        assert!(loaded.admit(0, 1));
+        loaded.pending.clear();
+        loaded.layer[0] = SupplyLayer::Ready(0);
+        loaded.free[0] = false;
+        assert!(
+            !loaded.admit(1, 1),
+            "a published entry left its capacity to the next layer"
+        );
+        assert!(loaded.release(0));
+        assert!(
+            matches!(loaded.layer[0], SupplyLayer::Consumed) && loaded.free[0],
+            "a released published entry keeps its slot"
+        );
+        assert_eq!(loaded.outstanding, 0);
+        assert!(loaded.admit(1, 1));
+        assert_eq!(loaded.pending.front(), Some(&1));
+        assert!(loaded.release(1));
+        assert!(
+            loaded.pending.is_empty() && matches!(loaded.layer[1], SupplyLayer::Consumed),
+            "a released queued entry stays queued"
+        );
+        assert_eq!(loaded.outstanding, 0);
+        assert!(!loaded.release(1));
+        assert!(!loaded.release(3));
+        assert!(loaded.admit(1, 1));
     }
 
     #[cfg(feature = "cuda")]
@@ -4253,6 +4333,7 @@ mod tests {
                 &ranges,
                 2 * per_layer,
                 (4 << 30) + 4 * per_layer,
+                1,
             )?;
             ensure!(
                 host_fixed == (4 << 30)
@@ -4264,13 +4345,14 @@ mod tests {
                 &[per_layer; 4],
                 &ranges,
                 2 * per_layer,
-                (4 << 30) + 3 * per_layer + UPLOAD_CHUNK_BYTES,
+                (4 << 30) + per_layer + max_staging,
+                1,
             )?;
             ensure!(
-                disk_fixed == (4 << 30) + 2 * per_layer + max_staging
+                disk_fixed == (4 << 30) + per_layer + max_staging
                     && disk_plan.host_bytes == 0
                     && disk_plan.disk_bytes == 4 * per_layer,
-                "disk-spill placement did not reserve derived disk staging bytes: disk_fixed={disk_fixed} max_staging={max_staging} plan={disk_plan:?}"
+                "disk-spill placement did not reserve the spawned supply slot and bounce: disk_fixed={disk_fixed} max_staging={max_staging} plan={disk_plan:?}"
             );
             let stream = &device.stream;
             let mut outputs = (0..4)
@@ -5558,26 +5640,57 @@ mod tests {
             crate::experts::disk::DiskReader::aligned_staging_bytes(offset, len, 8192)?;
         assert_eq!(staging_4096, 100_003_840);
         assert_eq!(staging_8192, staging_4096 + 4096);
-        let available_host = (4 << 30) + 3 * per_layer + staging_4096;
-        let ranges_8192 = [0, 1, 2, 3].map(|layer| (layer, offset, len, 8192));
-        let (disk_fixed, disk_plan) = WeightCatalog::dense_host_fixed(
-            &[per_layer; 4],
-            &ranges_8192,
-            2 * per_layer,
-            available_host,
-        )?;
-        assert_eq!(disk_fixed, (4 << 30) + 2 * per_layer + staging_8192);
-        assert_eq!(disk_plan.host_bytes, 0);
-        assert_eq!(disk_plan.disk_bytes, 4 * per_layer);
-        let ranges_4096 = [0, 1, 2, 3].map(|layer| (layer, offset, len, 4096));
-        let (under_fixed, under_plan) = WeightCatalog::dense_host_fixed(
-            &[per_layer; 4],
-            &ranges_4096,
-            2 * per_layer,
-            available_host,
-        )?;
-        assert_eq!(under_fixed, (4 << 30) + 2 * per_layer + staging_4096);
-        assert_eq!(under_plan.host_bytes, per_layer);
+        let base_reserve = 4usize << 30;
+        let layers = [per_layer; 16];
+        for (alignment, staging) in [(8192u64, staging_8192), (4096, staging_4096)] {
+            let ranges: [(_, u64, u64, u64); 16] =
+                std::array::from_fn(|layer| (layer, offset, len, alignment));
+            for workers in [1usize, 2, 4, 8] {
+                // Every layer on disk: one slot and one bounce per worker the plan spawns.
+                let spawned = workers.min(16) * (per_layer + staging);
+                let (fixed, plan) = WeightCatalog::dense_host_fixed(
+                    &layers,
+                    &ranges,
+                    2 * per_layer,
+                    base_reserve + spawned,
+                    workers,
+                )?;
+                assert_eq!(
+                    plan.host_bytes, 0,
+                    "workers {workers} alignment {alignment}"
+                );
+                assert_eq!(
+                    fixed,
+                    base_reserve + spawned,
+                    "workers {workers} alignment {alignment}"
+                );
+                // One layer above the charge for fifteen disk layers at the 4096 extent: that
+                // layer stays on the host tier only while every bounce holds the 4096 extent.
+                let available =
+                    base_reserve + workers.min(15) * (per_layer + staging_4096) + per_layer;
+                let (fixed, plan) = WeightCatalog::dense_host_fixed(
+                    &layers,
+                    &ranges,
+                    2 * per_layer,
+                    available,
+                    workers,
+                )?;
+                let (host, disk_layers) = if alignment == 4096 {
+                    (per_layer, 15)
+                } else {
+                    (0, 16)
+                };
+                assert_eq!(
+                    plan.host_bytes, host,
+                    "workers {workers} alignment {alignment}"
+                );
+                assert_eq!(
+                    fixed,
+                    base_reserve + workers.min(disk_layers) * (per_layer + staging),
+                    "workers {workers} alignment {alignment}"
+                );
+            }
+        }
         Ok(())
     }
 

@@ -4428,7 +4428,7 @@ fn upcast_from(
 
 /// Calibrated concurrent-reader candidates for one drive, ascending.
 const DISK_READ_WORKERS: [usize; 4] = [1, 2, 4, 8];
-const DISK_READ_SCHEMA: u32 = 1;
+const DISK_READ_SCHEMA: u32 = 2;
 
 /// Measured aggregate direct-read rate per candidate worker count, persisted per drive.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -4487,6 +4487,66 @@ pub(in crate::backend::cuda) fn dense_supply_workers(
     Ok(picked.2)
 }
 
+/// Sample tensors of the calibration probe: one request per largest reader candidate, so
+/// every candidate runs its own reader count. Largest first and round-robin over the shards,
+/// taking the size classes in order 4 to 64 MiB, at most 128 MiB, at most 1 MiB. A manifest
+/// with fewer sample tensors repeats them.
+fn disk_read_samples(manifest: &TensorManifest) -> Result<Vec<(&str, &TensorEntry)>> {
+    let mut classes: [BTreeMap<&str, Vec<(&str, &TensorEntry)>>; 3] = Default::default();
+    for (name, entry) in &manifest.entries {
+        if !entry.load || entry.bytes == 0 {
+            continue;
+        }
+        let class = if (4 << 20..=64 << 20).contains(&entry.bytes) {
+            0
+        } else if entry.bytes <= (128 << 20) {
+            1
+        } else if entry.bytes <= (1 << 20) {
+            2
+        } else {
+            continue;
+        };
+        classes[class]
+            .entry(entry.shard.as_str())
+            .or_default()
+            .push((name.as_str(), entry));
+    }
+    for entries in classes.iter_mut().flat_map(BTreeMap::values_mut) {
+        entries.sort_by_key(|&(name, entry)| (std::cmp::Reverse(entry.bytes), name));
+    }
+    let count = DISK_READ_WORKERS[DISK_READ_WORKERS.len() - 1];
+    let mut samples = Vec::with_capacity(count);
+    for class in classes.iter().filter(|class| !class.is_empty()) {
+        let shards: Vec<&Vec<_>> = class.values().collect();
+        for round in 0..shards
+            .iter()
+            .map(|entries| entries.len())
+            .max()
+            .unwrap_or(0)
+        {
+            for entries in &shards {
+                if samples.len() < count
+                    && let Some(&sample) = entries.get(round)
+                {
+                    samples.push(sample);
+                }
+            }
+        }
+        if samples.len() == count {
+            break;
+        }
+    }
+    ensure!(
+        !samples.is_empty(),
+        "resident disk rate needs a published conditioner read sample"
+    );
+    let distinct = samples.len();
+    for index in distinct..count {
+        samples.push(samples[index % distinct]);
+    }
+    Ok(samples)
+}
+
 /// The dense-streaming worker count for the drive hosting `dir`'s text shards: each
 /// candidate's aggregate rate through the fill reader over the same samples, picked by
 /// [`pick_disk_workers`], persisted under `runtime` keyed by the directory's device.
@@ -4533,40 +4593,7 @@ fn disk_reader_calibration(
             .expect("persisted worker is a candidate")];
         return Ok((cache.probe_bytes, rate, cache.workers));
     }
-    let mut windows = BTreeMap::<&str, (&str, &TensorEntry)>::new();
-    let mut larges = BTreeMap::<&str, (&str, &TensorEntry)>::new();
-    let mut smalls = BTreeMap::<&str, (&str, &TensorEntry)>::new();
-    for (name, entry) in &manifest.entries {
-        if !entry.load || entry.bytes == 0 {
-            continue;
-        }
-        let shard = entry.shard.as_str();
-        if (4 << 20..=64 << 20).contains(&entry.bytes) {
-            let sample = windows.entry(shard).or_insert((name, entry));
-            if sample.1.bytes < entry.bytes {
-                *sample = (name, entry);
-            }
-        } else if entry.bytes <= (1 << 20) {
-            let sample = smalls.entry(shard).or_insert((name, entry));
-            if sample.1.bytes > entry.bytes {
-                *sample = (name, entry);
-            }
-        } else if entry.bytes <= (128 << 20) {
-            let sample = larges.entry(shard).or_insert((name, entry));
-            if sample.1.bytes < entry.bytes {
-                *sample = (name, entry);
-            }
-        }
-    }
-    let samples: Vec<_> = if !windows.is_empty() {
-        windows.into_values().take(4).collect()
-    } else if !larges.is_empty() {
-        larges.into_values().take(4).collect()
-    } else if !smalls.is_empty() {
-        smalls.into_values().take(4).collect()
-    } else {
-        bail!("resident disk rate needs a published conditioner read sample")
-    };
+    let samples = disk_read_samples(manifest)?;
     let mut bufs: Vec<_> = samples
         .iter()
         .map(|(_, entry)| vec![0u8; entry.bytes])
@@ -4588,6 +4615,11 @@ fn disk_reader_calibration(
                 cast: FillCast::Raw,
             })
             .collect::<Vec<_>>();
+        ensure!(
+            requests.len() >= workers,
+            "disk read calibration holds {} samples for {workers} readers",
+            requests.len()
+        );
         let began = std::time::Instant::now();
         source.reader.read_many_direct(&mut requests, workers)?;
         let seconds = began.elapsed().as_secs_f64();
@@ -4606,14 +4638,14 @@ fn disk_reader_calibration(
         workers,
     };
     if let Some(path) = &path {
-        std::fs::write(path, serde_json::to_vec(&cache)?)?;
+        super::super::closure::write_cache(path, &cache)?;
     }
     if crate::backend::diagnostics_enabled() {
         eprintln!(
             "{}",
             serde_json::json!({"disk_read_calibration": {"st_dev": st_dev,
                 "workers": workers, "rates_bytes_per_second": rates,
-                "probe_bytes": probe_bytes, "cached": false}})
+                "probe_bytes": probe_bytes, "requests": samples.len(), "cached": false}})
         );
     }
     let rate = rates[DISK_READ_WORKERS
@@ -20633,6 +20665,240 @@ mod h3_direct_batch_tests {
         assert!(pick_disk_workers(&[f64::NAN, 1.0e9, 1.0e9, 1.0e9]).is_err());
         assert_eq!(DISK_READ_WORKERS, [1, 2, 4, 8]);
         Ok(())
+    }
+
+    #[test]
+    fn disk_probe_samples_hold_one_request_per_reader() -> Result<()> {
+        let mib = 1usize << 20;
+        let kib = 1usize << 10;
+        let entry = |name: &str, shard: &str, bytes: usize, load: bool| {
+            (
+                name.to_owned(),
+                TensorEntry {
+                    dtype: Dtype::BF16,
+                    shape: vec![bytes / 2],
+                    shard: shard.to_owned(),
+                    bytes,
+                    load,
+                    data_start: 0,
+                    data_offsets: [0, 0],
+                    scope: crate::checkpoint::TensorScope::Text,
+                    layer: None,
+                    role: String::new(),
+                    scale_name: None,
+                    quant: None,
+                    swap_halves: false,
+                },
+            )
+        };
+        let manifest = |entries: &[(&str, &str, usize, bool)]| TensorManifest {
+            entries: entries
+                .iter()
+                .map(|&(name, shard, bytes, load)| entry(name, shard, bytes, load))
+                .collect(),
+            resident_bytes: 0,
+        };
+        fn names(manifest: &TensorManifest) -> Result<Vec<&str>> {
+            Ok(super::disk_read_samples(manifest)?
+                .iter()
+                .map(|(name, _)| *name)
+                .collect())
+        }
+        // Two shards of five window tensors: one per shard and round, largest first. Tensors
+        // of the other classes, above every class and not loaded stay out.
+        let entries = [
+            ("a.0", "a", 10 * mib, true),
+            ("a.1", "a", 20 * mib, true),
+            ("a.2", "a", 30 * mib, true),
+            ("a.3", "a", 40 * mib, true),
+            ("a.4", "a", 50 * mib, true),
+            ("b.0", "b", 12 * mib, true),
+            ("b.1", "b", 22 * mib, true),
+            ("b.2", "b", 32 * mib, true),
+            ("b.3", "b", 42 * mib, true),
+            ("b.4", "b", 52 * mib, true),
+            ("huge", "a", 200 * mib, true),
+            ("large", "a", 70 * mib, true),
+            ("tiny", "a", mib, true),
+            ("skip", "a", 30 * mib, false),
+        ];
+        assert_eq!(
+            names(&manifest(&entries))?,
+            ["a.4", "b.4", "a.3", "b.3", "a.2", "b.2", "a.1", "b.1"]
+        );
+        // Three sample tensors repeat to one request per reader.
+        assert_eq!(
+            names(&manifest(&[
+                ("t0", "a", 10 * mib, true),
+                ("t1", "a", 20 * mib, true),
+                ("t2", "a", 30 * mib, true),
+            ]))?,
+            ["t2", "t1", "t0", "t2", "t1", "t0", "t2", "t1"]
+        );
+        // Without a window tensor the larger class comes first, then the small one.
+        assert_eq!(
+            names(&manifest(&[
+                ("l.0", "a", 70 * mib, true),
+                ("l.1", "a", 80 * mib, true),
+                ("s.0", "a", 512 * kib, true),
+                ("s.1", "a", 700 * kib, true),
+                ("s.2", "a", 900 * kib, true),
+                ("s.3", "a", mib, true),
+            ]))?,
+            ["l.1", "l.0", "s.3", "s.2", "s.1", "s.0", "l.1", "l.0"]
+        );
+        assert!(
+            super::disk_read_samples(&manifest(&[("huge", "a", 200 * mib, true)])).is_err(),
+            "a manifest without a sample tensor yielded samples"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GPU and a dense streaming window; runs alone, it seeds the worker count"]
+    fn dense_loaded_disk_layer_ends_its_read_ahead_gpu() -> Result<()> {
+        use crate::backend::cuda::weights::DenseStreaming;
+        use crate::prefill::DensePlacement;
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+        let root = std::env::temp_dir().join(format!("ff-dense-loaded-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("runtime"))?;
+        let result = (|| -> Result<()> {
+            let device = Device::new(0)?;
+            let shape = [384usize, 64];
+            let bytes = shape.iter().product::<usize>() * 2;
+            let per_layer = bytes * 3;
+            let mut header = serde_json::Map::new();
+            let mut entries = BTreeMap::new();
+            let mut offset = 0usize;
+            for layer in 0..3u32 {
+                for tensor in 0..3 {
+                    let name = format!("model.layers.{layer}.matrix{tensor}.weight");
+                    header.insert(
+                        name.clone(),
+                        serde_json::json!({"dtype": "BF16", "shape": shape, "data_offsets": [offset, offset + bytes]}),
+                    );
+                    entries.insert(
+                        name,
+                        TensorEntry {
+                            dtype: Dtype::BF16,
+                            shape: shape.to_vec(),
+                            shard: "model.safetensors".into(),
+                            bytes,
+                            load: true,
+                            data_start: 0,
+                            data_offsets: [offset as u64, (offset + bytes) as u64],
+                            scope: crate::checkpoint::TensorScope::Text,
+                            layer: Some(layer),
+                            role: format!("matrix{tensor}.weight"),
+                            scale_name: None,
+                            quant: None,
+                            swap_halves: false,
+                        },
+                    );
+                    offset += bytes;
+                }
+            }
+            let mut header = serde_json::to_vec(&header)?;
+            while !header.len().is_multiple_of(8) {
+                header.push(b' ');
+            }
+            for entry in entries.values_mut() {
+                entry.data_start = 8 + header.len() as u64;
+            }
+            let expected: Vec<Vec<u8>> = (0..3)
+                .map(|layer| {
+                    (0..per_layer / 2)
+                        .flat_map(|i| {
+                            (0x3c00u16 + ((i * 19 + layer * 173) % 1009) as u16).to_le_bytes()
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut file = std::fs::File::create(root.join("model.safetensors"))?;
+            file.write_all(&(header.len() as u64).to_le_bytes())?;
+            file.write_all(&header)?;
+            for bytes in &expected {
+                file.write_all(bytes)?;
+            }
+            drop(file);
+            let manifest = TensorManifest {
+                entries,
+                resident_bytes: per_layer * 3,
+            };
+            // One supply worker from the persisted calibration of the fixture's device.
+            let runtime = root.join("runtime");
+            let st_dev = std::fs::metadata(&root)?.dev();
+            std::fs::write(
+                runtime.join(format!(
+                    "disk-read-workers-v{DISK_READ_SCHEMA}-{st_dev}.json"
+                )),
+                serde_json::to_vec(&DiskReadWorkers {
+                    schema: DISK_READ_SCHEMA,
+                    st_dev,
+                    probe_bytes: 0,
+                    rates: [1.0; 4],
+                    workers: 1,
+                })?,
+            )?;
+            let (_, _, workers) = seed_dense_supply_workers(&root, &manifest, &runtime)?;
+            ensure!(
+                workers == 1,
+                "the supply worker count is already seeded at {workers}; this test runs alone"
+            );
+            let plan = DensePlacement::new(&[per_layer; 3], None, 2 * per_layer, 0)?;
+            ensure!(
+                plan.slots == [Some(0), Some(1), Some(0)],
+                "loaded-layer test slots: {:?}",
+                plan.slots
+            );
+            let mut dense = DenseStreaming::new(&root, &manifest, plan, &device, None)?;
+            ensure!(
+                dense.supply_workers() == 1,
+                "the supply spawned {} workers",
+                dense.supply_workers()
+            );
+            let stream = &device.stream;
+            let output = stream.alloc_zeros::<u8>(per_layer)?;
+            for repeat in 0..3 {
+                for layer in 0..3 {
+                    dense.begin(layer, stream)?;
+                    let source = dense.pointer(layer, 0, per_layer)?;
+                    unsafe {
+                        crate::backend::cuda::copy::dtod_raw(
+                            output.device_ptr(stream).0,
+                            source,
+                            per_layer,
+                            stream,
+                        )?;
+                    }
+                    dense.end(layer, stream)?;
+                    let actual = stream.clone_dtoh(&output)?;
+                    ensure!(
+                        actual == expected[layer],
+                        "dense slot bytes differ: repeat={repeat} layer={layer}"
+                    );
+                    ensure!(
+                        actual != expected[(layer + 1) % 3],
+                        "wrong-layer control is not discriminating"
+                    );
+                }
+            }
+            // Layer 1 stays in device slot 1 after its first upload; layers 0 and 2 alternate
+            // in slot 0: three uploads in the first repeat, two in each later one.
+            let (published, retired) = dense.flush_ring_counts()?;
+            ensure!(
+                retired == 7 && published >= retired,
+                "loaded-layer read-ahead counts: published={published} retired={retired}"
+            );
+            drop(dense);
+            println!(
+                "PASS dense_loaded_disk_layer layers=3 slots=[0,1,0] workers=1 repeats=3 published={published} retired=7 byte_mismatches=0 wrong_layer=detected"
+            );
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&root)?;
+        result
     }
 }
 
