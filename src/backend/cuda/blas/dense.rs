@@ -314,6 +314,8 @@ struct Descriptor {
     alignment: [u32; 4],
     workspace: usize,
     ffn_tail: Option<usize>,
+    incumbent: LtAlgorithm,
+    family: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -747,6 +749,7 @@ impl Blas {
             let plan = plans
                 .get_mut(&key)
                 .context("dense Lt projection lacks an incumbent")?;
+            let incumbent = plan.identity()?;
             let desc = Descriptor {
                 key: self.calibration.key.clone(),
                 sm: super::cubin::capability(self.stream.context())?,
@@ -754,6 +757,8 @@ impl Blas {
                 alignment: operands.alignments(),
                 workspace: self.workspace_bytes(),
                 ffn_tail,
+                incumbent,
+                family,
             };
             let (choice, filled) = desc.selection(self.calibration.runtime(), || {
                 let bytes = input
@@ -903,6 +908,8 @@ mod tests {
             alignment: [256; 4],
             workspace: 0,
             ffn_tail: None,
+            incumbent: parent,
+            family: false,
         };
         let mut cached = Selection {
             descriptor: descriptor.clone(),
@@ -942,5 +949,77 @@ mod tests {
         assert_ne!(warm.algorithm, reordered[0]);
         std::fs::remove_dir_all(dir)?;
         Ok(())
+    }
+
+    #[test]
+    fn dense_cache_entries_differ_by_incumbent() -> Result<()> {
+        let parent = LtAlgorithm {
+            id: 21,
+            tile: 15,
+            split_k: 1,
+            reduction: 0,
+            swizzle: 0,
+            custom: 0,
+            stages: 12,
+            inner: 0,
+            cluster: 0,
+        };
+        let alt = LtAlgorithm { id: 5, ..parent };
+        let describe = |incumbent: LtAlgorithm, family: bool| Descriptor {
+            key: CacheKey {
+                device_uuid: "gpu".into(),
+                driver_version: "driver".into(),
+                binary_version: "binary".into(),
+                cublaslt_version: 1,
+            },
+            sm: 89,
+            shape: LinearShape {
+                rows: 2278,
+                input: 5376,
+                output: 28672,
+            },
+            alignment: [256; 4],
+            workspace: 0,
+            ffn_tail: Some(2274),
+            incumbent,
+            family,
+        };
+        let entry = |descriptor: Descriptor| {
+            let incumbent = descriptor.incumbent;
+            Selection {
+                descriptor,
+                incumbent,
+                algorithm: alt,
+                required_workspace: 0,
+                medians_ms: vec![(incumbent, 100.0), (alt, 97.0)],
+                challenger_margin: Some(0.03),
+                fill_seconds: 1.0,
+            }
+        };
+        let family = describe(parent, true);
+        let other = describe(LtAlgorithm { id: 6, ..parent }, true);
+        let ordinary = describe(parent, false);
+        let dir =
+            std::env::temp_dir().join(format!("ff-dense-lt-incumbent-{}", std::process::id()));
+        std::fs::create_dir(&dir)?;
+        let result = (|| -> Result<()> {
+            let (_first, filled) = family.selection(&dir, || Ok(entry(family.clone())))?;
+            assert!(filled);
+            let (_second, filled) = other.selection(&dir, || Ok(entry(other.clone())))?;
+            assert!(filled);
+            let (_third, filled) = ordinary.selection(&dir, || Ok(entry(ordinary.clone())))?;
+            assert!(filled);
+            let files = std::fs::read_dir(&dir)?
+                .filter(|entry| {
+                    entry.as_ref().is_ok_and(|found| {
+                        found.path().extension().is_some_and(|ext| ext == "json")
+                    })
+                })
+                .count();
+            assert_eq!(files, 3);
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir)?;
+        result
     }
 }
