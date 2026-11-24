@@ -3883,19 +3883,26 @@ mod device {
                     actual == [bf16::from_f32(1.6484375)],
                     "SiLU control two-round value"
                 );
+                let (sep_rot, sep_p_codes, sep_p_scales) =
+                    launch_fwht_probe(&device, gap, (rows, k, group), false, 0)?;
+                ensure!(
+                    count_i8(&separate.codes[..rows * k], &sep_p_codes) == 0
+                        && count_f32(&separate.scales[..rows], &sep_p_scales) == 0,
+                    "SiLU control probe diverged from production"
+                );
                 stream.memcpy_htod(
                     &[bf16::from_f32(1.65625)],
                     &mut gated.slice_mut(control..control + 1),
                 )?;
-                let mutant = run(gap, false, plan_plain)?;
-                let differing = count_i8(&separate.codes, &mutant.codes);
+                let (mut_rot, _, _) = launch_fwht_probe(&device, gap, (rows, k, group), false, 0)?;
+                let differing = count_f32(&sep_rot, &mut_rot);
                 let target = control..control + group;
-                let inside = count_i8(&separate.codes[target.clone()], &mutant.codes[target]);
+                let inside = count_f32(&sep_rot[target.clone()], &mut_rot[target]);
                 println!(
                     "CONVROT_SILU_ROUND_CONTROL rows={rows} differ={differing} inside={inside}"
                 );
                 ensure!(
-                    differing > 0 && differing == inside,
+                    differing == group && inside == group,
                     "one-round SiLU control escaped selected group"
                 );
             }
