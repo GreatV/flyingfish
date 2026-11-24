@@ -1302,6 +1302,7 @@ fn ffn_projection_family(base_family: bool, index: usize) -> bool {
     index >= 2 || base_family
 }
 
+#[cfg(any(test, feature = "cuda"))]
 fn qualification_plan_family(base_family: bool, ff_in: bool) -> bool {
     ff_in && base_family
 }
