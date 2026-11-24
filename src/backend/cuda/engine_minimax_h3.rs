@@ -5610,12 +5610,9 @@ fn bind_video_ffn(
             let width = spec.heads * spec.head_dim;
             work.plan_rotation(d, spec)?;
             work.qkv_product = crate::convrot::n_fast_product(d, work.rows, (h, width))?;
-            if d.info.arch == crate::backend::setup::DeviceArchitecture::Cuda(120) {
-                work.product[OUT][0] = crate::convrot::n_fast_product(d, work.rows, (width, h))?;
-                for (i, rows) in [work.chunk, work.rows % work.chunk].into_iter().enumerate() {
-                    work.product[FF_OUT][i] =
-                        crate::convrot::n_fast_product(d, rows, (spec.ffn, h))?;
-                }
+            work.product[OUT][0] = crate::convrot::n_fast_product(d, work.rows, (width, h))?;
+            for (i, rows) in [work.chunk, work.rows % work.chunk].into_iter().enumerate() {
+                work.product[FF_OUT][i] = crate::convrot::n_fast_product(d, rows, (spec.ffn, h))?;
             }
             if crate::backend::diagnostics_enabled() {
                 eprintln!(

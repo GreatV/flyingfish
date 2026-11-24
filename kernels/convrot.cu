@@ -1248,13 +1248,320 @@ extern "C" __global__ void __maxnreg__(124) convrot_product_m_fast_one_barrier(
     if (m_tile * CONVROT_BM >= static_cast<unsigned>(rows)) return;
     convrot_product_tile<true, true, true>(codes, scales, qweight, wscale, y, rows, k, n, m_tile, blockIdx.y);
 }
+#endif
 
 extern "C" __global__ void __maxnreg__(124) convrot_product_n_fast_swizzled(
     const int8_t* codes, const float* scales, const int8_t* qweight, const float* wscale,
     __nv_bfloat16* y, int rows, int k, int n) {
     convrot_product_tile<true, true>(codes, scales, qweight, wscale, y, rows, k, n, blockIdx.y, blockIdx.x);
 }
-#endif
+
+static_assert(CONVROT_STAGE<true> * 3 == 73728 && CONVROT_STAGE<true> * 4 == 98304, "convrot pipelined smem");
+
+__device__ __forceinline__ void convrot_cp16_u(unsigned smem_dst, const void* src, int sz) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_dst), "l"(src), "r"(sz));
+}
+
+__device__ __forceinline__ void convrot_ldsm_x4_u(unsigned (&r)[4], unsigned smem_addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(smem_addr));
+}
+
+__device__ __forceinline__ void convrot_tile_origin(int& m0, int& n0) {
+    const int m_tiles = static_cast<int>(gridDim.y);
+    const int n_tiles = static_cast<int>(gridDim.x);
+    constexpr int GROUP_M = 8;
+    const int m_group_id = static_cast<int>(blockIdx.y) / GROUP_M;
+    const int m_group_start = m_group_id * GROUP_M;
+    const int group_h = min(GROUP_M, m_tiles - m_group_start);
+    const int local_id = (static_cast<int>(blockIdx.y) - m_group_start) * n_tiles + static_cast<int>(blockIdx.x);
+    const int m_tile = m_group_start + (local_id % group_h);
+    const int raw_n = local_id / group_h;
+    const int n_tile = (m_group_id & 1) ? (n_tiles - 1 - raw_n) : raw_n;
+    m0 = m_tile * CONVROT_BM;
+    n0 = n_tile * CONVROT_BN;
+}
+
+template <bool VEC32>
+__device__ __forceinline__ void convrot_store_row_pair(__nv_bfloat16* __restrict__ y, int rows, int n, int r, int c0,
+                                                       int a0, int a1, float sx, float sw0, float sw1) {
+    if constexpr (VEC32) {
+        if (r < rows && c0 < n) {
+            const float v0 = __fmul_rn(__fmul_rn(static_cast<float>(a0), sx), sw0);
+            const float v1 = __fmul_rn(__fmul_rn(static_cast<float>(a1), sx), sw1);
+            *reinterpret_cast<__nv_bfloat162*>(y + static_cast<long long>(r) * n + c0) = __floats2bfloat162_rn(v0, v1);
+        }
+    } else {
+        convrot_store_one(y, rows, n, r, c0, a0, sx, sw0);
+        convrot_store_one(y, rows, n, r, c0 + 1, a1, sx, sw1);
+    }
+}
+
+template <bool VEC32>
+__device__ __forceinline__ void convrot_store_epilogue(__nv_bfloat16* __restrict__ y, const int (&acc)[2][8][4],
+                                                       const float (&sx)[2][2], const float (&sw)[8][2], int rows,
+                                                       int n, int m0, int n0, int warp_m, int warp_n, int group,
+                                                       int t2) {
+#pragma unroll
+    for (int mi = 0; mi < 2; ++mi) {
+#pragma unroll
+        for (int ni = 0; ni < 8; ++ni) {
+            const int r0 = m0 + warp_m * 32 + mi * 16 + group;
+            const int c0 = n0 + warp_n * 64 + ni * 8 + t2;
+            convrot_store_row_pair<VEC32>(y, rows, n, r0, c0, acc[mi][ni][0], acc[mi][ni][1], sx[mi][0], sw[ni][0],
+                                          sw[ni][1]);
+            convrot_store_row_pair<VEC32>(y, rows, n, r0 + 8, c0, acc[mi][ni][2], acc[mi][ni][3], sx[mi][1], sw[ni][0],
+                                          sw[ni][1]);
+        }
+    }
+}
+
+template <int STAGES>
+__device__ __forceinline__ void convrot_product_tile_pipelined(
+    const int8_t* __restrict__ codes, const float* __restrict__ scales,
+    const int8_t* __restrict__ qweight, const float* __restrict__ wscale,
+    __nv_bfloat16* __restrict__ y, int rows, int k, int n) {
+    static_assert(STAGES >= 3, "convrot pipelined stages");
+    if (rows <= 0 || n <= 0 || k <= 0 || (k & (CONVROT_BK - 1))) __trap();
+    extern __shared__ __align__(16) int8_t smem[];
+    constexpr int STAGE_BYTES = CONVROT_STAGE<true>;
+    constexpr int TOTAL_BYTES = STAGES * STAGE_BYTES;
+
+    const int t = static_cast<int>(threadIdx.x);
+    const int lane = t & 31;
+    const int warp = t >> 5;
+    const int warp_m = warp >> 2;
+    const int warp_n = warp & 3;
+    const int group = lane >> 2;
+    const int t2 = (lane & 3) << 1;
+
+    int acc[2][8][4];
+#pragma unroll
+    for (int mi = 0; mi < 2; ++mi) {
+#pragma unroll
+        for (int ni = 0; ni < 8; ++ni) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[mi][ni][e] = 0;
+        }
+    }
+
+    int init_m0 = 0;
+    int init_n0 = 0;
+    convrot_tile_origin(init_m0, init_n0);
+
+    const int ar = t >> 2;
+    const int aseg = (t & 3) * 16;
+    const bool a_live = (init_m0 + ar) < rows;
+    const int asz = a_live ? 16 : 0;
+    const int8_t* a_g = a_live ? (codes + (static_cast<long long>(init_m0 + ar) * k + aseg)) : codes;
+    const int a_step = asz << 2;
+
+    const int bc0 = t >> 2;
+    const int bseg0 = (t & 3) * 16;
+    const bool b0_live = (init_n0 + bc0) < n;
+    const int b0sz = b0_live ? 16 : 0;
+    const int8_t* b0_g = b0_live ? (qweight + (static_cast<long long>(init_n0 + bc0) * k + bseg0)) : qweight;
+    const int b0_step = b0sz << 2;
+
+    const int linear1 = t + 512;
+    const int bc1 = linear1 >> 2;
+    const int bseg1 = (linear1 & 3) * 16;
+    const bool b1_live = (init_n0 + bc1) < n;
+    const int b1sz = b1_live ? 16 : 0;
+    const int8_t* b1_g = b1_live ? (qweight + (static_cast<long long>(init_n0 + bc1) * k + bseg1)) : qweight;
+    const int b1_step = b1sz << 2;
+
+    const unsigned smem_base = convrot_smem(smem);
+    const unsigned aw = smem_base + convrot_segment_offset<true>(ar, aseg);
+    const unsigned b0w = smem_base + CONVROT_BM * CONVROT_BK + convrot_segment_offset<true>(bc0, bseg0);
+
+    const int r_ldsm = warp_m * 32 + (lane & 15);
+    const int ka_ldsm = (lane >> 4) * 16;
+    const int ra_off0 = convrot_segment_offset<true>(r_ldsm, ka_ldsm);
+
+    const int c_ldsm = warp_n * 64 + (lane & 7) + (lane >> 4) * 8;
+    const int kb_ldsm = ((lane >> 3) & 1) * 16;
+    const int rb_off0 = CONVROT_BM * CONVROT_BK + convrot_segment_offset<true>(c_ldsm, kb_ldsm);
+
+    const int tiles = k >> 6;
+    unsigned w_off = 0;
+#pragma unroll
+    for (int p = 0; p < STAGES - 1; ++p) {
+        if (p < tiles) {
+            convrot_cp16_u(aw + w_off, a_g, asz);
+            convrot_cp16_u(b0w + w_off, b0_g, b0sz);
+            convrot_cp16_u(b0w + 8192 + w_off, b1_g, b1sz);
+            a_g += a_step;
+            b0_g += b0_step;
+            b1_g += b1_step;
+        }
+        convrot_cp_commit();
+        w_off += STAGE_BYTES;
+    }
+    convrot_cp_wait<STAGES - 2>();
+    __syncthreads();
+
+    int issue_rem = tiles - (STAGES - 1);
+    unsigned r_off = 0;
+#pragma unroll 1
+    for (int kt = 0; kt < tiles; ++kt) {
+        const unsigned a_rd0 = r_off + ra_off0;
+        const unsigned a_rd1 = r_off + (ra_off0 ^ 32);
+        const unsigned b_rd0 = r_off + rb_off0;
+        const unsigned b_rd1 = r_off + (rb_off0 ^ 32);
+        const bool do_issue = issue_rem > 0;
+
+        unsigned af[2][2][4];
+        unsigned bf[8][2];
+
+        convrot_ldsm_x4_u(af[0][0], a_rd0);
+        convrot_ldsm_x4_u(af[0][1], a_rd0 + 1024);
+        {
+            unsigned pair[4];
+            convrot_ldsm_x4_u(pair, b_rd0);
+            bf[0][0] = pair[0]; bf[0][1] = pair[1]; bf[1][0] = pair[2]; bf[1][1] = pair[3];
+            convrot_ldsm_x4_u(pair, b_rd0 + 1024);
+            bf[2][0] = pair[0]; bf[2][1] = pair[1]; bf[3][0] = pair[2]; bf[3][1] = pair[3];
+            convrot_ldsm_x4_u(pair, b_rd0 + 2048);
+            bf[4][0] = pair[0]; bf[4][1] = pair[1]; bf[5][0] = pair[2]; bf[5][1] = pair[3];
+            convrot_ldsm_x4_u(pair, b_rd0 + 3072);
+            bf[6][0] = pair[0]; bf[6][1] = pair[1]; bf[7][0] = pair[2]; bf[7][1] = pair[3];
+        }
+
+#pragma unroll
+        for (int ni = 0; ni < 2; ++ni) {
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi) {
+                convrot_mma_s8(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
+                               af[0][mi][0], af[0][mi][1], af[0][mi][2], af[0][mi][3], bf[ni][0], bf[ni][1]);
+            }
+        }
+        if (do_issue) {
+            convrot_cp16_u(aw + w_off, a_g, asz);
+            convrot_cp16_u(b0w + w_off, b0_g, b0sz);
+            convrot_cp16_u(b0w + 8192 + w_off, b1_g, b1sz);
+            a_g += a_step;
+            b0_g += b0_step;
+            b1_g += b1_step;
+        }
+        convrot_ldsm_x4_u(af[1][0], a_rd1);
+
+#pragma unroll
+        for (int ni = 2; ni < 4; ++ni) {
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi) {
+                convrot_mma_s8(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
+                               af[0][mi][0], af[0][mi][1], af[0][mi][2], af[0][mi][3], bf[ni][0], bf[ni][1]);
+            }
+        }
+        convrot_ldsm_x4_u(af[1][1], a_rd1 + 1024);
+        {
+            unsigned pair[4];
+            convrot_ldsm_x4_u(pair, b_rd1);
+            bf[0][0] = pair[0]; bf[0][1] = pair[1]; bf[1][0] = pair[2]; bf[1][1] = pair[3];
+        }
+
+#pragma unroll
+        for (int ni = 4; ni < 6; ++ni) {
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi) {
+                convrot_mma_s8(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
+                               af[0][mi][0], af[0][mi][1], af[0][mi][2], af[0][mi][3], bf[ni][0], bf[ni][1]);
+            }
+        }
+        {
+            unsigned pair[4];
+            convrot_ldsm_x4_u(pair, b_rd1 + 1024);
+            bf[2][0] = pair[0]; bf[2][1] = pair[1]; bf[3][0] = pair[2]; bf[3][1] = pair[3];
+        }
+
+#pragma unroll
+        for (int ni = 6; ni < 8; ++ni) {
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi) {
+                convrot_mma_s8(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
+                               af[0][mi][0], af[0][mi][1], af[0][mi][2], af[0][mi][3], bf[ni][0], bf[ni][1]);
+            }
+        }
+        {
+            unsigned pair[4];
+            convrot_ldsm_x4_u(pair, b_rd1 + 2048);
+            bf[4][0] = pair[0]; bf[4][1] = pair[1]; bf[5][0] = pair[2]; bf[5][1] = pair[3];
+        }
+
+#pragma unroll
+        for (int ni = 0; ni < 2; ++ni) {
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi) {
+                convrot_mma_s8(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
+                               af[1][mi][0], af[1][mi][1], af[1][mi][2], af[1][mi][3], bf[ni][0], bf[ni][1]);
+            }
+        }
+        {
+            unsigned pair[4];
+            convrot_ldsm_x4_u(pair, b_rd1 + 3072);
+            bf[6][0] = pair[0]; bf[6][1] = pair[1]; bf[7][0] = pair[2]; bf[7][1] = pair[3];
+        }
+
+#pragma unroll
+        for (int ni = 2; ni < 8; ++ni) {
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi) {
+                convrot_mma_s8(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
+                               af[1][mi][0], af[1][mi][1], af[1][mi][2], af[1][mi][3], bf[ni][0], bf[ni][1]);
+            }
+        }
+
+        if (kt + 1 < tiles) {
+            convrot_cp_commit();
+            convrot_cp_wait<STAGES - 2>();
+            __syncthreads();
+            --issue_rem;
+            r_off += STAGE_BYTES;
+            if (r_off == TOTAL_BYTES) r_off = 0;
+            w_off += STAGE_BYTES;
+            if (w_off == TOTAL_BYTES) w_off = 0;
+        }
+    }
+    convrot_cp_wait<0>();
+
+    int m0 = 0;
+    int n0 = 0;
+    convrot_tile_origin(m0, n0);
+
+    float sx[2][2];
+    float sw[8][2];
+#pragma unroll
+    for (int mi = 0; mi < 2; ++mi) {
+        const int r0 = m0 + warp_m * 32 + mi * 16 + group;
+        sx[mi][0] = convrot_ldg_f32(scales + r0, r0 < rows);
+        sx[mi][1] = convrot_ldg_f32(scales + (r0 + 8), (r0 + 8) < rows);
+    }
+#pragma unroll
+    for (int ni = 0; ni < 8; ++ni) {
+        const int c0 = n0 + warp_n * 64 + ni * 8 + t2;
+        sw[ni][0] = convrot_ldg_f32(wscale + c0, c0 < n);
+        sw[ni][1] = convrot_ldg_f32(wscale + (c0 + 1), (c0 + 1) < n);
+    }
+    if ((n & 1) == 0 && (reinterpret_cast<unsigned long long>(y) & 3ULL) == 0ULL) {
+        convrot_store_epilogue<true>(y, acc, sx, sw, rows, n, m0, n0, warp_m, warp_n, group, t2);
+    } else {
+        convrot_store_epilogue<false>(y, acc, sx, sw, rows, n, m0, n0, warp_m, warp_n, group, t2);
+    }
+}
+
+extern "C" __global__ void __maxnreg__(124) convrot_product_n_fast_swizzled_s3(
+    const int8_t* codes, const float* scales, const int8_t* qweight, const float* wscale,
+    __nv_bfloat16* y, int rows, int k, int n) {
+    convrot_product_tile_pipelined<3>(codes, scales, qweight, wscale, y, rows, k, n);
+}
+
+extern "C" __global__ void __maxnreg__(124) convrot_product_n_fast_swizzled_s4(
+    const int8_t* codes, const float* scales, const int8_t* qweight, const float* wscale,
+    __nv_bfloat16* y, int rows, int k, int n) {
+    convrot_product_tile_pipelined<4>(codes, scales, qweight, wscale, y, rows, k, n);
+}
 #else
 // gfx11 wave32 v_wmma_i32_16x16x16_iu8. BK=64, 2 swizzled LDS stages.
 // 128x128x64: 256 threads, 32768 B LDS (2 WGs/WGP). 128x256x64: 512 threads, 49152 B LDS (1 WG/WGP).
