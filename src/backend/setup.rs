@@ -67,6 +67,8 @@ pub(crate) const IMAGE_D128_SINGLE_PV: &str = "attention_prefill_d128_bidirectio
 pub(crate) const CONDITIONER_D128: &str = "attention_prefill_d128";
 #[cfg(any(test, feature = "cuda", feature = "rocm"))]
 pub(crate) const VAE_D64_WINDOWS: &str = "attention_prefill_d64_bidirectional_windows";
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) const VAE_D64_SINGLE_PV: &str = "attention_prefill_d64_bidirectional_windows_single_pv";
 
 #[cfg(any(test, feature = "cuda", feature = "rocm"))]
 pub(crate) const DECODER_F32_NARROW_FP16: &str = "vision_downcast_f32_to_f16_checked";
@@ -107,6 +109,14 @@ impl DeviceArchitecture {
     pub(crate) fn published_f32_lt(&self) -> LtOperand {
         match self {
             Self::Cuda(_) | Self::Hip(_) => LtOperand::F32,
+        }
+    }
+
+    #[cfg(any(test, feature = "cuda"))]
+    pub(crate) fn vae_d64_window_symbol(&self, video: bool) -> &'static str {
+        match self {
+            Self::Cuda(sm) if video && *sm >= 80 => VAE_D64_SINGLE_PV,
+            _ => VAE_D64_WINDOWS,
         }
     }
 
@@ -552,6 +562,14 @@ mod long_tests {
             VAE_D64_WINDOWS,
             "attention_prefill_d64_bidirectional_windows"
         );
+
+        for sm in [80, 86, 89, 90, 120] {
+            let arch = DeviceArchitecture::Cuda(sm);
+            assert_eq!(arch.vae_d64_window_symbol(true), VAE_D64_SINGLE_PV);
+            assert_eq!(arch.vae_d64_window_symbol(false), VAE_D64_WINDOWS);
+        }
+        assert_eq!(info75.arch.vae_d64_window_symbol(true), VAE_D64_WINDOWS);
+        assert_eq!(hip.arch.vae_d64_window_symbol(true), VAE_D64_WINDOWS);
 
         let narrow = "decoder.mid_block.resnets.0.conv1.weight";
         let raw = "decoder.transformer_blocks.0.norm1.weight";

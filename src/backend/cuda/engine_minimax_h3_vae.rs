@@ -2766,7 +2766,7 @@ impl TileWork {
             let offsets = (0..=active)
                 .map(|tile| u32::try_from(tile * tokens))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            flash.bind_bf16_windows(&offsets)?;
+            flash.bind_bf16_windows(&offsets, axes == 3)?;
             attention.push((active, flash));
         }
         let work = Self {

@@ -698,40 +698,48 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d16_bidirectional_f16_window
     }
 }
 
-/// # Safety
-/// Offsets delimit disjoint BF16 D64 windows; grid X covers the longest window, Z equals their count.
-#[unsafe(no_mangle)]
-pub unsafe extern "ptx-kernel" fn attention_prefill_d64_bidirectional_windows(
-    mut p: Attention,
-    keys: u32,
-    scale: f32,
-    offsets: *const u32,
-    windows: u32,
-) {
-    unsafe {
-        let window: u32;
-        asm!("mov.u32 {w}, %ctaid.z;", w=out(reg32) window);
-        assert!(!offsets.is_null() && window < windows && keys == p.rows);
-        let first = *offsets.add(window as usize);
-        let end = *offsets.add(window as usize + 1);
-        assert!(first < end && end <= p.rows);
-        window_attention!(p, first, end, 64);
-        let tile: u32;
-        asm!("mov.u32 {b}, %ctaid.x;", b=out(reg32) tile);
-        if tile * 64 >= p.rows {
-            return;
+macro_rules! d64_window_kernel {
+    ($name:ident, $residual:literal) => {
+        /// # Safety
+        /// Offsets delimit disjoint BF16 D64 windows; grid X covers the longest window, Z equals their count.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "ptx-kernel" fn $name(
+            mut p: Attention,
+            keys: u32,
+            scale: f32,
+            offsets: *const u32,
+            windows: u32,
+        ) {
+            unsafe {
+                let window: u32;
+                asm!("mov.u32 {w}, %ctaid.z;", w=out(reg32) window);
+                assert!(!offsets.is_null() && window < windows && keys == p.rows);
+                let first = *offsets.add(window as usize);
+                let end = *offsets.add(window as usize + 1);
+                assert!(first < end && end <= p.rows);
+                window_attention!(p, first, end, 64);
+                let tile: u32;
+                asm!("mov.u32 {b}, %ctaid.x;", b=out(reg32) tile);
+                if tile * 64 >= p.rows {
+                    return;
+                }
+                attention::<64, 8, 1, 64, SM75_F16, $residual, false>(
+                    p,
+                    p.rows,
+                    0,
+                    0,
+                    scale,
+                    core::ptr::null(),
+                    0,
+                );
+            }
         }
-        attention::<64, 8, 1, 64, SM75_F16, true, false>(
-            p,
-            p.rows,
-            0,
-            0,
-            scale,
-            core::ptr::null(),
-            0,
-        );
-    }
+    };
 }
+
+d64_window_kernel!(attention_prefill_d64_bidirectional_windows, true);
+#[cfg(not(ff_sm75))]
+d64_window_kernel!(attention_prefill_d64_bidirectional_windows_single_pv, false);
 
 /// # Safety
 /// Heads have 96 F16 columns; launch uses 128 threads and 36864 shared bytes.
