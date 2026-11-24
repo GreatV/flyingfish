@@ -542,7 +542,7 @@ pub struct Blas {
     invariant_rows: usize,
     plans: LinearPlans,
     #[cfg(test)]
-    dense_parents: RefCell<BTreeMap<LinearShape, Plan>>,
+    dense_parents: RefCell<BTreeMap<(LinearShape, bool), Plan>>,
     pitched_b: RefCell<BTreeMap<(usize, usize, usize, usize), Plan>>,
     row_families: RefCell<BTreeMap<(usize, usize), (sys::cublasLtMatmulAlgo_t, usize)>>,
     biased_plans: RefCell<BTreeMap<(LinearShape, u64, super::linear::LinearBiasMode), Plan>>,
@@ -1358,9 +1358,23 @@ impl Blas {
                 PlanAlgo::Fixed(algo),
             )?;
             self.bind_workspace(plan.workspace)?;
-            self.plans
-                .borrow_mut()
-                .insert((rows, plan_output, plan_input, 0, true), plan);
+            let key = (rows, plan_output, plan_input, 0, true);
+            if let Some(previous) = self.plans.borrow_mut().insert(key, plan) {
+                #[cfg(test)]
+                self.dense_parents.borrow_mut().insert(
+                    (
+                        LinearShape {
+                            rows,
+                            output: plan_output,
+                            input: plan_input,
+                        },
+                        true,
+                    ),
+                    previous,
+                );
+                #[cfg(not(test))]
+                drop(previous);
+            }
         }
         let limit = self.workspace.borrow().len();
         self.row_families

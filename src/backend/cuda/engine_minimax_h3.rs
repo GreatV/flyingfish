@@ -1298,6 +1298,10 @@ fn ffn_chunk(rows: usize) -> usize {
     rows.div_ceil(rows.div_ceil(FFN_CHUNK_ROWS))
 }
 
+fn ffn_projection_family(base_family: bool, index: usize) -> bool {
+    index >= 2 || base_family
+}
+
 #[derive(Clone, Copy, Debug)]
 struct FfnPlan {
     chunk: usize,
@@ -2466,6 +2470,10 @@ impl BlockWork {
             tensor_cost: 0.0,
             launches: 0,
         };
+        #[cfg(feature = "cuda")]
+        let base_family = blas.bf16_row_family();
+        #[cfg(not(feature = "cuda"))]
+        let base_family = false;
         for (rows, count) in [(chunk, self.rows / chunk), (self.rows % chunk, 1)] {
             if rows == 0 || count == 0 {
                 continue;
@@ -2481,25 +2489,16 @@ impl BlockWork {
             ];
             let counted = if LORA { shapes.len() } else { 2 };
             for (index, &(output, input)) in shapes[..counted].iter().enumerate() {
-                let (wave_cost, reduction) = blas.fixed_plan_cost(
-                    crate::backend::setup::LinearShape {
-                        rows,
-                        output,
-                        input,
-                    },
-                    describe,
-                    index >= 2,
-                )?;
+                let family = ffn_projection_family(base_family, index);
+                let shape = crate::backend::setup::LinearShape {
+                    rows,
+                    output,
+                    input,
+                };
+                let (wave_cost, reduction) = blas.fixed_plan_cost(shape, describe, family)?;
                 plan.tensor_cost +=
                     2.0 * rows as f64 * output as f64 * input as f64 * count as f64 * wave_cost;
-                plan.workspace = plan.workspace.max(blas.fixed_workspace(
-                    crate::backend::setup::LinearShape {
-                        rows,
-                        output,
-                        input,
-                    },
-                    index >= 2,
-                )?);
+                plan.workspace = plan.workspace.max(blas.fixed_workspace(shape, family)?);
                 launches += 1 + reduction;
             }
             plan.launches += count * launches;
@@ -8476,6 +8475,22 @@ mod tests {
         }
         assert!(FfnPlan::alias_capacity((usize::MAX, usize::MAX), usize::MAX).is_err());
         assert!(FfnPlan::alias_capacity((1, 1), 0).is_err());
+        let family_ws = 8_192usize;
+        let row_ws = 1_024usize;
+        let priced = |base_family, index| {
+            if ffn_projection_family(base_family, index) {
+                family_ws
+            } else {
+                row_ws
+            }
+        };
+        assert_eq!([priced(true, 0), priced(true, 1)], [family_ws, family_ws]);
+        assert_eq!([priced(false, 0), priced(false, 1)], [row_ws, row_ws]);
+        assert_eq!(priced(false, 2), family_ws);
+        let old = |index| {
+            if index >= 2 { family_ws } else { row_ws }
+        };
+        assert!(priced(true, 0) > old(0) && priced(true, 1) > old(1));
         assert!(
             FfnPlan::select(
                 &[FfnPlan {

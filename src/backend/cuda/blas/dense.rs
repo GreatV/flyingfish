@@ -799,7 +799,9 @@ impl Blas {
         let (family_output, family_input) = (shape.output, shape.input);
         let original = std::mem::replace(plan, bound);
         #[cfg(test)]
-        self.dense_parents.borrow_mut().insert(shape, original);
+        self.dense_parents
+            .borrow_mut()
+            .insert((shape, false), original);
         #[cfg(not(test))]
         drop(original);
         drop(plans);
@@ -810,23 +812,57 @@ impl Blas {
     }
 
     #[cfg(test)]
-    pub(crate) fn swap_dense_parents(&self) -> Result<usize> {
-        self.stream.synchronize()?;
-        let mut parents = self.dense_parents.borrow_mut();
-        let mut plans = self.plans.borrow_mut();
-        for (s, old) in parents.iter_mut() {
+    fn exchange_dense_parents<T>(
+        parents: &mut std::collections::BTreeMap<(LinearShape, bool), T>,
+        plans: &mut std::collections::BTreeMap<(usize, usize, usize, u32, bool), T>,
+    ) -> Result<usize> {
+        for ((shape, family), old) in parents.iter_mut() {
             let current = plans
-                .get_mut(&(s.rows, s.output, s.input, 0, false))
+                .get_mut(&(shape.rows, shape.output, shape.input, 0, *family))
                 .context("dense test binding missing")?;
             std::mem::swap(current, old);
         }
         Ok(parents.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn swap_dense_parents(&self) -> Result<usize> {
+        self.stream.synchronize()?;
+        Self::exchange_dense_parents(
+            &mut self.dense_parents.borrow_mut(),
+            &mut self.plans.borrow_mut(),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swap_restores_the_pre_qualification_family_plan() -> Result<()> {
+        let shape = LinearShape {
+            rows: 1024,
+            output: 28_672,
+            input: 5_376,
+        };
+        let key = |family| (shape.rows, shape.output, shape.input, 0, family);
+        let qualified = 21u8;
+        let previous = 6u8;
+        let mut plans =
+            std::collections::BTreeMap::from([(key(false), qualified), (key(true), qualified)]);
+        let mut parents = std::collections::BTreeMap::from([
+            ((shape, false), previous),
+            ((shape, true), previous),
+        ]);
+        let bound = Blas::exchange_dense_parents(&mut parents, &mut plans)?;
+        assert_eq!(bound, 2);
+        assert_eq!(plans[&key(true)], previous);
+        assert_eq!(plans[&key(false)], previous);
+        Blas::exchange_dense_parents(&mut parents, &mut plans)?;
+        assert_eq!(plans[&key(true)], qualified);
+        Ok(())
+    }
 
     #[test]
     fn dense_cache_rejects_an_unmeasured_or_noise_level_switch() -> Result<()> {
