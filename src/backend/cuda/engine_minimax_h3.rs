@@ -18,7 +18,7 @@ use crate::backend::gpu::{
     LaunchConfig, PushKernelArg,
 };
 use crate::checkpoint::{MappedCheckpoint, TensorEntry, TensorManifest};
-use crate::convrot::ProductKernel;
+use crate::convrot::{ProductKernel, RotatePlan};
 use crate::experts::disk::{AlignedBytes, SpanReader};
 use crate::gguf::GgmlType;
 use crate::minimax_h3::{
@@ -2257,7 +2257,8 @@ pub(crate) struct BlockWork {
     chunk: usize,
     fixed_lora: bool,
     product: [[ProductKernel; 2]; FF_OUT + 1],
-    rotate_32: [[bool; 2]; FF_OUT + 1],
+    rotate: [Option<RotatePlan>; FF_OUT + 1],
+    rotate_fused_down: Option<RotatePlan>,
     qkv_product: ProductKernel,
     #[cfg(test)]
     repeat_ffn_input: bool,
@@ -2296,7 +2297,7 @@ struct WideResidual {
 
 /// Convrot and low-rank scratch for one block forward. `codes` aliases `x`; `convrot` is absent when `k == 0`.
 struct StoredScratch {
-    convrot: Option<(CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>)>,
+    convrot: Option<(CudaSlice<f32>, CudaSlice<f32>)>,
     mid: CudaSlice<bf16>,
     k: usize,
     rank: usize,
@@ -2306,7 +2307,6 @@ struct StoredScratch {
 #[derive(Clone, Copy)]
 struct StoredPtrs {
     x: u64,
-    rotated: u64,
     codes: u64,
     scales: u64,
     mid: u64,
@@ -2315,28 +2315,26 @@ struct StoredPtrs {
     rank: usize,
     product: ProductKernel,
     mid_pitch: usize,
-    rotate_32: bool,
+    rotate: Option<RotatePlan>,
 }
 
 impl BlockWork {
     fn plan_rotation(&mut self, device: &Device, spec: &H3Spec) -> Result<()> {
-        use crate::convrot::{group_dot_32_fills_wave, group_dot_32_wave_sizes};
-        if !matches!(spec.int8_convrot.as_ref(), Some((256, _))) {
+        let Some((group, _)) = spec.int8_convrot.as_ref() else {
             return Ok(());
-        }
-        let [ordinary, fused] = group_dot_32_wave_sizes(device)?;
+        };
+        let group = usize::try_from(*group)?;
         let h = spec.hidden;
         let width = spec.heads * spec.head_dim;
-        if (h, width) == (5376, 7168) {
-            self.rotate_32[..OUT].fill([group_dot_32_fills_wave(self.rows, h, ordinary); 2]);
-            self.rotate_32[OUT] = [group_dot_32_fills_wave(self.rows, width, ordinary); 2];
-        }
-        if (h, spec.ffn) == (5376, 14336) {
-            let chunks = [self.chunk, self.rows % self.chunk];
-            self.rotate_32[FF_IN] = chunks.map(|rows| group_dot_32_fills_wave(rows, h, ordinary));
-            self.rotate_32[FF_OUT] =
-                chunks.map(|rows| group_dot_32_fills_wave(rows, spec.ffn, fused));
-        }
+        let plan_h = crate::convrot::derive_rotate_plan(device, h, group, false)?;
+        let plan_w = crate::convrot::derive_rotate_plan(device, width, group, false)?;
+        let plan_f_plain = crate::convrot::derive_rotate_plan(device, spec.ffn, group, false)?;
+        let plan_f_silu = crate::convrot::derive_rotate_plan(device, spec.ffn, group, true)?;
+        self.rotate[..OUT].fill(Some(plan_h));
+        self.rotate[OUT] = Some(plan_w);
+        self.rotate[FF_IN] = Some(plan_h);
+        self.rotate[FF_OUT] = Some(plan_f_plain);
+        self.rotate_fused_down = Some(plan_f_silu);
         Ok(())
     }
 
@@ -2709,11 +2707,7 @@ impl BlockWork {
         let stored = if let Some((k, low_rank)) = crate::minimax_h3::stored_scratch_extents(spec)? {
             let pitch = crate::minimax_h3::stored_low_rank_pitch(low_rank);
             let convrot = if k > 0 {
-                Some((
-                    s.alloc_zeros::<f32>(rows * k)?,
-                    s.alloc_zeros::<f32>(rows * k)?,
-                    s.alloc_zeros::<f32>(rows)?,
-                ))
+                Some((s.alloc_zeros::<f32>(rows * k)?, s.alloc_zeros::<f32>(rows)?))
             } else {
                 None
             };
@@ -2739,7 +2733,8 @@ impl BlockWork {
             normed_probe: Vec::new(),
             fixed_lora: false,
             product: [[ProductKernel::NFast; 2]; FF_OUT + 1],
-            rotate_32: [[false; 2]; FF_OUT + 1],
+            rotate: [None; FF_OUT + 1],
+            rotate_fused_down: None,
             qkv_product: ProductKernel::NFast,
             #[cfg(test)]
             repeat_ffn_input: false,
@@ -2861,13 +2856,12 @@ fn lora_pair(
 
 fn stored_ptrs(s: &Arc<CudaStream>, work: &BlockWork) -> Option<StoredPtrs> {
     let scratch = work.stored.as_ref()?;
-    let (x, rotated, scales) = match scratch.convrot.as_ref() {
-        Some((x, rotated, scales)) => (pointer(x, s), pointer(rotated, s), pointer(scales, s)),
-        None => (0, 0, 0),
+    let (x, scales) = match scratch.convrot.as_ref() {
+        Some((x, scales)) => (pointer(x, s), pointer(scales, s)),
+        None => (0, 0),
     };
     Some(StoredPtrs {
         x,
-        rotated,
         codes: x,
         scales,
         mid: pointer(&scratch.mid, s),
@@ -2876,7 +2870,7 @@ fn stored_ptrs(s: &Arc<CudaStream>, work: &BlockWork) -> Option<StoredPtrs> {
         rank: scratch.rank,
         product: ProductKernel::NFast,
         mid_pitch: scratch.mid_pitch,
-        rotate_32: false,
+        rotate: None,
     })
 }
 
@@ -2979,7 +2973,7 @@ fn apply_int8(
         crate::backend::cuda::contracts::no_overlap(&x, &y, "gate/up", "ConvRot output")?;
     }
     let launch = c.kernels.stored_launch(c.s.context())?;
-    // group_dot reads bf16. linear reads the upcast f32.
+    // fwht_quantize reads bf16. linear reads the upcast f32.
     let x_ptr = if rows >= crate::convrot::TENSOR_CORE_ROWS {
         x.ptr
     } else {
@@ -3001,7 +2995,6 @@ fn apply_int8(
             qweight: qweight.ptr,
             wscale: wscale.ptr,
             y: y.ptr,
-            rotated: ptrs.rotated,
             codes: ptrs.codes,
             scales: ptrs.scales,
             rows: i32::try_from(rows)?,
@@ -3010,7 +3003,7 @@ fn apply_int8(
             group: i32::try_from(group)?,
             product: ptrs.product,
             fuse_silu,
-            rotate_32: ptrs.rotate_32,
+            rotate: ptrs.rotate,
         },
     )
 }
@@ -3081,7 +3074,6 @@ fn apply_shared_qkv(
             qweight: 0,
             wscale: 0,
             y: 0,
-            rotated: ptrs.rotated,
             codes: ptrs.codes,
             scales: ptrs.scales,
             rows: rows_i,
@@ -3090,7 +3082,7 @@ fn apply_shared_qkv(
             group,
             product: ProductKernel::NFast,
             fuse_silu: false,
-            rotate_32: work.rotate_32[Q][0],
+            rotate: work.rotate[Q],
         },
     )?;
     for ((qweight, wscale, _), out) in [(q.0, q.1, q.2), (k.0, k.1, k.2), (v.0, v.1, v.2)]
@@ -3106,7 +3098,6 @@ fn apply_shared_qkv(
                 qweight: qweight.ptr,
                 wscale: wscale.ptr,
                 y: y.ptr,
-                rotated: ptrs.rotated,
                 codes: ptrs.codes,
                 scales: ptrs.scales,
                 rows: rows_i,
@@ -3115,7 +3106,7 @@ fn apply_shared_qkv(
                 group,
                 product: work.qkv_product,
                 fuse_silu: false,
-                rotate_32: false,
+                rotate: None,
             },
         )?;
     }
@@ -3394,7 +3385,7 @@ fn block_forward_tail<const LORA: bool>(
     let base = |index: usize, x: Tensor<bf16, 2>, y: Tensor<bf16, 2>| -> Result<()> {
         let scratch = scratch.map(|mut ptrs| {
             ptrs.product = work.product[index][0];
-            ptrs.rotate_32 = work.rotate_32[index][0];
+            ptrs.rotate = work.rotate[index];
             ptrs
         });
         apply_linear(c, &w.linears[index], x, y, scratch)
@@ -3596,7 +3587,8 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
     let (s, h, f, rows) = (c.s, c.spec.hidden, c.spec.ffn, work.rows);
     let chunk = work.chunk;
     let products = &work.product;
-    let rotate_32 = work.rotate_32;
+    let rotate = work.rotate;
+    let rotate_fused_down = work.rotate_fused_down;
     let wide = work.wide_launch;
     let fused_down = if !LORA && !SHIFT_INPUT {
         int8_linear(&w.linears[FF_OUT])
@@ -3613,7 +3605,7 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
         let scratch = scratch.map(|mut ptrs| {
             let tail = usize::from(x.shape[0] as usize != chunk);
             ptrs.product = products[index][tail];
-            ptrs.rotate_32 = index == FF_IN && rotate_32[FF_IN][tail];
+            ptrs.rotate = rotate[index];
             ptrs
         });
         #[cfg(feature = "cuda")]
@@ -3658,7 +3650,7 @@ fn ffn_forward<const SHIFT_INPUT: bool, const LORA: bool>(
             let scratch = scratch.map(|mut ptrs| {
                 let tail = usize::from(n != chunk);
                 ptrs.product = products[FF_OUT][tail];
-                ptrs.rotate_32 = rotate_32[FF_OUT][tail];
+                ptrs.rotate = rotate_fused_down;
                 ptrs
             });
             apply_int8(
@@ -19819,6 +19811,7 @@ mod tests {
         check(&weights.linears[OUT], out_rank)?;
         let rows = 20usize;
         let mut work = BlockWork::new(s, &spec, 0, rows)?;
+        work.plan_rotation(&device, &spec)?;
         work.prepare::<false>(&blas, &spec)?;
         let kernels = BlockKernels::new(&device)?;
         let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?

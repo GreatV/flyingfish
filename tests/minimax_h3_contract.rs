@@ -2123,7 +2123,7 @@ fn hyperflow_stored_placement_prints_124_resident_and_345_streamed() -> Result<(
         } else {
             low_rank.div_ceil(8) * 8
         };
-        Ok(n * u64::try_from(k)? * 8 + n * 4 + n * u64::try_from(pitch)? * 2)
+        Ok(n * u64::try_from(k)? * 4 + n * 4 + n * u64::try_from(pitch)? * 2)
     };
     let video_audio_scratch = per_row(rows)?;
     let scratch = per_row(packed)? + per_row(text_rows)?;
