@@ -497,8 +497,9 @@ impl Drop for FillThread {
 static LIVE_FILL_BOUNCE_BYTES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// The host reserve a dense tier keeps beside its pinned layer copies: per supply worker one
-/// slot and one largest-tensor bounce buffer, and 4 GiB.
+/// The host reserve a dense tier keeps beside its pinned layer copies: per supply worker the
+/// tier spawns (the calibrated count, at most one per streamed layer) one slot and one
+/// largest-tensor bounce buffer, and 4 GiB.
 fn pinned_host_reserve(supply_workers: usize, slot_bytes: usize, largest: usize) -> Result<usize> {
     slot_bytes
         .checked_add(largest)
@@ -4462,7 +4463,7 @@ static DENSE_SUPPLY_WORKERS: std::sync::OnceLock<(usize, f64, usize)> = std::syn
 /// Seeds [`dense_supply_workers`] from the persisted calibration of the drive hosting
 /// `dir`, measuring when no cache holds. Returns the probe bytes, the rate at the picked
 /// count, and the count.
-pub(super) fn seed_dense_supply_workers(
+pub(in crate::backend::cuda) fn seed_dense_supply_workers(
     dir: &Path,
     manifest: &TensorManifest,
     runtime: &Path,
@@ -4549,8 +4550,9 @@ fn disk_read_samples(manifest: &TensorManifest) -> Result<Vec<(&str, &TensorEntr
 
 /// The dense-streaming worker count for the drive hosting `dir`'s text shards: each
 /// candidate's aggregate rate through the fill reader over the same samples, picked by
-/// [`pick_disk_workers`], persisted under `runtime` keyed by the directory's device.
-/// Returns the probe bytes, the rate at the picked count, and the count.
+/// [`pick_disk_workers`]. Under `runtime` the count comes from the calibration persisted
+/// for the directory's device when that file holds one, and is measured and persisted
+/// otherwise. Returns the probe bytes, the rate at the picked count, and the count.
 fn disk_reader_calibration(
     dir: &Path,
     manifest: &TensorManifest,
@@ -4558,6 +4560,10 @@ fn disk_reader_calibration(
 ) -> Result<(usize, f64, usize)> {
     use std::os::unix::fs::MetadataExt;
     let st_dev = std::fs::metadata(dir)?.dev();
+    if let Some(runtime) = runtime {
+        std::fs::create_dir_all(runtime)
+            .with_context(|| format!("create runtime directory {}", runtime.display()))?;
+    }
     let path = runtime.map(|runtime| {
         runtime.join(format!(
             "disk-read-workers-v{DISK_READ_SCHEMA}-{st_dev}.json"
@@ -4729,7 +4735,8 @@ struct PlacedLayers {
 
 /// Device budget and host budget for `layers`, then the `DensePlacement` those budgets produce. `host_available` is
 /// measured only when the layers do not all fit the device budget. Visit count 1 spends no host budget.
-/// `supply_workers` is the disk supply's worker count the host reserve is charged for.
+/// `supply_workers` is the calibrated disk supply worker count; the reserve is charged for the
+/// workers the placement spawns, at most one per streamed layer.
 fn plan_dense_layers(
     (layers, source_layers, largest, owned, media): (&[usize], &[usize], usize, usize, usize),
     placement: Placement,
@@ -4760,7 +4767,8 @@ fn plan_dense_layers(
     )?;
     let (host_budget, host_available) = if probe.slot_bytes > 0 {
         let available = host_available.context("host tier without a measured host budget")?;
-        let reserved = pinned_host_reserve(supply_workers, probe.slot_bytes, largest)?;
+        let spawned = supply_workers.min(probe.slots.iter().flatten().count());
+        let reserved = pinned_host_reserve(spawned, probe.slot_bytes, largest)?;
         ensure!(
             available >= reserved,
             "dense pinned staging and host reserve exceed available RAM: need={reserved} available={available}"
@@ -5206,7 +5214,8 @@ fn low_rank_layer_tail(
 }
 
 /// `(plan, device budget, host budget, available host bytes)` for one charged table.
-/// `supply_workers` is the disk supply's worker count the host reserve is charged for.
+/// `supply_workers` is the calibrated disk supply worker count; the reserve is charged for the
+/// workers the placement spawns, at most one per streamed layer.
 fn stored_compact(
     (placement, visits): (Placement, usize),
     charged_device: &[usize],
@@ -5263,12 +5272,9 @@ fn stored_compact(
         None
     };
     let host_budget = if let Some(available) = host_available {
+        let spawned = supply_workers.min(probe.slots.iter().flatten().count());
         let budget = available
-            .checked_sub(pinned_host_reserve(
-                supply_workers,
-                probe.slot_bytes,
-                largest,
-            )?)
+            .checked_sub(pinned_host_reserve(spawned, probe.slot_bytes, largest)?)
             .context("stored pinned staging and host reserve exceed available RAM")?;
         match placement {
             Placement::Derived => DensePlacement::host_budget_for_visits(budget, visits)?,
@@ -17757,6 +17763,58 @@ mod tests {
     }
 
     #[test]
+    fn one_shot_reserve_spawns_no_more_workers_than_disk_layers() -> Result<()> {
+        use super::{Placement, plan_dense_layers};
+        let gib = 1usize << 30;
+        let layers = [gib; 50];
+        let largest = 256 << 20;
+        // 54 GiB free of 80 GiB is a 49 GiB device budget: 47 layers resident, 3 streamed in
+        // two slots, so three of the eight supply workers are spawned.
+        let (free, total) = (54 * gib, 80 * gib);
+        let place = |host: usize, visits: usize| {
+            plan_dense_layers(
+                (&layers, &layers, largest, 0, 0),
+                Placement::Derived,
+                (free, total, Some(host)),
+                2,
+                8,
+                visits,
+            )
+        };
+        let (plan, facts) = place(10 * gib, 1)?;
+        assert_eq!(
+            (
+                facts.device_budget,
+                plan.resident_bytes,
+                plan.disk_bytes,
+                plan.host_bytes
+            ),
+            (49 * gib, 47 * gib, 3 * gib, 0)
+        );
+        // The reserve is three slots and bounces plus 4 GiB; with two visits what is left of
+        // 10 GiB pins two layers.
+        let reserve = 3 * (gib + largest) + (4 << 30);
+        let (plan, facts) = place(10 * gib, 2)?;
+        assert_eq!(
+            (facts.host_budget, plan.host_bytes, plan.disk_bytes),
+            (10 * gib - reserve, 2 * gib, gib)
+        );
+        let (plan, facts) = place(reserve + gib, 2)?;
+        assert_eq!((facts.host_budget, plan.host_bytes), (gib, gib));
+        let (_, facts) = place(reserve, 2)?;
+        assert_eq!(facts.host_budget, 0);
+        let error = place(reserve - 1, 2)
+            .err()
+            .context("a host below the reserve placed the layers")?
+            .to_string();
+        assert!(
+            error.contains("need=8321499136 available=8321499135"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_H3_IMAGE"]
     fn resident_image_request_two_matches_fresh_and_bounds_allocations() -> Result<()> {
         use crate::minimax_h3::{ImageReference, ImageRequest, ImageRunOptions};
@@ -20665,6 +20723,52 @@ mod h3_direct_batch_tests {
         assert!(pick_disk_workers(&[f64::NAN, 1.0e9, 1.0e9, 1.0e9]).is_err());
         assert_eq!(DISK_READ_WORKERS, [1, 2, 4, 8]);
         Ok(())
+    }
+
+    #[test]
+    fn persisted_disk_calibration_is_read_without_a_probe() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let root = std::env::temp_dir().join(format!("ff-disk-calibration-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("model"))?;
+        let runtime = root.join("runtime");
+        let result = (|| -> Result<()> {
+            let dir = root.join("model");
+            let manifest = TensorManifest {
+                entries: BTreeMap::new(),
+                resident_bytes: 0,
+            };
+            // Without a persisted calibration the probe reads a sample tensor, and the
+            // manifest holds none; the runtime directory is created before that.
+            let absent = disk_reader_calibration(&dir, &manifest, Some(&runtime))
+                .unwrap_err()
+                .to_string();
+            ensure!(
+                absent.contains("resident disk rate needs a published conditioner read sample"),
+                "{absent}"
+            );
+            ensure!(runtime.is_dir(), "runtime directory not created");
+            let st_dev = std::fs::metadata(&dir)?.dev();
+            std::fs::write(
+                runtime.join(format!(
+                    "disk-read-workers-v{DISK_READ_SCHEMA}-{st_dev}.json"
+                )),
+                serde_json::to_vec(&DiskReadWorkers {
+                    schema: DISK_READ_SCHEMA,
+                    st_dev,
+                    probe_bytes: 83_886_080,
+                    rates: [2.0; 4],
+                    workers: 1,
+                })?,
+            )?;
+            let calibration = disk_reader_calibration(&dir, &manifest, Some(&runtime))?;
+            ensure!(
+                calibration == (83_886_080, 2.0, 1),
+                "persisted calibration read back as {calibration:?}"
+            );
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&root)?;
+        result
     }
 
     #[test]

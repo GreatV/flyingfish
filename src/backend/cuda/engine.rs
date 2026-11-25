@@ -1285,7 +1285,7 @@ impl Engine {
             .and_then(|n| n.checked_add(kv_bytes))
             .context("classic dense transient reservation overflow")?;
         let mut catalog = WeightCatalog::load_dense(
-            dir,
+            (dir, &runtime),
             &model_spec,
             &device,
             transient_bytes,

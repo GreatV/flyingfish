@@ -548,26 +548,21 @@ impl DenseStage<'_> {
                 });
             }
         }
-        // A choice dominated on both seconds and held bytes by another leaves the set.
-        let mut order: Vec<usize> = (0..choices.len()).collect();
-        order.sort_by(|&a, &b| {
-            choices[a]
-                .seconds
-                .total_cmp(&choices[b].seconds)
-                .then_with(|| choices[a].held.cmp(&choices[b].held))
-        });
-        let mut keep = vec![true; choices.len()];
-        let (mut below, mut run) = (usize::MAX, usize::MAX);
-        let mut previous: Option<usize> = None;
-        for &index in &order {
-            if previous.is_some_and(|last| choices[last].seconds != choices[index].seconds) {
-                below = below.min(run);
-                run = usize::MAX;
-            }
-            keep[index] = choices[index].held < below && choices[index].held < run;
-            run = run.min(choices[index].held);
-            previous = Some(index);
-        }
+        // A choice that another matches on seconds, held bytes and pinned layers, with one of
+        // them lower, leaves the set; the pinned layers are the device mapping pages it needs.
+        let dominated = |index: usize| {
+            let choice = &choices[index];
+            choices.iter().enumerate().any(|(other, rival)| {
+                other != index
+                    && rival.seconds <= choice.seconds
+                    && rival.held <= choice.held
+                    && rival.layers <= choice.layers
+                    && (rival.seconds < choice.seconds
+                        || rival.held < choice.held
+                        || rival.layers < choice.layers)
+            })
+        };
+        let keep: Vec<_> = (0..choices.len()).map(|index| !dominated(index)).collect();
         let choices: Vec<_> = choices
             .into_iter()
             .zip(keep)
@@ -603,9 +598,9 @@ struct HostChoice {
 }
 
 /// The host choices of one stage beside one base placement, in recorded order: seconds fall
-/// with every later choice, and no choice holds both no more seconds and no more host bytes
-/// than another. The leading run holds every ring worker's reserve; the tail holds fewer once
-/// pinning leaves the stage fewer disk layers than ring workers.
+/// with every later choice, and no choice is matched by another on seconds, held bytes and
+/// pinned layers with one of them lower. The leading run holds every ring worker's reserve;
+/// the tail holds fewer once pinning leaves the stage fewer disk layers than ring workers.
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 struct HostOptions {
     choices: Vec<HostChoice>,
@@ -615,12 +610,13 @@ struct HostOptions {
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 impl HostOptions {
-    /// The choices holding at most `room` host bytes, in recorded order.
+    /// The choices holding at most `room` host bytes, from the most pinned to the least: a tie
+    /// in seconds goes to the choice that pins the most and holds the least among those that fit.
     fn fitting(&self, room: usize) -> impl Iterator<Item = &HostChoice> + '_ {
-        let (lead, tail) = self.choices.split_at(self.tail);
-        lead.iter()
-            .take_while(move |choice| choice.held <= room)
-            .chain(tail.iter().filter(move |choice| choice.held <= room))
+        self.choices
+            .iter()
+            .rev()
+            .filter(move |choice| choice.held <= room)
     }
 
     /// The last choice holding at most `room` host bytes with at most `mappings` host mappings.
@@ -731,12 +727,12 @@ pub(crate) fn try_price_dense_stages(
                 };
                 for first in firsts.fitting(room) {
                     let Some(mappings) = mapping_capacity.checked_sub(first.layers) else {
-                        break;
+                        continue;
                     };
                     let room = host_limit - first.held - decoder.least;
                     for second in seconds.fitting(room) {
                         let Some(mappings) = mappings.checked_sub(second.layers) else {
-                            break;
+                            continue;
                         };
                         let room = host_limit - first.held - second.held;
                         let Some(last) = decoder.last_fitting(room, mappings) else {
@@ -876,6 +872,33 @@ mod tests {
         assert!(
             price_dense_stages(stages, (2021, 2999, 1), (1.0, 100.0), 4).is_err(),
             "a host limit below the all-host plan placed a stage"
+        );
+        // A tie goes to the plan that pins the most: beside two one-byte resident stages the
+        // disk-only plan holds 3300 host bytes and fits as well.
+        let tiny = DenseStage {
+            device: &[1],
+            source: &[1],
+            visits: 1,
+            load_scratch: 0,
+            device_staging: 0,
+        };
+        let stages = [three, tiny, tiny];
+        let tied = price_dense_stages(stages, (2021, 3300, 1), (1.0, 100.0), 4)?;
+        assert_eq!(
+            (tied.plans[0].host_bytes, tied.plans[0].disk_bytes),
+            (3000, 0)
+        );
+        // Each pinned layer needs a device mapping page. At device limit 2004 the two slots
+        // (2002 bytes) and the two resident bytes leave none, so the disk-only plan is the one
+        // that fits, in 3300 host bytes exactly; one byte less places no stage.
+        let unmapped = price_dense_stages(stages, (2004, 3300, 1), (1.0, 100.0), 4)?;
+        assert_eq!(
+            (unmapped.plans[0].host_bytes, unmapped.plans[0].disk_bytes),
+            (0, 3000)
+        );
+        assert!(
+            price_dense_stages(stages, (2004, 3299, 1), (1.0, 100.0), 4).is_err(),
+            "a host limit below the disk-only plan placed a stage without a mapping page"
         );
         Ok(())
     }

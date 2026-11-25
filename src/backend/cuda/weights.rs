@@ -2042,6 +2042,18 @@ struct SupplyShared {
 unsafe impl Send for SupplyShared {}
 unsafe impl Sync for SupplyShared {}
 
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+impl SupplyShared {
+    /// Stores the abort flag under the state mutex, then wakes every waiter: a worker that has
+    /// tested the flag and not yet waited holds that mutex, so it cannot miss the wakeup.
+    fn stop(&self) {
+        let state = self.state.lock().expect("dense supply lock");
+        self.abort.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(state);
+        self.changed.notify_all();
+    }
+}
+
 /// Concurrent disk supply of a dense streaming tier: `workers` threads read whole disk
 /// layers through the aligned direct reader into per-layer pinned slots; the consumer
 /// uploads from a slot and retires it by event, and a worker reuses a slot only after its
@@ -2149,10 +2161,7 @@ impl LayerSupply {
             match worker {
                 Ok(handle) => handles.push(handle),
                 Err(error) => {
-                    shared
-                        .abort
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    shared.changed.notify_all();
+                    shared.stop();
                     for handle in handles {
                         let _ = handle.join();
                     }
@@ -2259,29 +2268,32 @@ impl LayerSupply {
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 impl Drop for LayerSupply {
     fn drop(&mut self) {
-        self.shared
-            .abort
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.shared.changed.notify_all();
+        self.shared.stop();
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
-        let context = self.shared.context.clone();
-        let _ = context.bind_to_thread();
-        let _ = context.synchronize();
+        let context = &self.shared.context;
+        context.record_err(context.synchronize());
+        context.record_err(context.bind_to_thread());
         for (address, _) in self.registrations.drain(..) {
             // SAFETY: the workers joined and the context is synchronized; no access remains
             // to the registered range.
             #[cfg(feature = "cuda")]
-            let _ = unsafe {
-                cudarc::driver::sys::cuMemHostUnregister(address as *mut std::ffi::c_void)
-            }
-            .result();
+            context.record_err(
+                unsafe {
+                    cudarc::driver::sys::cuMemHostUnregister(address as *mut std::ffi::c_void)
+                }
+                .result(),
+            );
             #[cfg(feature = "rocm")]
-            let _ = unsafe { context.unregister_host(address as u64) };
+            context.record_err(unsafe { context.unregister_host(address as u64) });
         }
     }
 }
+
+/// Test park of a supply worker between its abort check and its wait, in microseconds.
+#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+static SUPPLY_WAIT_PARK_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// One supply worker: claims the next queued layer into its slot, waits the slot's
 /// previous upload event, reads the layer's ranges through the aligned direct reader,
@@ -2312,6 +2324,12 @@ fn supply_worker(shared: Arc<SupplyShared>, slot: usize, alignment: usize) {
                     state.layer[index] = SupplyLayer::Reading;
                     state.free[slot] = false;
                     break index;
+                }
+                #[cfg(test)]
+                if SUPPLY_WAIT_PARK_MICROS.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                    std::thread::sleep(std::time::Duration::from_micros(
+                        SUPPLY_WAIT_PARK_MICROS.load(std::sync::atomic::Ordering::SeqCst),
+                    ));
                 }
                 state = shared.changed.wait(state).expect("dense supply lock");
             }
@@ -3323,9 +3341,11 @@ impl WeightCatalog {
             })
     }
 
+    /// Streams the layers of `dir` that do not fit the device budget. `runtime` is the
+    /// directory the disk supply's worker count is seeded from.
     #[cfg(feature = "cuda")]
     pub(crate) fn load_dense(
-        dir: &Path,
+        (dir, runtime): (&Path, &Path),
         spec: &crate::model_spec::ModelSpec,
         d: &Device,
         transient_bytes: usize,
@@ -3391,7 +3411,8 @@ impl WeightCatalog {
         let available_host = available_host
             .checked_sub(host_bytes)
             .context("dense host feature reservation exceeds available RAM")?;
-        let supply_workers = super::engine::minimax_h3::dense_supply_workers(dir, &manifest)?;
+        let (_, _, supply_workers) =
+            super::engine::minimax_h3::seed_dense_supply_workers(dir, &manifest, runtime)?;
         let (_, plan) =
             Self::dense_host_fixed(&layers, &ranges, budget, available_host, supply_workers)?;
         let memory_bus_bits = d
@@ -4070,6 +4091,63 @@ mod tests {
         assert!(!loaded.release(1));
         assert!(!loaded.release(3));
         assert!(loaded.admit(1, 1));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires GPU; a worker parked between its abort check and its wait must be woken by the drop"]
+    fn supply_drop_wakes_a_worker_parking_before_its_wait_gpu() -> Result<()> {
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let root =
+            std::env::temp_dir().join(format!("ff-dense-supply-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(root.join("model.safetensors"), vec![0u8; 8192])?;
+        // The park holds the worker on the state for 200 ms between its abort check and its
+        // wait. The supply is created, parked and dropped on one thread; the drop starts 50 ms
+        // after the spawn, inside the park, and must return well inside 5 s.
+        SUPPLY_WAIT_PARK_MICROS.store(200_000, Ordering::SeqCst);
+        let (spawned, did_spawn) = mpsc::channel::<()>();
+        let (reported, reports) = mpsc::channel::<Result<(), String>>();
+        let dir = root.clone();
+        std::thread::spawn(move || {
+            let outcome = (|| -> Result<()> {
+                let device = crate::backend::cuda::Device::new(0)?;
+                let shard: Arc<str> = "model.safetensors".into();
+                let supply = LayerSupply::spawn(
+                    1,
+                    vec![vec![SupplyRange {
+                        source_offset: 0,
+                        shard,
+                        offset: 0,
+                        len: 4096,
+                    }]],
+                    vec![4096],
+                    4096,
+                    &dir,
+                    &device.ctx,
+                )?;
+                let _ = spawned.send(());
+                std::thread::sleep(Duration::from_millis(50));
+                drop(supply);
+                Ok(())
+            })();
+            let _ = reported.send(outcome.map_err(|error| format!("{error:#}")));
+        });
+        did_spawn
+            .recv_timeout(Duration::from_secs(60))
+            .context("the supply was not created within 60 s")?;
+        let dropped = reports.recv_timeout(Duration::from_secs(5));
+        SUPPLY_WAIT_PARK_MICROS.store(0, Ordering::SeqCst);
+        std::fs::remove_dir_all(&root)?;
+        match dropped {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => anyhow::bail!("{error}"),
+            Err(_) => anyhow::bail!(
+                "the supply's drop did not return within 5 s: a worker parked between its abort check and its wait was not woken"
+            ),
+        }
     }
 
     #[cfg(feature = "cuda")]

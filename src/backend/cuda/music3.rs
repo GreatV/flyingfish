@@ -337,7 +337,7 @@ impl Runtime {
         flash.bind_position(&cursor, capacity)?;
         let depth = Depth::load(&ar, &device)?;
         let weights = WeightCatalog::load_dense(
-            &model.join("language_model"),
+            (&model.join("language_model"), runtime),
             &ar.language,
             &device,
             external_reserve,
