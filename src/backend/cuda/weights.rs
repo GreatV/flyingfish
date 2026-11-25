@@ -2063,8 +2063,40 @@ impl SupplyShared {
 pub(crate) struct LayerSupply {
     shared: Arc<SupplyShared>,
     handles: Vec<std::thread::JoinHandle<()>>,
-    /// Registered slot buffers; `Drop` unregisters every address before they free.
-    registrations: Vec<(usize, crate::experts::disk::AlignedBytes)>,
+    /// Registered slot buffers; the field drops after the workers joined and the context
+    /// synchronized.
+    registrations: SupplySlots,
+}
+
+/// Registered slot buffers of a dense supply. `Drop` unregisters every address before its
+/// buffer frees: along a failed `LayerSupply::spawn` and at the supply's end.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+struct SupplySlots {
+    context: Arc<CudaContext>,
+    buffers: Vec<(usize, crate::experts::disk::AlignedBytes)>,
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+impl Drop for SupplySlots {
+    fn drop(&mut self) {
+        let context = &self.context;
+        context.record_err(context.bind_to_thread());
+        for (address, _) in self.buffers.drain(..) {
+            // SAFETY: `LayerSupply::spawn` registered each address once; it is unregistered
+            // here once, before its buffer frees.
+            #[cfg(feature = "cuda")]
+            context.record_err(
+                unsafe {
+                    cudarc::driver::sys::cuMemHostUnregister(address as *mut std::ffi::c_void)
+                }
+                .result(),
+            );
+            #[cfg(feature = "rocm")]
+            context.record_err(unsafe { context.unregister_host(address as u64) });
+            #[cfg(test)]
+            SUPPLY_UNREGISTERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -2104,14 +2136,17 @@ impl LayerSupply {
             .max()
             .unwrap_or(4096);
         context.bind_to_thread()?;
-        let mut registrations = Vec::with_capacity(slot_count);
+        let mut slots = SupplySlots {
+            context: context.clone(),
+            buffers: Vec::with_capacity(slot_count),
+        };
         let mut slot_base = Vec::with_capacity(slot_count);
         let mut events = Vec::with_capacity(slot_count);
         for _ in 0..slot_count {
             let mut buffer = crate::experts::disk::AlignedBytes::new(slot_bytes, alignment)?;
             let base = buffer.as_mut().as_mut_ptr();
-            // SAFETY: the buffer lives in `registrations` through the supply's Drop,
-            // which unregisters the address before it frees.
+            // SAFETY: the buffer lives in `slots` until a drop of it unregisters the address
+            // before the buffer frees.
             #[cfg(feature = "cuda")]
             unsafe {
                 cudarc::driver::sys::cuMemHostRegister_v2(base.cast(), slot_bytes, 0)
@@ -2124,7 +2159,7 @@ impl LayerSupply {
                     .register_host(base as u64, slot_bytes, false)
                     .context("register dense supply slot")?;
             }
-            registrations.push((base as usize, buffer));
+            slots.buffers.push((base as usize, buffer));
             slot_base.push(base);
             events.push(context.new_event(None)?);
         }
@@ -2151,14 +2186,7 @@ impl LayerSupply {
         });
         let mut handles = Vec::with_capacity(slot_count);
         for slot in 0..slot_count {
-            let worker = std::thread::Builder::new()
-                .name(format!("dense-supply-{slot}"))
-                .spawn({
-                    let shared = Arc::clone(&shared);
-                    move || supply_worker(shared, slot, alignment)
-                })
-                .context("spawn dense supply worker");
-            match worker {
+            match spawn_supply_worker(&shared, slot, alignment) {
                 Ok(handle) => handles.push(handle),
                 Err(error) => {
                     shared.stop();
@@ -2172,7 +2200,7 @@ impl LayerSupply {
         Ok(Self {
             shared,
             handles,
-            registrations,
+            registrations: slots,
         })
     }
 
@@ -2272,28 +2300,44 @@ impl Drop for LayerSupply {
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
-        let context = &self.shared.context;
-        context.record_err(context.synchronize());
-        context.record_err(context.bind_to_thread());
-        for (address, _) in self.registrations.drain(..) {
-            // SAFETY: the workers joined and the context is synchronized; no access remains
-            // to the registered range.
-            #[cfg(feature = "cuda")]
-            context.record_err(
-                unsafe {
-                    cudarc::driver::sys::cuMemHostUnregister(address as *mut std::ffi::c_void)
-                }
-                .result(),
-            );
-            #[cfg(feature = "rocm")]
-            context.record_err(unsafe { context.unregister_host(address as u64) });
-        }
+        self.shared
+            .context
+            .record_err(self.shared.context.synchronize());
     }
 }
 
 /// Test park of a supply worker between its abort check and its wait, in microseconds.
 #[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
 static SUPPLY_WAIT_PARK_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Test slot whose supply worker's spawn fails; `usize::MAX` for none.
+#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+static SUPPLY_SPAWN_FAIL_SLOT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Test count of supply slot addresses passed to the unregister call.
+#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+static SUPPLY_UNREGISTERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Spawns supply worker `slot`. A test refuses the worker that `SUPPLY_SPAWN_FAIL_SLOT` names.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+fn spawn_supply_worker(
+    shared: &Arc<SupplyShared>,
+    slot: usize,
+    alignment: usize,
+) -> Result<std::thread::JoinHandle<()>> {
+    #[cfg(test)]
+    if slot == SUPPLY_SPAWN_FAIL_SLOT.load(std::sync::atomic::Ordering::SeqCst) {
+        bail!("the spawn of dense supply worker {slot} is refused");
+    }
+    std::thread::Builder::new()
+        .name(format!("dense-supply-{slot}"))
+        .spawn({
+            let shared = Arc::clone(shared);
+            move || supply_worker(shared, slot, alignment)
+        })
+        .context("spawn dense supply worker")
+}
 
 /// One supply worker: claims the next queued layer into its slot, waits the slot's
 /// previous upload event, reads the layer's ranges through the aligned direct reader,
@@ -4148,6 +4192,52 @@ mod tests {
                 "the supply's drop did not return within 5 s: a worker parked between its abort check and its wait was not woken"
             ),
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires GPU; a failed supply spawn must unregister the slots it registered"]
+    fn supply_spawn_failure_unregisters_its_slots_gpu() -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let root =
+            std::env::temp_dir().join(format!("ff-dense-supply-spawn-{}", std::process::id()));
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(root.join("model.safetensors"), vec![0u8; 8192])?;
+        let device = crate::backend::cuda::Device::new(0)?;
+        let shard: Arc<str> = "model.safetensors".into();
+        let range = |offset: u64| SupplyRange {
+            source_offset: 0,
+            shard: shard.clone(),
+            offset,
+            len: 4096,
+        };
+        // Both slots are registered before the second worker's spawn is refused.
+        SUPPLY_SPAWN_FAIL_SLOT.store(1, Ordering::SeqCst);
+        SUPPLY_UNREGISTERS.store(0, Ordering::SeqCst);
+        let failed = LayerSupply::spawn(
+            2,
+            vec![vec![range(0)], vec![range(4096)]],
+            vec![4096; 2],
+            4096,
+            &root,
+            &device.ctx,
+        );
+        SUPPLY_SPAWN_FAIL_SLOT.store(usize::MAX, Ordering::SeqCst);
+        let unregistered = SUPPLY_UNREGISTERS.load(Ordering::SeqCst);
+        std::fs::remove_dir_all(&root)?;
+        let error = failed
+            .err()
+            .context("a refused worker spawn built a dense supply")?;
+        let error = format!("{error:#}");
+        ensure!(
+            error.contains("is refused"),
+            "the supply's spawn failed elsewhere: {error}"
+        );
+        ensure!(
+            unregistered == 2,
+            "a failed dense supply spawn unregistered {unregistered} of 2 registered slots"
+        );
+        Ok(())
     }
 
     #[cfg(feature = "cuda")]
