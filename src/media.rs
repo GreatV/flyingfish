@@ -541,8 +541,8 @@ pub fn write_y4m(
         .and_then(|n| n.checked_add(pixels / 2))
         .context("Y4M output frame extent overflow")?;
     let workers = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1);
+        .context("detect available parallelism for Y4M write")?
+        .get();
     let shape = (width, height, frame_bytes, frame_out_bytes);
     if workers <= 1 {
         let mut out = vec![0u8; frame_out_bytes];

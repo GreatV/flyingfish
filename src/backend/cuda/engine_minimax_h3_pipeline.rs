@@ -1701,19 +1701,23 @@ impl DecoderVisitCost {
 }
 
 #[cfg(feature = "cuda")]
-fn pre_fault_bytes(len: usize) -> Vec<u8> {
+fn pre_fault_bytes(len: usize) -> Result<Vec<u8>> {
     let mut buffer = vec![0u8; len];
     if len == 0 {
-        return buffer;
+        return Ok(buffer);
     }
-    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
-        .ok()
-        .filter(|&size| size > 0)
-        .unwrap_or(4096);
+    // SAFETY: sysconf takes no pointer arguments.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    ensure!(
+        page > 0,
+        "sysconf(_SC_PAGESIZE) returned {page}: {}",
+        std::io::Error::last_os_error()
+    );
+    let page = usize::try_from(page).context("sysconf(_SC_PAGESIZE) exceeds usize")?;
     let pages = len.div_ceil(page);
     let workers = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
+        .context("detect available parallelism for RGB pre-fault")?
+        .get()
         .min(pages);
     let touch = |slice: &mut [u8]| {
         for chunk in slice.chunks_mut(page) {
@@ -1725,7 +1729,7 @@ fn pre_fault_bytes(len: usize) -> Vec<u8> {
     };
     if workers <= 1 {
         touch(&mut buffer);
-        return buffer;
+        return Ok(buffer);
     }
     let base = pages / workers;
     let extra = pages % workers;
@@ -1739,7 +1743,7 @@ fn pre_fault_bytes(len: usize) -> Vec<u8> {
             scope.spawn(move || touch(slice));
         }
     });
-    buffer
+    Ok(buffer)
 }
 
 #[cfg(feature = "cuda")]
@@ -1857,7 +1861,7 @@ impl VideoDecodeStage {
         drop(decoded);
         let (rgb_ptr, _rgb_guard) = rgb.device_ptr(&device.upload);
         device.upload.wait(&self.rgb_ready)?;
-        let mut video = pre_fault_bytes(self.geometry.rgb_bytes);
+        let mut video = pre_fault_bytes(self.geometry.rgb_bytes)?;
         let staging = self.rgb_staging.as_mut_slice()?;
         let done = &self.rgb_done;
         let (readback, audio) = std::thread::scope(|scope| {
@@ -1871,10 +1875,11 @@ impl VideoDecodeStage {
                         .decode((s, blas), &input, (2, geometry.audio_latents))?;
                 Ok(s.clone_dtoh(&decoded_audio)?)
             })();
-            (
-                d2h.join().expect("RGB pinned readback thread panicked"),
-                audio,
-            )
+            let readback = match d2h.join() {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("RGB pinned readback thread panicked")),
+            };
+            (readback, audio)
         });
         drop(_rgb_guard);
         readback?;
@@ -5342,7 +5347,7 @@ fn packed_decoder_handoffs_preserve_video_patches_and_stereo_channels() -> Resul
 fn rgb_pinned_chunked_readback_matches_clone_dtoh() -> Result<()> {
     use crate::backend::gpu::DevicePtr;
     for len in [0usize, 1, 4095, 4096, 4097, 200_003] {
-        let zeros = pre_fault_bytes(len);
+        let zeros = pre_fault_bytes(len)?;
         assert_eq!(zeros.len(), len);
         assert!(zeros.iter().all(|&b| b == 0));
     }
@@ -5364,7 +5369,7 @@ fn rgb_pinned_chunked_readback_matches_clone_dtoh() -> Result<()> {
         ready.record(&device.stream)?;
         let (ptr, _guard) = gpu.device_ptr(&device.upload);
         device.upload.wait(&ready)?;
-        let mut out = pre_fault_bytes(len);
+        let mut out = pre_fault_bytes(len)?;
         readback_pinned_chunks(
             &device.upload,
             ptr,
@@ -5380,7 +5385,7 @@ fn rgb_pinned_chunked_readback_matches_clone_dtoh() -> Result<()> {
         };
         assert_eq!(out, reference, "pinned readback mismatch for len={len}");
         if len == 200_003 {
-            let mut shifted = pre_fault_bytes(len - 1);
+            let mut shifted = pre_fault_bytes(len - 1)?;
             let (ptr_shift, _guard_shift) = gpu.device_ptr(&device.upload);
             readback_pinned_chunks(
                 &device.upload,
