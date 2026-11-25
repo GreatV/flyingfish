@@ -2,7 +2,7 @@ use crate::backend::gpu::{CudaFunction, LaunchConfig, PushKernelArg};
 use crate::backend::gpu::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr};
 use crate::backend::setup::{CONDITIONER_D128, IMAGE_D128_RESIDUAL, VAE_D64_WINDOWS};
 #[cfg(feature = "cuda")]
-use crate::backend::setup::{DeviceArchitecture, IMAGE_D128_SINGLE_PV};
+use crate::backend::setup::{DeviceArchitecture, IMAGE_D128_SINGLE_PV, VAE_D64_SINGLE_PV};
 use anyhow::Context;
 use anyhow::{Result, ensure};
 use half::bf16;
@@ -153,16 +153,23 @@ fn check_native_function(
     name: &str,
     dynamic_shared: u32,
     set_dynamic: bool,
-) -> Result<()> {
-    let optin = super::optin_shared_bytes(ctx)?;
+) -> Result<i64> {
+    let optin = super::optin_shared_bytes(ctx)
+        .with_context(|| format!("{name} opt-in shared memory limit"))?;
     #[cfg(feature = "cuda")]
     {
         use cudarc::driver::sys::CUfunction_attribute as F;
-        let shared = function.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?;
-        let local = function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
-        let registers = function.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
+        let shared = function
+            .get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)
+            .with_context(|| format!("{name} SHARED_SIZE_BYTES"))?;
+        let local = function
+            .get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)
+            .with_context(|| format!("{name} LOCAL_SIZE_BYTES"))?;
+        let registers = function
+            .get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)
+            .with_context(|| format!("{name} NUM_REGS"))?;
         ensure!(
-            local == 0 && registers <= 255,
+            local == 0 && (1..=255).contains(&registers),
             "native prefill {name} resource limit: registers={registers} local={local}"
         );
         ensure!(
@@ -185,15 +192,14 @@ fn check_native_function(
             super::set_max_dynamic_shared_bytes(function, dynamic_shared)?;
         }
     }
+    let active = function
+        .occupancy_max_active_blocks_per_multiprocessor(128, dynamic_shared as usize, None)
+        .with_context(|| format!("{name} active blocks per SM"))?;
     ensure!(
-        function.occupancy_max_active_blocks_per_multiprocessor(
-            128,
-            dynamic_shared as usize,
-            None
-        )? > 0,
-        "native prefill {name} has zero resident blocks"
+        active > 0,
+        "native prefill {name} has zero active blocks per SM"
     );
-    Ok(())
+    Ok(i64::from(active))
 }
 
 fn split_extent(capacity: usize, heads: usize, resident: usize) -> Result<(usize, usize)> {
@@ -920,7 +926,7 @@ impl Flash {
         )
     }
 
-    pub fn bind_bf16_windows(&mut self, offsets: &[u32]) -> Result<()> {
+    pub fn bind_bf16_windows(&mut self, offsets: &[u32], video: bool) -> Result<()> {
         ensure!(self.geometry[2] == 64, "grouped BF16 windows require D64");
         ensure!(
             self.score
@@ -928,7 +934,18 @@ impl Flash {
                 && self.position == 0,
             "grouped BF16 windows require an unmasked fixed score"
         );
-        self.bind_windows(offsets, i32::MAX as u32, VAE_D64_WINDOWS)
+        #[cfg(feature = "cuda")]
+        let symbol = DeviceArchitecture::Cuda(
+            super::cubin::capability(self.stream.context())
+                .context("D64 window compute capability")?,
+        )
+        .vae_d64_window_symbol(video);
+        #[cfg(feature = "rocm")]
+        let symbol = {
+            let _ = video;
+            VAE_D64_WINDOWS
+        };
+        self.bind_windows(offsets, i32::MAX as u32, symbol)
     }
 
     fn window_geometry(
@@ -979,8 +996,26 @@ impl Flash {
         } else {
             "attention_native"
         };
-        let function = super::cubin::module(ctx, module)?.load_function(name)?;
-        check_native_function(ctx, &function, name, self.shared, false)?;
+        let module = super::cubin::module(ctx, module)?;
+        let load = |symbol: &str| {
+            module
+                .load_function(symbol)
+                .with_context(|| format!("load {symbol}"))
+        };
+        let function = load(name)?;
+        let active = check_native_function(ctx, &function, name, self.shared, false)?;
+        #[cfg(feature = "cuda")]
+        if name == VAE_D64_SINGLE_PV {
+            let residual = load(VAE_D64_WINDOWS)?;
+            let previous =
+                check_native_function(ctx, &residual, VAE_D64_WINDOWS, self.shared, false)?;
+            ensure!(
+                active >= previous,
+                "{name} active blocks per SM {active} below {VAE_D64_WINDOWS} {previous}"
+            );
+        }
+        #[cfg(feature = "rocm")]
+        let _ = active;
         let offsets = self.stream.clone_htod(offsets)?;
         if self.native.len() == 1 {
             self.native.push(function);
@@ -4270,7 +4305,7 @@ mod tests {
         let mut grouped = case.binding(stream)?;
         grouped.lse = stream.clone_htod(&vec![-123.5f32; rows * 32 + 8])?;
         if lengths.len() > 1 {
-            grouped.bind_bf16_windows(&offsets)?;
+            grouped.bind_bf16_windows(&offsets, false)?;
         }
         for graph in [false, true] {
             stream.memset_zeros(&mut buffers.out.slice_mut(..rows * width))?;
@@ -4328,7 +4363,7 @@ mod tests {
             );
         }
         if lengths == [64, 64] {
-            grouped.bind_bf16_windows(&[0, rows as u32])?;
+            grouped.bind_bf16_windows(&[0, rows as u32], false)?;
             case.run(&mut grouped, &mut buffers)?;
             let wrong = stream.clone_dtoh(&buffers.out)?;
             let differences = wrong[..rows * width]
@@ -4363,6 +4398,225 @@ mod tests {
         defects += bf16_disjoint_window_cell(stream, &[17, 19], true, limits)?;
         println!("BF16_WINDOWS_RESULT cases=8 modes=2 identity_bit_limit=0 defects={defects}");
         Ok(defects)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[derive(serde::Deserialize)]
+    struct VideoWindowCell {
+        lengths: Vec<usize>,
+        tau: [f64; 3],
+    }
+
+    #[cfg(feature = "cuda")]
+    fn video_window_cell(
+        stream: &Arc<CudaStream>,
+        path: &std::path::Path,
+        name: &str,
+        cell: &VideoWindowCell,
+    ) -> Result<usize> {
+        let rows = cell.lengths.iter().sum::<usize>();
+        let width = 32 * 64;
+        let bytes = std::fs::read(path)?;
+        let tensors = safetensors::SafeTensors::deserialize(&bytes)?;
+        let input = |key, head_major| -> Result<_> {
+            let t = tensors.tensor(key)?;
+            ensure!(
+                t.dtype() == safetensors::Dtype::BF16 && t.shape() == [rows, 32, 64],
+                "invalid video window operand {key}"
+            );
+            let mut data = vec![bf16::ZERO; rows * width];
+            for (i, chunk) in t.data().as_chunks::<2>().0.iter().enumerate() {
+                let target = if head_major {
+                    ((i / 64 % 32) * rows + i / width) * 64 + i % 64
+                } else {
+                    i
+                };
+                data[target] = bf16::from_le_bytes(*chunk);
+            }
+            Ok(stream.clone_htod(&data)?)
+        };
+        let mut buffers = Buffers {
+            q: input("q", false)?,
+            k: input("k", true)?,
+            v: input("v", true)?,
+            out: stream.clone_htod(&vec![bf16::from_f32(-123.5); rows * width + 8])?,
+        };
+        let expected = reference_f64(&tensors, "o")?;
+        let reference_lse = reference_f64(&tensors, "lse")?;
+        ensure!(
+            expected.len() == rows * width
+                && reference_lse.len() == rows * 32
+                && cell.tau.iter().all(|v| v.is_finite() && *v >= 1e-6),
+            "invalid D64 reference"
+        );
+        let case = Case {
+            name: name.to_owned(),
+            d: 64,
+            hq: 32,
+            hkv: 32,
+            mode: "bidirectional".into(),
+            seed: 47,
+            rows,
+            start: 0,
+            keys: rows,
+            extent: 0,
+            capacity: rows,
+            pitch: width,
+            scale: Some(0.125),
+        };
+        let mut op = case.binding(stream)?;
+        op.lse = stream.clone_htod(&vec![-123.5f32; rows * 32 + 8])?;
+        let mut offsets = vec![0u32];
+        for &length in &cell.lengths {
+            offsets.push(
+                offsets
+                    .last()
+                    .unwrap()
+                    .checked_add(length.try_into()?)
+                    .context("video window offset overflow")?,
+            );
+        }
+        op.bind_bf16_windows(&offsets, true)?;
+        let mut eager: Option<(Vec<bf16>, Vec<f32>)> = None;
+        let mut defects = 0;
+        for graph in [false, true] {
+            stream.memset_zeros(&mut buffers.out.slice_mut(..rows * width))?;
+            stream.memset_zeros(&mut op.lse.slice_mut(..rows * 32))?;
+            if graph {
+                stream.begin_capture(
+                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+                let result = case.run(&mut op, &mut buffers);
+                let captured = stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                result?;
+                captured?.context("D64 video graph empty")?.launch()?;
+            } else {
+                case.run(&mut op, &mut buffers)?;
+            }
+            let o = stream.clone_dtoh(&buffers.out)?;
+            let l = stream.clone_dtoh(&op.lse)?;
+            ensure!(
+                o[rows * width..].iter().all(|v| v.to_f32() == -123.5)
+                    && l[rows * 32..].iter().all(|v| *v == -123.5),
+                "video attention guard overwritten"
+            );
+            let values = o[..rows * width]
+                .iter()
+                .map(|v| v.to_f64())
+                .collect::<Vec<_>>();
+            let (absolute, rms) = errors(&values, &expected, false)?;
+            let (lse, _) = errors(
+                &l[..rows * 32]
+                    .iter()
+                    .map(|v| f64::from(*v))
+                    .collect::<Vec<_>>(),
+                &reference_lse,
+                false,
+            )?;
+            let issue = absolute > cell.tau[0] || rms > cell.tau[1] || lse > cell.tau[2];
+            defects += usize::from(issue);
+            println!(
+                "VIDEO_D64 {name} graph={graph} max={absolute} rms={rms} lse={lse} tau={:?} defect={issue}",
+                cell.tau
+            );
+            if let Some((prior_o, prior_l)) = eager.take() {
+                ensure!(
+                    o.iter()
+                        .zip(prior_o)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                        && l.iter()
+                            .zip(prior_l)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "graph/eager differed {name}"
+                );
+            } else {
+                eager = Some((o, l));
+            }
+        }
+        if name == "boundary" {
+            op.bind_bf16_windows(&[0, rows.try_into()?], true)?;
+            case.run(&mut op, &mut buffers)?;
+            let wrong = stream.clone_dtoh(&buffers.out)?;
+            let (bad, rms) = errors(
+                &wrong[..rows * width]
+                    .iter()
+                    .map(|v| v.to_f64())
+                    .collect::<Vec<_>>(),
+                &expected,
+                false,
+            )?;
+            ensure!(
+                bad > cell.tau[0] || rms > cell.tau[1],
+                "merged-window mutant escaped"
+            );
+            println!("VIDEO_D64_CONTROL merged_window max={bad} rms={rms} detected=true");
+        }
+        Ok(defects)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU lease and publisher-calibrated D64 fixtures"]
+    fn video_d64_windows_matches_publisher_floor() -> Result<()> {
+        ensure!(
+            std::env::var("FF_DENSE_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window missing"
+        );
+        let root = std::path::PathBuf::from(std::env::var("FF_DENSE_REFERENCE")?);
+        #[derive(serde::Deserialize)]
+        struct Freeze {
+            device: String,
+            sm: u32,
+            cases: std::collections::BTreeMap<String, VideoWindowCell>,
+        }
+        let frozen: Freeze = serde_json::from_slice(&std::fs::read(root.join("freeze.json"))?)?;
+        let ctx = crate::backend::gpu::CudaContext::new(0)?;
+        ensure!(
+            super::super::cubin::capability(&ctx)? == frozen.sm && ctx.name()? == frozen.device,
+            "uncalibrated video attention device"
+        );
+        for family in ["minimax", "hyperflow"] {
+            for block in [0, 35] {
+                for batch in [1, 3, 14] {
+                    let name = format!("{family}-block{block}-b{batch}");
+                    let cell = frozen.cases.get(&name).with_context(|| name.clone())?;
+                    ensure!(
+                        cell.lengths == vec![1797; batch],
+                        "invalid lengths in {name}"
+                    );
+                }
+            }
+        }
+        for (name, lengths) in [
+            ("mixed", &[1, 64, 65, 72, 73, 1797][..]),
+            ("uniform", &[17, 19]),
+            ("boundary", &[64, 64]),
+        ] {
+            ensure!(
+                frozen.cases.get(name).is_some_and(|c| c.lengths == lengths),
+                "missing or invalid {name}"
+            );
+        }
+        // SAFETY: all allocations, copies and launches use this one stream.
+        unsafe {
+            ctx.disable_event_tracking();
+        }
+        let stream = ctx.new_stream()?;
+        let mut defects = 0;
+        for (name, cell) in &frozen.cases {
+            defects += video_window_cell(
+                &stream,
+                &root.join(format!("{name}.safetensors")),
+                name,
+                cell,
+            )?;
+        }
+        ensure!(defects == 0, "VIDEO_D64 defects={defects}");
+        println!(
+            "PASS VIDEO_D64 cells={} eager_and_graph=true defects=0",
+            frozen.cases.len()
+        );
+        Ok(())
     }
 
     #[test]
