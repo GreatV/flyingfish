@@ -437,6 +437,40 @@ impl Blas {
     }
 }
 
+fn repeat_matches(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    scan: &cudarc::driver::CudaFunction,
+    flags: &mut cudarc::driver::CudaSlice<u32>,
+    pair: [u64; 2],
+    len: usize,
+    sms: usize,
+) -> Result<bool> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    let blocks = u32::try_from(len.div_ceil(256).min(8 * sms))?;
+    ensure!(blocks > 0, "dense Lt repeat scan has no elements or SMs");
+    stream.memset_zeros(flags)?;
+    unsafe {
+        stream
+            .launch_builder(scan)
+            .arg(&pair[0])
+            .arg(&pair[1])
+            .arg(&u64::try_from(len)?)
+            .arg(&mut *flags)
+            .launch(LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    let mut bits = [0u32];
+    stream.memcpy_dtoh(flags, &mut bits)?;
+    stream.synchronize()?;
+    let [bits] = bits;
+    ensure!(bits & 2 == 0, "nonfinite dense Lt setup output");
+    ensure!(bits & 4 != 0, "dense Lt setup output has no signal");
+    Ok(bits & 1 == 0)
+}
+
 struct Agreement {
     different: bool,
     largest: f32,
@@ -568,6 +602,9 @@ impl Blas {
             }
             Ok(())
         };
+        let scan = super::cubin::module(self.stream.context(), "q38_common")?
+            .load_function("bf16_repeat_flags")?;
+        let mut flags = self.stream.alloc_zeros::<u32>(1)?;
         for (i, algo) in candidates.into_iter().enumerate() {
             ops.launch(self, plan, &algo)?;
             if i == 0 {
@@ -575,10 +612,15 @@ impl Blas {
             }
             copy(copies[1])?;
             ops.launch(self, plan, &algo)?;
-            self.stream.synchronize()?;
-            let same = Agreement::read(copies[1], ops.output.ptr, len)?;
             ensure!(
-                !same.different,
+                repeat_matches(
+                    &self.stream,
+                    &scan,
+                    &mut flags,
+                    [copies[1], ops.output.ptr],
+                    len,
+                    self.skinny_device.0,
+                )?,
                 "unsplit dense Lt same-plan repeat differs: {:?}",
                 algo_config(&algo)?
             );
@@ -852,6 +894,55 @@ impl Blas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "CUDA window for production dense Lt repeat extents"]
+    fn dense_repeat_matches_host_words() -> Result<()> {
+        use crate::backend::cuda::Device;
+        use cudarc::driver::DevicePtr;
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let device = Device::new(0)?;
+        let stream = &device.stream;
+        let scan = crate::backend::cuda::cubin::module(&device.ctx, "q38_common")?
+            .load_function("bf16_repeat_flags")?;
+        let mut flags = stream.alloc_zeros::<u32>(1)?;
+        for len in [39_741 * 7_168, 3_057 * 28_672] {
+            let mut a = stream.alloc_zeros::<bf16>(len)?;
+            let mut b = stream.alloc_zeros::<bf16>(len)?;
+            for (first, lhs, rhs, expected) in [
+                (0, 0, 0, Err("dense Lt setup output has no signal")),
+                (0, 0x8000, 1, Err("dense Lt setup output has no signal")),
+                (0, 1, 1, Ok(true)),
+                (0, 0x3f80, 0x3f81, Ok(false)),
+                (1, 0, 0x8000, Ok(false)),
+                (0, 0x7f80, 0x3f80, Err("nonfinite dense Lt setup output")),
+                (0, 0, 0x7fc1, Err("nonfinite dense Lt setup output")),
+            ] {
+                stream.memcpy_htod(&[bf16::from_bits(first)], &mut a.slice_mut(..1))?;
+                stream.memcpy_htod(&[bf16::from_bits(first)], &mut b.slice_mut(..1))?;
+                stream.memcpy_htod(&[bf16::from_bits(lhs)], &mut a.slice_mut(len - 1..))?;
+                stream.memcpy_htod(&[bf16::from_bits(rhs)], &mut b.slice_mut(len - 1..))?;
+                let (ap, _a) = a.device_ptr(stream);
+                let (bp, _b) = b.device_ptr(stream);
+                let actual =
+                    repeat_matches(stream, &scan, &mut flags, [ap, bp], len, device.info.sms);
+                let host = Agreement::read(ap, bp, len).map(|value| !value.different);
+                assert_eq!(
+                    host.map_err(|e| e.to_string()),
+                    expected.map_err(String::from)
+                );
+                assert_eq!(
+                    actual.map_err(|e| e.to_string()),
+                    expected.map_err(String::from),
+                    "{len} words, tail {lhs:04x}/{rhs:04x}"
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn swap_restores_the_pre_qualification_family_plan() -> Result<()> {
