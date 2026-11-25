@@ -4040,6 +4040,23 @@ mod tests {
     use half::bf16;
     use sha2::{Digest, Sha256};
 
+    /// The supply's published reads that no upload retired and that wait in no slot.
+    fn released_entries(dense: &DenseStreaming) -> u64 {
+        dense.supply.as_ref().map_or(0, |supply| {
+            released_count(&supply.shared.state.lock().expect("dense supply lock"))
+        })
+    }
+
+    /// `published` less the retired entries and the entries waiting in a slot.
+    fn released_count(state: &SupplyState) -> u64 {
+        let waiting = state
+            .layer
+            .iter()
+            .filter(|layer| matches!(layer, SupplyLayer::Ready(_)))
+            .count() as u64;
+        state.published - state.retired - waiting
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn demand_cursor_layer_is_admitted_under_capacity() {
@@ -4135,6 +4152,19 @@ mod tests {
         assert!(!loaded.release(1));
         assert!(!loaded.release(3));
         assert!(loaded.admit(1, 1));
+        // Of the published entries, those neither retired nor waiting in a slot were released.
+        let mut counted = fresh();
+        counted.published = 3;
+        counted.retired = 1;
+        counted.outstanding = 1;
+        counted.layer[0] = SupplyLayer::Ready(0);
+        counted.free[0] = false;
+        assert_eq!(released_count(&counted), 1);
+        assert!(counted.release(0));
+        assert_eq!(released_count(&counted), 2);
+        assert!(counted.admit(1, 1));
+        assert!(counted.release(1));
+        assert_eq!(released_count(&counted), 2);
     }
 
     #[cfg(feature = "cuda")]
@@ -4704,6 +4734,7 @@ mod tests {
                     }
                 }
                 let (claims, reclaims) = dense.flush_ring_counts()?;
+                let released = released_entries(&dense);
                 let slot_count = dense
                     .supply
                     .as_ref()
@@ -4714,16 +4745,16 @@ mod tests {
                         "host-only placement claimed disk ring slots: claims={claims} reclaims={reclaims}"
                     );
                 } else {
-                    // The pump wraps after the last repeat and pre-reads into every free slot;
-                    // a pre-read publishes without a retire.
+                    // Every published read is retired by an upload, released at a layer the
+                    // consumer finds loaded, or waiting in a slot at the count.
                     ensure!(
                         reclaims == (3 * (4 - host_layers)) as u64
-                            && claims == reclaims + slot_count,
-                        "disk ring claim/reclaim mismatch: host_layers={host_layers} claims={claims} reclaims={reclaims} slots={slot_count}"
+                            && claims == reclaims + slot_count + released,
+                        "disk ring claim/reclaim/release mismatch: host_layers={host_layers} claims={claims} reclaims={reclaims} released={released} slots={slot_count}"
                     );
                 }
                 println!(
-                    "PASS dense_slots host_layers={host_layers} disk_layers={} layers=4 repeats=3 slot_bytes={per_layer} claims={claims} reclaims={reclaims} byte_mismatches=0 product_rows=1,17 product_bits=0 wrong_generation=detected bounds=detected tail_guards=preserved",
+                    "PASS dense_slots host_layers={host_layers} disk_layers={} layers=4 repeats=3 slot_bytes={per_layer} claims={claims} reclaims={reclaims} released={released} byte_mismatches=0 product_rows=1,17 product_bits=0 wrong_generation=detected bounds=detected tail_guards=preserved",
                     4 - host_layers
                 );
             }
