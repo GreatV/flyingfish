@@ -6396,7 +6396,7 @@ impl Dit {
             }
             let row_pairs = s.clone_htod(&plan.row_pairs[k])?;
             let row_timesteps = s.clone_htod(&plan.row_timesteps[k])?;
-            self.step(
+            self.evaluate(
                 c,
                 table,
                 counts,
@@ -6407,6 +6407,7 @@ impl Dit {
                     row_pairs: &row_pairs,
                     row_timesteps: &row_timesteps,
                 },
+                k == 0,
             )?;
             self.euler(
                 s,
@@ -6448,33 +6449,13 @@ impl Dit {
         }
     }
 
-    /// One teacher-forced evaluation; the velocities land in `self.video` and `self.audio`.
-    pub(crate) fn step(
-        &mut self,
-        c: &BlockContext<'_>,
-        adaln: &AdalnTable,
-        (pairs, timesteps): (u32, u32),
-        inputs: &StepInputs<'_>,
-    ) -> Result<()> {
-        if let Some(tier) = self.tier.as_mut() {
-            tier.ready()?;
-        }
+    fn refine_text(&mut self, c: &BlockContext<'_>, text: &CudaSlice<bf16>) -> Result<()> {
         let (s, spec, r) = (c.s, c.spec, self.ranges);
         let h = spec.hidden;
-        let video_rows = r.condition + (r.rows - r.video_start);
-        let patch = spec.video_row_width();
-        ensure!(
-            inputs.video.len() == video_rows * patch
-                && inputs.audio.len() == r.audio * spec.audio_in_channels
-                && inputs.text.len() == r.text * spec.text_dim
-                && inputs.row_pairs.len() == r.rows
-                && inputs.row_timesteps.len() == r.rows,
-            "evaluation inputs differ from the layout"
-        );
         c.blas.linear_biased(
             matrix(&self.context[0], s, h, spec.text_dim)?,
             vector(&self.context[1], s)?,
-            matrix(inputs.text, s, r.text, spec.text_dim)?,
+            matrix(text, s, r.text, spec.text_dim)?,
             &mut TensorMut(matrix(&self.text, s, r.text, h)?),
             LinearBiasMode::BeforeOutputRound,
         )?;
@@ -6510,16 +6491,69 @@ impl Dit {
                 threads: HIDDEN_NORM_THREADS,
                 eps: spec.final_norm_eps,
             },
-        )?;
-        // `[text, hidden]` refiner rows. The block stack then writes `x`.
-        #[cfg(test)]
-        {
-            let count = r.text * h;
+        )
+    }
+
+    /// One teacher-forced evaluation; the velocities land in `self.video` and `self.audio`.
+    #[cfg(test)]
+    pub(crate) fn step(
+        &mut self,
+        c: &BlockContext<'_>,
+        adaln: &AdalnTable,
+        (pairs, timesteps): (u32, u32),
+        inputs: &StepInputs<'_>,
+    ) -> Result<()> {
+        self.evaluate(c, adaln, (pairs, timesteps), inputs, true)
+    }
+
+    fn evaluate(
+        &mut self,
+        c: &BlockContext<'_>,
+        adaln: &AdalnTable,
+        (pairs, timesteps): (u32, u32),
+        inputs: &StepInputs<'_>,
+        refine_text: bool,
+    ) -> Result<()> {
+        if let Some(tier) = self.tier.as_mut() {
+            tier.ready()?;
+        }
+        let (s, spec, r) = (c.s, c.spec, self.ranges);
+        let h = spec.hidden;
+        let video_rows = r.condition + (r.rows - r.video_start);
+        let patch = spec.video_row_width();
+        ensure!(
+            inputs.video.len() == video_rows * patch
+                && inputs.audio.len() == r.audio * spec.audio_in_channels
+                && inputs.text.len() == r.text * spec.text_dim
+                && inputs.row_pairs.len() == r.rows
+                && inputs.row_timesteps.len() == r.rows,
+            "evaluation inputs differ from the layout"
+        );
+        let count = r.text * h;
+        if refine_text {
+            self.refine_text(c, inputs.text)?;
             s.memcpy_dtod(&self.x.slice(..count), &mut self.text.slice_mut(..count))?;
+        } else {
+            s.memcpy_dtod(&self.text.slice(..count), &mut self.x.slice_mut(..count))?;
         }
         #[cfg(test)]
-        if self.trace.as_ref().is_some_and(Vec::is_empty) && self.refiner_trace.is_none() {
-            self.refiner_trace = Some(s.clone_dtoh(&self.x.slice(..r.text * h))?);
+        if self.trace.is_some() {
+            let prefix = s.clone_dtoh(&self.x.slice(..count))?;
+            if refine_text {
+                self.refiner_trace = Some(prefix);
+            } else {
+                let reference = self
+                    .refiner_trace
+                    .as_ref()
+                    .context("missing refined text prefix")?;
+                ensure!(
+                    prefix
+                        .iter()
+                        .map(|w| w.to_bits())
+                        .eq(reference.iter().map(|w| w.to_bits())),
+                    "restored text prefix differs from the first evaluation"
+                );
+            }
         }
         projection(
             c.s,
@@ -13209,9 +13243,12 @@ mod tests {
             &text_host,
         )?;
         let condition = layout.condition_video_rows * patch;
-        let mut chain = |grids: (&Schedule, &Schedule)| -> Result<[Vec<f64>; 2]> {
-            let video = s.clone_htod(&video0.iter().map(|&v| v as f32).collect::<Vec<_>>())?;
-            let audio = s.clone_htod(&audio0.iter().map(|&v| v as f32).collect::<Vec<_>>())?;
+        let mut chain = |grids: (&Schedule, &Schedule),
+                         check_prefix: bool|
+         -> Result<[Vec<f64>; 2]> {
+            let mut video = s.clone_htod(&video0.iter().map(|&v| v as f32).collect::<Vec<_>>())?;
+            let mut audio = s.clone_htod(&audio0.iter().map(|&v| v as f32).collect::<Vec<_>>())?;
+            dit.trace = check_prefix.then(Vec::new);
             dit.sample(
                 &context,
                 (&table, &adaln_plan),
@@ -13219,6 +13256,71 @@ mod tests {
                 (&video, &audio),
                 &text,
             )?;
+            if let Some(trajectory) = dit.trace.take() {
+                let prefix = dit
+                    .refiner_trace
+                    .take()
+                    .context("missing first refined prefix")?;
+                ensure!(
+                    trajectory.len() == adaln_plan.row_pairs.len(),
+                    "refiner trajectory length"
+                );
+                s.memcpy_htod(
+                    &video0.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+                    &mut video,
+                )?;
+                s.memcpy_htod(
+                    &audio0.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+                    &mut audio,
+                )?;
+                let count = (
+                    u32::try_from(adaln_plan.pairs.len())?,
+                    u32::try_from(adaln_plan.timesteps.len())?,
+                );
+                for (k, expected) in trajectory.iter().enumerate() {
+                    dit.step(
+                        &context,
+                        &table,
+                        count,
+                        &StepInputs {
+                            video: &video,
+                            audio: &audio,
+                            text: &text,
+                            row_pairs: &s.clone_htod(&adaln_plan.row_pairs[k])?,
+                            row_timesteps: &s.clone_htod(&adaln_plan.row_timesteps[k])?,
+                        },
+                    )?;
+                    ensure!(
+                        s.clone_dtoh(&dit.text)?
+                            .iter()
+                            .map(|x| x.to_bits())
+                            .eq(prefix.iter().map(|x| x.to_bits())),
+                        "freshly refined text differs at evaluation {k}"
+                    );
+                    dit.euler(
+                        s,
+                        (&video, condition, video.len() - condition),
+                        &dit.video,
+                        grids.0,
+                        k,
+                    )?;
+                    dit.euler(s, (&audio, 0, audio.len()), &dit.audio, grids.1, k)?;
+                    for (rows, reference) in [(&video, &expected.video), (&audio, &expected.audio)]
+                    {
+                        ensure!(
+                            s.clone_dtoh(rows)?
+                                .iter()
+                                .map(|x| x.to_bits())
+                                .eq(reference.iter().map(|x| x.to_bits())),
+                            "fresh and reused text produce different latents at evaluation {k}"
+                        );
+                    }
+                }
+                println!(
+                    "H3_REFINER_TRAJECTORY evaluations={} prefix_exact=true video_exact=true audio_exact=true",
+                    trajectory.len()
+                );
+            }
             let video: Vec<f64> = s.clone_dtoh(&video)?.into_iter().map(f64::from).collect();
             let audio: Vec<f64> = s.clone_dtoh(&audio)?.into_iter().map(f64::from).collect();
             ensure!(
@@ -13232,9 +13334,9 @@ mod tests {
             Ok([video, audio])
         };
         kernels.serial_norm_modulate.set(true);
-        let serial = chain((&video_grid, &audio_grid))?;
+        let serial = chain((&video_grid, &audio_grid), false)?;
         kernels.serial_norm_modulate.set(false);
-        let candidate = chain((&video_grid, &audio_grid))?;
+        let candidate = chain((&video_grid, &audio_grid), true)?;
         let bits: usize = candidate
             .iter()
             .zip(&serial)
@@ -13261,7 +13363,7 @@ mod tests {
                 bound > 0,
                 "dense trajectory gate did not qualify a projection"
             );
-            let parent = chain((&video_grid, &audio_grid))?;
+            let parent = chain((&video_grid, &audio_grid), false)?;
             blas.swap_dense_parents()?;
             for (name, a, b, tau) in [
                 (
@@ -13290,7 +13392,7 @@ mod tests {
                 );
             }
         }
-        let control = chain((&audio_grid, &video_grid))?;
+        let control = chain((&audio_grid, &video_grid), false)?;
         let c_video = distance(&control[0][condition..], &final_video_rows)?;
         let c_audio = distance(&control[1], &final_audio_rows)?;
         println!("H3_CHAIN swapped-grid control video={c_video:?} audio={c_audio:?}");
@@ -18115,7 +18217,7 @@ mod tests {
             }
             _ => anyhow::bail!("FF_H3_VIDEO_MODE must be minimax or hyperflow"),
         };
-        let make = |phase: usize, seed| -> Result<H3Request> {
+        let make = |phase: usize, seed, prompt: &str| -> Result<H3Request> {
             let (width, height) = (1344, 768);
             let image = crate::serve::image::RgbImage {
                 width,
@@ -18134,14 +18236,16 @@ mod tests {
             prepare_video(
                 &base,
                 &spec,
-                "a boat passing a stone pier",
+                prompt,
                 &[(KeyframeAnchor::First, &image)],
                 ((124, seed), schedule),
             )
         };
-        let request_a = make(0, 271)?;
-        let request_b = make(47, 379)?;
-        let media_control = make(0, 379)?;
+        let prompt = "a boat passing a stone pier";
+        let request_a = make(0, 271, prompt)?;
+        let text_control = make(47, 379, "a ship passing a stone pier")?;
+        let request_b = make(47, 379, prompt)?;
+        let media_control = make(0, 379, prompt)?;
         let runtime =
             std::env::temp_dir().join(format!("ff-h3-video-resident-{}", std::process::id()));
         std::fs::create_dir(&runtime)?;
@@ -18196,6 +18300,7 @@ mod tests {
                 let H3Output { video, audio, .. } = match request {
                     2 => session.render_with_reference(&request_b, &reference)?,
                     3 => session.render(&media_control)?,
+                    7 => session.render(&text_control)?,
                     _ => session.render(&request_b)?,
                 };
                 ensure!(
@@ -18206,6 +18311,8 @@ mod tests {
                 );
                 if request == 3 {
                     ensure!(video != fresh.video, "video ignored changed reference");
+                } else if request == 7 {
+                    ensure!(video != fresh.video, "video ignored changed text");
                 } else {
                     let rgb = video == fresh.video;
                     let pcm = pipeline::same_f32_bits(&audio, &fresh.audio);
