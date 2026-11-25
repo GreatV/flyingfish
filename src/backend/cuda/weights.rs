@@ -2063,8 +2063,8 @@ impl SupplyShared {
 pub(crate) struct LayerSupply {
     shared: Arc<SupplyShared>,
     handles: Vec<std::thread::JoinHandle<()>>,
-    /// Registered slot buffers; the field drops after the workers joined and the context
-    /// synchronized.
+    /// Registered slot buffers; the destructor unregisters them after the workers joined and
+    /// the context synchronized.
     registrations: SupplySlots,
 }
 
@@ -2077,8 +2077,12 @@ struct SupplySlots {
 }
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
-impl Drop for SupplySlots {
-    fn drop(&mut self) {
+impl SupplySlots {
+    /// Unregisters every buffer; a call after the first finds none.
+    fn unregister(&mut self) {
+        if self.buffers.is_empty() {
+            return;
+        }
         let context = &self.context;
         context.record_err(context.bind_to_thread());
         for (address, _) in self.buffers.drain(..) {
@@ -2096,6 +2100,13 @@ impl Drop for SupplySlots {
             #[cfg(test)]
             SUPPLY_UNREGISTERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+impl Drop for SupplySlots {
+    fn drop(&mut self) {
+        self.unregister();
     }
 }
 
@@ -2300,9 +2311,9 @@ impl Drop for LayerSupply {
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
-        self.shared
-            .context
-            .record_err(self.shared.context.synchronize());
+        let context = &self.shared.context;
+        context.record_err(context.synchronize());
+        self.registrations.unregister();
     }
 }
 
