@@ -2,11 +2,42 @@ use crate::config::Config;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceArchitecture {
     Cuda(u32),
     Hip(String),
+    Tpu(String),
+}
+
+impl Serialize for DeviceArchitecture {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct TpuTag<'a> {
+            tpu: &'a str,
+        }
+        match self {
+            Self::Cuda(sm) => serializer.serialize_u32(*sm),
+            Self::Hip(gfx) => serializer.serialize_str(gfx),
+            Self::Tpu(chip) => TpuTag { tpu: chip }.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DeviceArchitecture {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Cuda(u32),
+            Hip(String),
+            Tpu { tpu: String },
+        }
+        match Repr::deserialize(deserializer)? {
+            Repr::Cuda(sm) => Ok(Self::Cuda(sm)),
+            Repr::Hip(gfx) => Ok(Self::Hip(gfx)),
+            Repr::Tpu { tpu } => Ok(Self::Tpu(tpu)),
+        }
+    }
 }
 
 impl std::fmt::Display for DeviceArchitecture {
@@ -14,6 +45,7 @@ impl std::fmt::Display for DeviceArchitecture {
         match self {
             Self::Cuda(sm) => sm.fmt(f),
             Self::Hip(gfx) => gfx.fmt(f),
+            Self::Tpu(chip) => chip.fmt(f),
         }
     }
 }
@@ -108,7 +140,7 @@ impl DeviceArchitecture {
     #[cfg(any(test, feature = "cuda"))]
     pub(crate) fn published_f32_lt(&self) -> LtOperand {
         match self {
-            Self::Cuda(_) | Self::Hip(_) => LtOperand::F32,
+            Self::Cuda(_) | Self::Hip(_) | Self::Tpu(_) => LtOperand::F32,
         }
     }
 
@@ -125,7 +157,7 @@ impl DeviceArchitecture {
     pub(crate) fn image_d128_full_symbol(&self) -> &'static str {
         match self {
             Self::Cuda(sm) if *sm >= 80 => IMAGE_D128_SINGLE_PV,
-            Self::Cuda(_) | Self::Hip(_) => IMAGE_D128_RESIDUAL,
+            Self::Cuda(_) | Self::Hip(_) | Self::Tpu(_) => IMAGE_D128_RESIDUAL,
         }
     }
 
@@ -135,7 +167,7 @@ impl DeviceArchitecture {
         } else {
             match self {
                 Self::Cuda(sm) if *sm < 80 => DecoderNarrow::F32ToFp16,
-                Self::Cuda(_) | Self::Hip(_) => DecoderNarrow::F32ToBf16,
+                Self::Cuda(_) | Self::Hip(_) | Self::Tpu(_) => DecoderNarrow::F32ToBf16,
             }
         }
     }
@@ -143,7 +175,7 @@ impl DeviceArchitecture {
     pub(crate) fn decoder_f32_narrow_symbol(&self) -> &'static str {
         match self {
             Self::Cuda(sm) if *sm < 80 => DECODER_F32_NARROW_FP16,
-            Self::Cuda(_) | Self::Hip(_) => DECODER_F32_NARROW_BF16,
+            Self::Cuda(_) | Self::Hip(_) | Self::Tpu(_) => DECODER_F32_NARROW_BF16,
         }
     }
 }
@@ -620,5 +652,36 @@ mod long_tests {
         ));
         assert!(!crate::gdn_plan::GdnPolicy::for_device(&info75).cw_p2_for_step(5));
         assert!(crate::gdn_plan::GdnPolicy::for_device(&info89).cw_p2_for_step(5));
+    }
+
+    #[test]
+    fn tpu_architecture_serde_roundtrips_without_colliding_with_hip_or_cuda() -> Result<()> {
+        let cuda = DeviceArchitecture::Cuda(89);
+        let hip = DeviceArchitecture::Hip("gfx1100".into());
+        let tpu = DeviceArchitecture::Tpu("TPU v5 lite".into());
+        assert_eq!(serde_json::to_string(&cuda)?, "89");
+        assert_eq!(serde_json::to_string(&hip)?, "\"gfx1100\"");
+        let tpu_json = serde_json::to_string(&tpu)?;
+        assert_eq!(serde_json::from_str::<DeviceArchitecture>(&tpu_json)?, tpu);
+        assert_eq!(serde_json::from_str::<DeviceArchitecture>("89")?, cuda);
+        assert_eq!(
+            serde_json::from_str::<DeviceArchitecture>("\"gfx1100\"")?,
+            hip
+        );
+        let tpu_info = DeviceInfo {
+            name: "TPU v5 lite".into(),
+            arch: tpu,
+            sms: 1,
+            l2_bytes: 0,
+            warp: 128,
+            max_threads: 1,
+            shared_bytes: 0,
+            sm_shared_bytes: 0,
+            cooperative: false,
+            optin_shared_bytes: 0,
+            memory_bytes_per_second: 0.0,
+        };
+        assert!(tpu_info.require_cuda_tensor_ops("convrot").is_err());
+        Ok(())
     }
 }

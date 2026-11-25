@@ -12,6 +12,10 @@ pub mod setup;
 pub mod gpu;
 #[cfg(feature = "rocm")]
 pub mod hip;
+#[cfg(feature = "tpu")]
+pub mod tpu;
+#[cfg(feature = "tpu")]
+pub use tpu::TpuDevice as BackendDevice;
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) mod cuda;

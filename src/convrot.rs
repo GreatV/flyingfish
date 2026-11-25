@@ -997,6 +997,7 @@ impl ProductKernel {
                 Self::NFast | Self::MFastLdsm { .. } | Self::MFastStriped { .. } => 32_768,
                 Self::NFastLdsm | Self::NFastSwizzled { .. } => 49_152,
             },
+            crate::backend::setup::DeviceArchitecture::Tpu(_) => 0,
         }
     }
 
@@ -1007,6 +1008,7 @@ impl ProductKernel {
                 Self::NFast | Self::MFastLdsm { .. } | Self::MFastStriped { .. } => (128, 128),
                 Self::NFastLdsm | Self::NFastSwizzled { .. } => (128, 256),
             },
+            crate::backend::setup::DeviceArchitecture::Tpu(_) => (0, 0),
         }
     }
 
@@ -1018,6 +1020,7 @@ impl ProductKernel {
                 Self::NFast | Self::MFastLdsm { .. } | Self::MFastStriped { .. } => 256,
                 Self::NFastLdsm | Self::NFastSwizzled { .. } => 512,
             },
+            crate::backend::setup::DeviceArchitecture::Tpu(_) => 0,
         }
     }
 
@@ -1029,6 +1032,7 @@ impl ProductKernel {
                 Self::NFast | Self::MFastLdsm { .. } | Self::MFastStriped { .. } => (216, 2),
                 Self::NFastLdsm | Self::NFastSwizzled { .. } => (216, 1),
             },
+            crate::backend::setup::DeviceArchitecture::Tpu(_) => (0, 0),
         }
     }
 
@@ -1070,10 +1074,11 @@ impl ProductKernel {
 
 #[cfg(any(test, feature = "cuda", feature = "rocm"))]
 fn arch_supported(arch: &crate::backend::setup::DeviceArchitecture) -> bool {
-    use crate::backend::setup::DeviceArchitecture::{Cuda, Hip};
+    use crate::backend::setup::DeviceArchitecture::{Cuda, Hip, Tpu};
     match arch {
         Cuda(sm) => *sm >= 80,
         Hip(gfx) => gfx.starts_with("gfx11"),
+        Tpu(_) => false,
     }
 }
 
