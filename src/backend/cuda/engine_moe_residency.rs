@@ -14,7 +14,6 @@ use std::cell::RefCell;
 #[path = "engine_moe_prefill.rs"]
 mod prefill;
 pub(in crate::backend::cuda::engine) use prefill::Prefill;
-pub(in crate::backend::cuda) use prefill::ReadAhead;
 pub(super) use prefill::{cpu_bound, peer_prefill_bytes};
 
 #[derive(Clone)]
@@ -169,48 +168,6 @@ impl Reader {
             let result = unsafe { device.ctx.register_host(address, bytes, portable) };
             result
                 .with_context(|| format!("register expert disk ring: slot={slot} bytes={bytes}"))?;
-            reader.registrations.push(address);
-        }
-        Ok(reader)
-    }
-
-    pub(in crate::backend::cuda) fn new_ranges(
-        device: &Device,
-        disk: DiskReader,
-        ranges: Vec<Vec<(u64, crate::experts::catalogue::NativeRange)>>,
-        chunk_bytes: u64,
-    ) -> Result<Self> {
-        let slots = disk.ring_slots() as usize;
-        let spans = disk.ring_spans();
-        let mut reader = Self {
-            disk,
-            context: device.ctx.clone(),
-            registrations: Vec::with_capacity(slots),
-            copied: vec![None; slots],
-            catalogue: None,
-            ranges,
-            chunk_bytes,
-        };
-        device.ctx.bind_to_thread()?;
-        for (slot, (address, bytes)) in spans.into_iter().enumerate() {
-            ensure!(
-                !reader.registrations.contains(&address),
-                "disk ring registration repeated address={address:#x}"
-            );
-            // SAFETY: the reader owns every stable ring allocation through unregister.
-            #[cfg(feature = "cuda")]
-            let result = unsafe {
-                cudarc::driver::sys::cuMemHostRegister_v2(
-                    address as *mut std::ffi::c_void,
-                    bytes,
-                    0,
-                )
-                .result()
-            };
-            #[cfg(feature = "rocm")]
-            let result = unsafe { device.ctx.register_host(address, bytes, false) };
-            result
-                .with_context(|| format!("register dense disk ring: slot={slot} bytes={bytes}"))?;
             reader.registrations.push(address);
         }
         Ok(reader)

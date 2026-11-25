@@ -3624,7 +3624,7 @@ impl Engine {
             .and_then(|n| n.checked_add(fixed))
             .context("dense workspace reservation overflow")?;
             WeightCatalog::load_dense(
-                dir,
+                (dir, &runtime),
                 &model_spec,
                 &device,
                 transient,
