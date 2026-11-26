@@ -2,6 +2,7 @@
 
 pub mod dit_block;
 pub mod hlo;
+pub mod minimax_h3;
 pub mod pjrt;
 pub mod plan;
 
@@ -53,6 +54,15 @@ pub struct TpuDevice {
 }
 
 impl TpuDevice {
+    /// Opens `FF_TPU_LIB` when set, otherwise loads `libtpu.so` from the dynamic linker search path.
+    pub fn open_default(device_index: usize) -> Result<Self> {
+        let lib_path = std::env::var_os("FF_TPU_LIB")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("libtpu.so"));
+        Self::open(&lib_path, device_index)
+    }
+
     pub fn open(library_path: &Path, device_index: usize) -> Result<Self> {
         let api = PjrtApi::load(library_path)?;
         let plugin_attributes = api.plugin_attributes()?;
@@ -244,11 +254,69 @@ impl TpuDevice {
         })
     }
 
+    pub fn upload_f32(
+        &self,
+        data: &[f32],
+        dims: &[i64],
+        semantics: HostSemantics,
+    ) -> Result<TpuBuffer> {
+        self.upload_f32_to_memory(data, dims, semantics, None)
+    }
+
+    pub fn upload_f32_to_memory(
+        &self,
+        data: &[f32],
+        dims: &[i64],
+        semantics: HostSemantics,
+        target_memory: Option<&MemoryKindInfo>,
+    ) -> Result<TpuBuffer> {
+        let elems = checked_elements(dims)?;
+        ensure!(
+            data.len() == elems,
+            "upload_f32 length {} != dims product {elems}",
+            data.len()
+        );
+        let (device, memory) = match target_memory {
+            Some(info) => (ptr::null_mut(), info.handle),
+            None => (self.device, ptr::null_mut()),
+        };
+        let handle = unsafe {
+            self.inner.api.buffer_from_host_buffer(
+                self.inner.client,
+                HostBufferSpec {
+                    data: data.as_ptr() as *const c_void,
+                    buffer_type: BufferType::F32,
+                    dims,
+                    semantics,
+                    device,
+                    memory,
+                },
+            )?
+        };
+        Ok(TpuBuffer {
+            inner: Rc::clone(&self.inner),
+            handle,
+            byte_len: elems * BufferType::F32.byte_width(),
+        })
+    }
+
     pub fn copy_buffer_to_default_hbm(&self, src: &TpuBuffer) -> Result<TpuBuffer> {
         let handle = self
             .inner
             .api
             .buffer_copy_to_memory(src.handle, self.default_memory)?;
+        Ok(TpuBuffer {
+            inner: Rc::clone(&self.inner),
+            handle,
+            byte_len: src.byte_len,
+        })
+    }
+
+    pub fn copy_buffer_to_default_hbm_async(&self, src: &TpuBuffer) -> Result<TpuBuffer> {
+        let handle = self
+            .inner
+            .api
+            .buffer_copy_to_memory_async(src.handle, self.default_memory)?;
         Ok(TpuBuffer {
             inner: Rc::clone(&self.inner),
             handle,
@@ -335,6 +403,10 @@ impl TpuBuffer {
         Ok(out)
     }
 
+    pub fn await_ready(&self) -> Result<()> {
+        self.inner.api.await_buffer_ready(self.handle)
+    }
+
     pub fn download_bf16(&self) -> Result<Vec<bf16>> {
         ensure!(
             self.byte_len.is_multiple_of(2),
@@ -349,11 +421,51 @@ impl TpuBuffer {
             .map(|&c| bf16::from_le_bytes(c))
             .collect())
     }
+
+    pub fn download_f32(&self) -> Result<Vec<f32>> {
+        ensure!(
+            self.byte_len.is_multiple_of(4),
+            "F32 buffer byte length {} is not divisible by 4",
+            self.byte_len
+        );
+        let bytes = self.download_bytes()?;
+        Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
+            .collect())
+    }
 }
 
 impl Drop for TpuBuffer {
     fn drop(&mut self) {
         self.inner.api.destroy_buffer(self.handle);
+    }
+}
+
+pub struct TpuEvent {
+    inner: Rc<ClientInner>,
+    handle: *mut c_void,
+}
+
+impl TpuEvent {
+    pub fn wait(mut self) -> Result<()> {
+        let h = self.handle;
+        self.handle = ptr::null_mut();
+        self.inner
+            .api
+            .await_and_destroy_event(h, "PJRT_LoadedExecutable_Execute")
+    }
+}
+
+impl Drop for TpuEvent {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            let h = self.handle;
+            self.handle = ptr::null_mut();
+            let _ = self.inner.api.await_and_destroy_event(h, "TpuEvent::drop");
+        }
     }
 }
 
@@ -370,6 +482,16 @@ impl TpuExecutable {
         inputs: &[&TpuBuffer],
         output_byte_lens: &[usize],
     ) -> Result<Vec<TpuBuffer>> {
+        let (outputs, event) = self.execute_async(inputs, output_byte_lens)?;
+        event.wait()?;
+        Ok(outputs)
+    }
+
+    pub fn execute_async(
+        &self,
+        inputs: &[&TpuBuffer],
+        output_byte_lens: &[usize],
+    ) -> Result<(Vec<TpuBuffer>, TpuEvent)> {
         ensure!(
             output_byte_lens.len() == self.num_outputs,
             "executable produces {} outputs, caller supplied {} byte lengths",
@@ -377,11 +499,11 @@ impl TpuExecutable {
             output_byte_lens.len()
         );
         let handles: Vec<*mut c_void> = inputs.iter().map(|b| b.handle).collect();
-        let raw_outs =
+        let (raw_outs, event_handle) =
             self.inner
                 .api
-                .execute_single_device(self.handle, &handles, self.num_outputs)?;
-        Ok(raw_outs
+                .execute_single_device_async(self.handle, &handles, self.num_outputs)?;
+        let outputs = raw_outs
             .into_iter()
             .zip(output_byte_lens.iter().copied())
             .map(|(handle, byte_len)| TpuBuffer {
@@ -389,7 +511,14 @@ impl TpuExecutable {
                 handle,
                 byte_len,
             })
-            .collect())
+            .collect();
+        Ok((
+            outputs,
+            TpuEvent {
+                inner: Rc::clone(&self.inner),
+                handle: event_handle,
+            },
+        ))
     }
 }
 

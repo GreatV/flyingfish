@@ -10,12 +10,19 @@ use flyingfish::{
             load_block_adaln_proj_from_shard, load_time_embedder_from_shard,
         },
         hlo::{emit_bf16_attention, emit_bf16_matmul},
+        minimax_h3::{
+            ConditionerReport, DitSampleOptions, DitSampleReport, VaeDecodeOptions,
+            VaeDecodeReport, image_decode_with_device, image_latents_with_device,
+            image_sample_with_device, run_conditioner_with_device, run_norm_out_pdd_with_device,
+        },
         pjrt::{CompiledMemoryStats, HostSemantics},
         plan::{BlockPlacement, ModelFootprint, TpuPlacementPlan, TpuTopology},
     },
+    media::write_png,
     minimax_h3::{
-        AdalnPlan, ImageSchedule, ImageSpec, TEXT_TAG, image_latent_extent, image_layout,
-        image_row_plan, rotary_rows,
+        AdalnPlan, ImageRequest, ImageSchedule, ImageSpec, TEXT_TAG, image_latent_extent,
+        image_layout, image_noise_draw, image_rgb8, image_row_plan, rotary_rows,
+        unpatchify_latents,
     },
 };
 use half::bf16;
@@ -60,6 +67,37 @@ const H3_ATTN_WIDTH: usize = H3_HEADS * H3_HEAD_DIM;
 const H3_ROWS_1024: usize = 1031;
 const H3_ROWS_2048: usize = 4103;
 const HBM_RELEASE_SLACK_BYTES: i64 = 16 * 1024 * 1024;
+
+// Frozen 3.0x ref_bf16 vs ref_f32 floors (1024x512, "a red cube on a blue table", seed 42, allow_tf32=False):
+// Stage 1 (RTX 4090 sm89): rel_l2=1.129761e-2, rel_max_abs=1.060895e-2
+// Stage 2 Step-0 vel (L4 sm89): rel_l2=1.510285e-2, rel_max_abs=1.619548e-2
+// Stage 2 PDD F32 probe (L4 sm89): BF16-dot error=2.852514e-3, head5-vs-head0=7.501377e-2
+// Stage 2 6-step latent (L4 sm89): rel_l2=1.905240e-1, rel_max_abs=5.027437e-1
+// Stage 3 VAE canvas (L4 sm89): rel_l2=2.825602e-3, rel_max_abs=5.240450e-2, rgb8_mean_abs=0.254349
+// Composed E2E (L4 sm89): latent 1.878862e-1 / 5.607637e-1, canvas 1.368177e-1 / 8.097732e-1 / 8.850106
+const STEP3_PROMPT: &str = "a red cube on a blue table";
+const STEP3_WIDTH: usize = 1024;
+const STEP3_HEIGHT: usize = 512;
+const STEP3_MIN_AREA: usize = 1024;
+const STEP3_SEED: u64 = 42;
+const STEP3_COND_REL_L2_TOL: f64 = 3.389282e-2;
+const STEP3_COND_REL_MAX_ABS_TOL: f64 = 3.182686e-2;
+const STEP3_DIT_STEP0_REL_L2_TOL: f64 = 4.530854e-2;
+const STEP3_DIT_STEP0_REL_MAX_ABS_TOL: f64 = 4.858644e-2;
+const STEP3_PDD_F32_REL_L2_TOL: f64 = 1.0e-3;
+const STEP3_PDD_F32_REL_MAX_ABS_TOL: f64 = 2.0e-3;
+const STEP3_PDD_HEAD5_VS_HEAD0_MIN_REL_L2: f64 = 5.0e-2;
+const STEP3_DIT_FINAL_REL_L2_TOL: f64 = 5.715719e-1;
+const STEP3_DIT_FINAL_REL_MAX_ABS_TOL: f64 = 1.508231;
+const STEP3_VAE_CANVAS_REL_L2_TOL: f64 = 8.476805e-3;
+const STEP3_VAE_CANVAS_REL_MAX_ABS_TOL: f64 = 1.572135e-1;
+const STEP3_VAE_RGB8_MEAN_ABS_TOL: f64 = 0.763048;
+const STEP3_E2E_LATENT_REL_L2_TOL: f64 = 5.636585e-1;
+const STEP3_E2E_LATENT_REL_MAX_ABS_TOL: f64 = 1.682291;
+const STEP3_E2E_CANVAS_REL_L2_TOL: f64 = 4.104531e-1;
+const STEP3_E2E_CANVAS_REL_MAX_ABS_TOL: f64 = 2.429319;
+const STEP3_E2E_RGB8_MEAN_ABS_TOL: f64 = 26.550318;
+const STEP3_CONTROL_MIN_MULT: f64 = 3.0;
 
 #[derive(Clone, Debug, Serialize)]
 struct BlockMetrics {
@@ -969,5 +1007,734 @@ fn tpu_h3_image_dit_block0_gate() -> Result<()> {
         "TPU_STEP2_RESULT overall_pass={overall_pass} cases_pass={all_cases_pass} controls_pass={all_controls_pass}"
     );
     ensure!(overall_pass, "TPU Step 2 H3-Image DiT block 0 gate failed");
+    Ok(())
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct Rgb8Metrics {
+    elements: usize,
+    max_abs: u32,
+    mean_abs: f64,
+    rmse: f64,
+    pct_exact: f64,
+    pct_le1: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PddProbeReport {
+    head0: BlockMetrics,
+    head5: BlockMetrics,
+    head5_vs_head0: BlockMetrics,
+    passed: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DiskForcedReport {
+    disk_blocks: usize,
+    host_cap_bytes: u64,
+    bit_diffs: usize,
+    passed: bool,
+    live_plan: TpuPlacementPlan,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct Step3Summary {
+    device: flyingfish::backend::tpu::DeviceAttributes,
+    prompt: String,
+    width: usize,
+    height: usize,
+    seed: u64,
+    init_noise_bit_diffs: usize,
+    conditioner: ConditionerReport,
+    conditioner_metrics: BlockMetrics,
+    pdd_probe: PddProbeReport,
+    dit_report: DitSampleReport,
+    dit_step0_metrics: BlockMetrics,
+    dit_final_metrics: BlockMetrics,
+    dit_forced_disk: DiskForcedReport,
+    dit_controls: Vec<ControlReport>,
+    vae_report: VaeDecodeReport,
+    vae_canvas_metrics: BlockMetrics,
+    vae_rgb8_metrics: Rgb8Metrics,
+    vae_rope_control: ControlReport,
+    e2e_latent_metrics: BlockMetrics,
+    e2e_canvas_metrics: BlockMetrics,
+    e2e_rgb8_metrics: Rgb8Metrics,
+    passed: bool,
+}
+
+struct Step3Fixtures {
+    token_ids: Vec<u32>,
+    cond_ref_bf16: Vec<bf16>,
+    init_noise: Vec<f32>,
+    position_ids: Vec<[f64; 3]>,
+    token_tags: Vec<u8>,
+    vel0_ref_bf16: Vec<f32>,
+    step0_pre_norm_out_bf16: Vec<bf16>,
+    pdd_head0_vel_f32: Vec<f32>,
+    pdd_head5_vel_f32: Vec<f32>,
+    final_latent_ref: Vec<f32>,
+    vae_canvas_ref: Vec<f32>,
+    vae_rgb8_ref: Vec<u8>,
+}
+
+fn compute_f32_metrics(cand: &[f32], reference: &[f32]) -> Result<BlockMetrics> {
+    ensure!(
+        cand.len() == reference.len() && !cand.is_empty(),
+        "f32 metric slice length mismatch {} vs {}",
+        cand.len(),
+        reference.len()
+    );
+    let mut all_finite = true;
+    let mut max_abs = 0.0f64;
+    let mut ref_max_abs = 0.0f64;
+    let mut sq_err = 0.0f64;
+    let mut sq_ref = 0.0f64;
+    for (&c, &r) in cand.iter().zip(reference) {
+        let cf = f64::from(c);
+        let rf = f64::from(r);
+        if !cf.is_finite() || !rf.is_finite() {
+            all_finite = false;
+        }
+        let d = (cf - rf).abs();
+        max_abs = max_abs.max(d);
+        ref_max_abs = ref_max_abs.max(rf.abs());
+        sq_err += d * d;
+        sq_ref += rf * rf;
+    }
+    ensure!(ref_max_abs > 0.0 && sq_ref > 0.0, "zero reference tensor");
+    let n = cand.len() as f64;
+    Ok(BlockMetrics {
+        elements: cand.len(),
+        all_finite,
+        max_abs,
+        rmse: (sq_err / n).sqrt(),
+        ref_rms: (sq_ref / n).sqrt(),
+        ref_max_abs,
+        rel_l2: (sq_err / sq_ref).sqrt(),
+        rel_max_abs: max_abs / ref_max_abs,
+    })
+}
+
+fn compute_rgb8_metrics(cand: &[u8], reference: &[u8]) -> Result<Rgb8Metrics> {
+    ensure!(
+        cand.len() == reference.len() && !cand.is_empty(),
+        "rgb8 slice length mismatch {} vs {}",
+        cand.len(),
+        reference.len()
+    );
+    let mut max_abs = 0u32;
+    let mut sum_abs = 0u64;
+    let mut sum_sq = 0u64;
+    let mut exact = 0usize;
+    let mut le1 = 0usize;
+    for (&c, &r) in cand.iter().zip(reference) {
+        let d = u32::from(c.abs_diff(r));
+        max_abs = max_abs.max(d);
+        sum_abs += u64::from(d);
+        sum_sq += u64::from(d) * u64::from(d);
+        if d == 0 {
+            exact += 1;
+        }
+        if d <= 1 {
+            le1 += 1;
+        }
+    }
+    let n = cand.len() as f64;
+    Ok(Rgb8Metrics {
+        elements: cand.len(),
+        max_abs,
+        mean_abs: sum_abs as f64 / n,
+        rmse: (sum_sq as f64 / n).sqrt(),
+        pct_exact: (exact as f64 / n) * 100.0,
+        pct_le1: (le1 as f64 / n) * 100.0,
+    })
+}
+
+fn open_st_file(path: &Path) -> Result<memmap2::Mmap> {
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    // SAFETY: read-only memory map of a frozen fixture file.
+    unsafe { MmapOptions::new().map(&file) }.with_context(|| format!("mmap {}", path.display()))
+}
+
+fn st_read_bf16(st: &SafeTensors<'_>, name: &str, shape: &[usize]) -> Result<Vec<bf16>> {
+    let v = st.tensor(name).with_context(|| format!("missing {name}"))?;
+    ensure!(
+        v.dtype() == Dtype::BF16 && v.shape() == shape,
+        "{name} dtype/shape mismatch: {:?} {:?}",
+        v.dtype(),
+        v.shape()
+    );
+    Ok(v.data()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&c| bf16::from_le_bytes(c))
+        .collect())
+}
+
+fn st_read_f32(st: &SafeTensors<'_>, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
+    let v = st.tensor(name).with_context(|| format!("missing {name}"))?;
+    ensure!(
+        v.dtype() == Dtype::F32 && v.shape() == shape,
+        "{name} dtype/shape mismatch: {:?} {:?}",
+        v.dtype(),
+        v.shape()
+    );
+    Ok(v.data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&c| f32::from_le_bytes(c))
+        .collect())
+}
+
+fn load_step3_fixtures(dir: &Path, spec: &ImageSpec) -> Result<Step3Fixtures> {
+    let cond_mm = open_st_file(&dir.join("cond_ref_bf16.safetensors"))?;
+    let cond_st = SafeTensors::deserialize(&cond_mm)?;
+    let tids_v = cond_st.tensor("token_ids").context("missing token_ids")?;
+    ensure!(
+        tids_v.dtype() == Dtype::I32 && tids_v.shape().len() == 1,
+        "token_ids dtype/shape mismatch"
+    );
+    let text_rows = tids_v.shape()[0];
+    let token_ids: Vec<u32> = tids_v
+        .data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&c| u32::try_from(i32::from_le_bytes(c)).context("negative token_id"))
+        .collect::<Result<Vec<_>>>()?;
+    let cond_ref_bf16 = st_read_bf16(&cond_st, "prompt_embeds", &[text_rows, spec.text_dim])?;
+
+    let (lh, lw) = image_latent_extent(spec, STEP3_HEIGHT, STEP3_WIDTH)?;
+    let img_rows = (lh / spec.patch[1]) * (lw / spec.patch[2]);
+    let total_rows = text_rows + img_rows;
+    let patch_dim = spec.row_width();
+
+    let noise_mm = open_st_file(&dir.join("init_noise.safetensors"))?;
+    let noise_st = SafeTensors::deserialize(&noise_mm)?;
+    let init_noise = st_read_f32(&noise_st, "init_noise", &[img_rows, patch_dim])?;
+    let pos_v = noise_st
+        .tensor("position_ids")
+        .context("missing position_ids")?;
+    ensure!(
+        pos_v.dtype() == Dtype::F64 && pos_v.shape() == [total_rows, 3],
+        "position_ids dtype/shape mismatch"
+    );
+    let pos_f64: Vec<f64> = pos_v
+        .data()
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|&c| f64::from_le_bytes(c))
+        .collect();
+    let position_ids: Vec<[f64; 3]> = pos_f64.as_chunks::<3>().0.to_vec();
+    let tags_v = noise_st
+        .tensor("token_tags")
+        .context("missing token_tags")?;
+    ensure!(
+        tags_v.dtype() == Dtype::U8 && tags_v.shape() == [total_rows],
+        "token_tags dtype/shape mismatch"
+    );
+    let token_tags = tags_v.data().to_vec();
+
+    let pdd_mm = open_st_file(&dir.join("dit_step0_and_pdd_ref.safetensors"))?;
+    let pdd_st = SafeTensors::deserialize(&pdd_mm)?;
+    let vel0_ref_bf16 = st_read_f32(&pdd_st, "vel0_ref_bf16", &[img_rows, patch_dim])?;
+    let step0_pre_norm_out_bf16 = st_read_bf16(
+        &pdd_st,
+        "step0_pre_norm_out_bf16",
+        &[total_rows, spec.hidden],
+    )?;
+    let pdd_head0_vel_f32 = st_read_f32(&pdd_st, "pdd_head0_vel_f32", &[img_rows, patch_dim])?;
+    let pdd_head5_vel_f32 = st_read_f32(&pdd_st, "pdd_head5_vel_f32", &[img_rows, patch_dim])?;
+
+    let dit_mm = open_st_file(&dir.join("dit_final_latent_ref_bf16.safetensors"))?;
+    let dit_st = SafeTensors::deserialize(&dit_mm)?;
+    let final_latent_ref = st_read_f32(&dit_st, "final_latent", &[spec.in_channels, lh, lw])?;
+
+    let vae_mm = open_st_file(&dir.join("vae_ref_bf16.safetensors"))?;
+    let vae_st = SafeTensors::deserialize(&vae_mm)?;
+    let vae_canvas_ref = st_read_f32(&vae_st, "canvas", &[STEP3_HEIGHT, STEP3_WIDTH, 3])?;
+    let rgb_v = vae_st.tensor("rgb8").context("missing rgb8")?;
+    ensure!(
+        rgb_v.dtype() == Dtype::U8 && rgb_v.shape() == [STEP3_HEIGHT, STEP3_WIDTH, 3],
+        "rgb8 dtype/shape mismatch"
+    );
+    let vae_rgb8_ref = rgb_v.data().to_vec();
+
+    Ok(Step3Fixtures {
+        token_ids,
+        cond_ref_bf16,
+        init_noise,
+        position_ids,
+        token_tags,
+        vel0_ref_bf16,
+        step0_pre_norm_out_bf16,
+        pdd_head0_vel_f32,
+        pdd_head5_vel_f32,
+        final_latent_ref,
+        vae_canvas_ref,
+        vae_rgb8_ref,
+    })
+}
+
+fn write_rgb_png(path: &Path, width: usize, height: usize, rgb: &[u8]) -> Result<()> {
+    let mut file = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    write_png(&mut file, width, height, rgb)
+}
+
+fn run_step3_pdd_probe(
+    dev: &TpuDevice,
+    model: &Path,
+    text_rows: usize,
+    fix: &Step3Fixtures,
+) -> Result<PddProbeReport> {
+    let got_h0 =
+        run_norm_out_pdd_with_device(dev, model, text_rows, &fix.step0_pre_norm_out_bf16, 0, 0)?;
+    let got_h5 =
+        run_norm_out_pdd_with_device(dev, model, text_rows, &fix.step0_pre_norm_out_bf16, 0, 5)?;
+    let head0 = compute_f32_metrics(&got_h0, &fix.pdd_head0_vel_f32)?;
+    let head5 = compute_f32_metrics(&got_h5, &fix.pdd_head5_vel_f32)?;
+    let head5_vs_head0 = compute_f32_metrics(&got_h5, &fix.pdd_head0_vel_f32)?;
+    let passed = head0.all_finite
+        && head5.all_finite
+        && head0.rel_l2 <= STEP3_PDD_F32_REL_L2_TOL
+        && head0.rel_max_abs <= STEP3_PDD_F32_REL_MAX_ABS_TOL
+        && head5.rel_l2 <= STEP3_PDD_F32_REL_L2_TOL
+        && head5.rel_max_abs <= STEP3_PDD_F32_REL_MAX_ABS_TOL
+        && head5_vs_head0.rel_l2 > STEP3_PDD_HEAD5_VS_HEAD0_MIN_REL_L2;
+    println!(
+        "TPU_STEP3_PDD_F32_PROBE head0_rel_l2={:.6e} head5_rel_l2={:.6e} head5_vs_head0_rel_l2={:.6e} pass={passed}",
+        head0.rel_l2, head5.rel_l2, head5_vs_head0.rel_l2
+    );
+    Ok(PddProbeReport {
+        head0,
+        head5,
+        head5_vs_head0,
+        passed,
+    })
+}
+
+fn run_step3_dit_controls(
+    dev: &TpuDevice,
+    model: &Path,
+    spec: &ImageSpec,
+    layout: &flyingfish::minimax_h3::ImageLayout,
+    fix: &Step3Fixtures,
+    latent_extent: [usize; 2],
+) -> Result<Vec<ControlReport>> {
+    let mut controls = Vec::with_capacity(3);
+    let min_step0 = STEP3_CONTROL_MIN_MULT * STEP3_DIT_STEP0_REL_L2_TOL;
+    let min_final = STEP3_CONTROL_MIN_MULT * STEP3_DIT_FINAL_REL_L2_TOL;
+
+    // Control 1: non-square 16x32 RoPE (h, w) transpose on step-0 velocity.
+    let (_, rep_rope) = image_sample_with_device(
+        dev,
+        model,
+        layout,
+        &fix.init_noise,
+        &fix.cond_ref_bf16,
+        &DitSampleOptions {
+            transpose_rope_hw: true,
+            stop_after_step0: true,
+            ..Default::default()
+        },
+    )?;
+    let m_rope = compute_f32_metrics(&rep_rope.step0_velocity, &fix.vel0_ref_bf16)?;
+    let c_rope = ControlReport {
+        name: "dit_step0_rope_hw_transpose".into(),
+        rel_l2: m_rope.rel_l2,
+        rel_max_abs: m_rope.rel_max_abs,
+        min_expected_rel_l2: min_step0,
+        failed_as_required: m_rope.rel_l2 > min_step0,
+    };
+    println!(
+        "TPU_STEP3_CONTROL name={} rel_l2={:.6e} min_expected={:.6e} mult_over_tol={:.2}x failed_as_required={}",
+        c_rope.name,
+        c_rope.rel_l2,
+        c_rope.min_expected_rel_l2,
+        c_rope.rel_l2 / STEP3_DIT_STEP0_REL_L2_TOL,
+        c_rope.failed_as_required
+    );
+    controls.push(c_rope);
+
+    // Control 2: wrong step-0 timestep index (timesteps[5] instead of timesteps[0]).
+    let (_, rep_ts) = image_sample_with_device(
+        dev,
+        model,
+        layout,
+        &fix.init_noise,
+        &fix.cond_ref_bf16,
+        &DitSampleOptions {
+            wrong_step0_timestep_index: Some(5),
+            stop_after_step0: true,
+            ..Default::default()
+        },
+    )?;
+    let m_ts = compute_f32_metrics(&rep_ts.step0_velocity, &fix.vel0_ref_bf16)?;
+    let c_ts = ControlReport {
+        name: "dit_step0_wrong_timestep".into(),
+        rel_l2: m_ts.rel_l2,
+        rel_max_abs: m_ts.rel_max_abs,
+        min_expected_rel_l2: min_step0,
+        failed_as_required: m_ts.rel_l2 > min_step0,
+    };
+    println!(
+        "TPU_STEP3_CONTROL name={} rel_l2={:.6e} min_expected={:.6e} mult_over_tol={:.2}x failed_as_required={}",
+        c_ts.name,
+        c_ts.rel_l2,
+        c_ts.min_expected_rel_l2,
+        c_ts.rel_l2 / STEP3_DIT_STEP0_REL_L2_TOL,
+        c_ts.failed_as_required
+    );
+    controls.push(c_ts);
+
+    // Control 3: negated velocity Euler sign (`latents -= dt * vel`) over all 6 steps.
+    let (bad_rows, _) = image_sample_with_device(
+        dev,
+        model,
+        layout,
+        &fix.init_noise,
+        &fix.cond_ref_bf16,
+        &DitSampleOptions {
+            negate_euler_velocity: true,
+            ..Default::default()
+        },
+    )?;
+    let bad_lat = unpatchify_latents(
+        &bad_rows,
+        (spec.in_channels, 1, latent_extent[0], latent_extent[1]),
+        spec.patch,
+    );
+    let m_euler = compute_f32_metrics(&bad_lat, &fix.final_latent_ref)?;
+    let c_euler = ControlReport {
+        name: "dit_final_wrong_euler_sign".into(),
+        rel_l2: m_euler.rel_l2,
+        rel_max_abs: m_euler.rel_max_abs,
+        min_expected_rel_l2: min_final,
+        failed_as_required: m_euler.rel_l2 > min_final,
+    };
+    println!(
+        "TPU_STEP3_CONTROL name={} rel_l2={:.6e} min_expected={:.6e} mult_over_tol={:.2}x failed_as_required={}",
+        c_euler.name,
+        c_euler.rel_l2,
+        c_euler.min_expected_rel_l2,
+        c_euler.rel_l2 / STEP3_DIT_FINAL_REL_L2_TOL,
+        c_euler.failed_as_required
+    );
+    controls.push(c_euler);
+    Ok(controls)
+}
+
+#[test]
+#[ignore = "TPU; FF_TPU_LIB, FF_H3_IMAGE_MODEL, FF_TPU_STEP3_FIXTURES"]
+fn tpu_h3_image_full_pipeline_gate() -> Result<()> {
+    let lib_path = env_path("FF_TPU_LIB")?;
+    let model = env_path("FF_H3_IMAGE_MODEL")?;
+    let fixtures_dir = env_path("FF_TPU_STEP3_FIXTURES")?;
+    let out_dir = env::var_os("FF_TPU_GATE_OUT").map(PathBuf::from);
+
+    let spec = ImageSpec::read(&model)?;
+    let fix = load_step3_fixtures(&fixtures_dir, &spec)?;
+    let (lh, lw) = image_latent_extent(&spec, STEP3_HEIGHT, STEP3_WIDTH)?;
+    let text_rows = fix.token_ids.len();
+    let text_tags = vec![TEXT_TAG; text_rows];
+    let layout = image_layout(&spec, &text_tags, &[], lh, lw)?;
+    ensure!(
+        layout.position_ids == fix.position_ids && layout.token_tags == fix.token_tags,
+        "Step 3 layout does not match frozen init_noise fixture"
+    );
+
+    // Stage 0: CPU image_noise_draw bit-exact against frozen init_noise fixture.
+    let cpu_noise = image_noise_draw(STEP3_SEED, fix.init_noise.len());
+    let init_noise_bit_diffs = cpu_noise
+        .iter()
+        .zip(&fix.init_noise)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    println!(
+        "TPU_STEP3_STAGE0_NOISE elems={} bit_diffs={init_noise_bit_diffs}",
+        fix.init_noise.len()
+    );
+    ensure!(
+        init_noise_bit_diffs == 0,
+        "CPU image_noise_draw differed from init_noise fixture on {init_noise_bit_diffs} entries"
+    );
+
+    let dev = TpuDevice::open(&lib_path, 0)?;
+
+    // Stage 1: Qwen3-VL text conditioner (50 layers, selective 11 shards).
+    let (cond_tpu, cond_report) = run_conditioner_with_device(&dev, &model, &fix.token_ids)?;
+    let cond_metrics = compute_metrics(&cond_tpu, &fix.cond_ref_bf16)?;
+    let cond_hbm_ok =
+        cond_report.hbm_after_drop_bytes <= cond_report.hbm_before_bytes + HBM_RELEASE_SLACK_BYTES;
+    let cond_pass = cond_metrics.all_finite
+        && cond_metrics.rel_l2 <= STEP3_COND_REL_L2_TOL
+        && cond_metrics.rel_max_abs <= STEP3_COND_REL_MAX_ABS_TOL
+        && cond_hbm_ok;
+    println!(
+        "TPU_STEP3_STAGE1_COND layers={} rel_l2={:.6e} rel_max_abs={:.6e} hbm_before={} hbm_after={} elapsed_ms={:.1} pass={cond_pass}",
+        cond_report.layers_run,
+        cond_metrics.rel_l2,
+        cond_metrics.rel_max_abs,
+        cond_report.hbm_before_bytes,
+        cond_report.hbm_after_drop_bytes,
+        cond_report.elapsed_ms
+    );
+
+    // Stage 2a: Direct F32 norm_out + pdd_proj_out head-0/5 & HIGHEST precision probe.
+    let pdd_probe = run_step3_pdd_probe(&dev, &model, text_rows, &fix)?;
+
+    // Stage 2b: Full 50-block 6-step DiT isolated on derived live plan.
+    let (dit_rows, dit_report) = image_sample_with_device(
+        &dev,
+        &model,
+        &layout,
+        &fix.init_noise,
+        &fix.cond_ref_bf16,
+        &DitSampleOptions::default(),
+    )?;
+    let active_block_bytes = 770_725_376u64;
+    check_live_plan(
+        &dit_report.live_topology,
+        &dit_report.live_plan,
+        &spec,
+        active_block_bytes,
+    )?;
+    let prefetch_ok = dit_report.live_plan.prefetch_depth == 0
+        || dit_report
+            .per_step_stats
+            .iter()
+            .all(|st| st.overlapped_prefetches > 0);
+    let dit_hbm_ok =
+        dit_report.hbm_after_drop_bytes <= dit_report.hbm_before_bytes + HBM_RELEASE_SLACK_BYTES;
+    let dit_step0_metrics = compute_f32_metrics(&dit_report.step0_velocity, &fix.vel0_ref_bf16)?;
+    let dit_latent = unpatchify_latents(&dit_rows, (spec.in_channels, 1, lh, lw), spec.patch);
+    let dit_final_metrics = compute_f32_metrics(&dit_latent, &fix.final_latent_ref)?;
+    let dit_pass = dit_step0_metrics.all_finite
+        && dit_step0_metrics.rel_l2 <= STEP3_DIT_STEP0_REL_L2_TOL
+        && dit_step0_metrics.rel_max_abs <= STEP3_DIT_STEP0_REL_MAX_ABS_TOL
+        && dit_final_metrics.all_finite
+        && dit_final_metrics.rel_l2 <= STEP3_DIT_FINAL_REL_L2_TOL
+        && dit_final_metrics.rel_max_abs <= STEP3_DIT_FINAL_REL_MAX_ABS_TOL
+        && prefetch_ok
+        && dit_hbm_ok;
+    println!(
+        "TPU_STEP3_STAGE2_DIT resident={} pinned={} disk={} prefetch_depth={} step0_rel_l2={:.6e} final_rel_l2={:.6e} final_rel_max_abs={:.6e} prefetch_ok={prefetch_ok} hbm_ok={dit_hbm_ok} elapsed_ms={:.1} pass={dit_pass}",
+        dit_report.live_plan.count(BlockPlacement::HbmResident),
+        dit_report
+            .live_plan
+            .count(BlockPlacement::PinnedHostStreamed),
+        dit_report.live_plan.count(BlockPlacement::DiskStreamed),
+        dit_report.live_plan.prefetch_depth,
+        dit_step0_metrics.rel_l2,
+        dit_final_metrics.rel_l2,
+        dit_final_metrics.rel_max_abs,
+        dit_report.elapsed_ms
+    );
+
+    // Stage 2c: Forced DiskStreamed (>= 2 blocks) bit-identical verification against derived plan.
+    let host_blocks = dit_report
+        .live_plan
+        .count(BlockPlacement::PinnedHostStreamed)
+        + dit_report
+            .live_plan
+            .count(BlockPlacement::PageableHostStreamed);
+    let host_reserve = dit_report
+        .live_topology
+        .host_available_bytes
+        .saturating_sub(dit_report.live_plan.usable_host_bytes);
+    let host_cap_bytes =
+        host_reserve.saturating_add(host_blocks.saturating_sub(3) as u64 * active_block_bytes);
+    let (forced_rows, forced_report) = image_sample_with_device(
+        &dev,
+        &model,
+        &layout,
+        &fix.init_noise,
+        &fix.cond_ref_bf16,
+        &DitSampleOptions {
+            host_available_cap_bytes: Some(host_cap_bytes),
+            ..Default::default()
+        },
+    )?;
+    check_live_plan(
+        &forced_report.live_topology,
+        &forced_report.live_plan,
+        &spec,
+        active_block_bytes,
+    )?;
+    let forced_disk_blocks = forced_report.live_plan.count(BlockPlacement::DiskStreamed);
+    let forced_disk_executed = forced_report
+        .per_step_stats
+        .iter()
+        .all(|st| st.disk_blocks_run == forced_disk_blocks);
+    let forced_bit_diffs = forced_rows
+        .iter()
+        .zip(&dit_rows)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    let forced_disk_pass = forced_disk_blocks >= 2 && forced_disk_executed && forced_bit_diffs == 0;
+    println!(
+        "TPU_STEP3_STAGE2_DISK_FORCED host_cap={host_cap_bytes} disk_blocks={forced_disk_blocks} disk_executed={forced_disk_executed} bit_diffs={forced_bit_diffs} pass={forced_disk_pass}"
+    );
+    let dit_forced_disk = DiskForcedReport {
+        disk_blocks: forced_disk_blocks,
+        host_cap_bytes,
+        bit_diffs: forced_bit_diffs,
+        passed: forced_disk_pass,
+        live_plan: forced_report.live_plan,
+    };
+
+    // Stage 2d: Three Stage 2 discriminating controls (each > 3.0x frozen tolerance).
+    let dit_controls = run_step3_dit_controls(&dev, &model, &spec, &layout, &fix, [lh, lw])?;
+    let dit_controls_pass =
+        dit_controls.len() == 3 && dit_controls.iter().all(|c| c.failed_as_required);
+
+    // Stage 3: Isolated 24-layer mixed-precision Image VAE decoder + 2D RoPE control.
+    let (vae_canvas, vae_report) = image_decode_with_device(
+        &dev,
+        &model,
+        [lh, lw],
+        &fix.final_latent_ref,
+        &VaeDecodeOptions::default(),
+    )?;
+    let vae_rgb8 = image_rgb8(
+        &vae_canvas,
+        [STEP3_HEIGHT, STEP3_WIDTH],
+        [STEP3_HEIGHT, STEP3_WIDTH],
+    )?;
+    let vae_canvas_metrics = compute_f32_metrics(&vae_canvas, &fix.vae_canvas_ref)?;
+    let vae_rgb8_metrics = compute_rgb8_metrics(&vae_rgb8, &fix.vae_rgb8_ref)?;
+    let vae_hbm_ok =
+        vae_report.hbm_after_drop_bytes <= vae_report.hbm_before_bytes + HBM_RELEASE_SLACK_BYTES;
+    let vae_pass = vae_canvas_metrics.all_finite
+        && vae_canvas_metrics.rel_l2 <= STEP3_VAE_CANVAS_REL_L2_TOL
+        && vae_canvas_metrics.rel_max_abs <= STEP3_VAE_CANVAS_REL_MAX_ABS_TOL
+        && vae_rgb8_metrics.mean_abs <= STEP3_VAE_RGB8_MEAN_ABS_TOL
+        && vae_hbm_ok;
+    println!(
+        "TPU_STEP3_STAGE3_VAE tiles={} batch={} rel_l2={:.6e} rel_max_abs={:.6e} rgb8_mean={:.4} hbm_ok={vae_hbm_ok} elapsed_ms={:.1} pass={vae_pass}",
+        vae_report.tile_count,
+        vae_report.tile_batch,
+        vae_canvas_metrics.rel_l2,
+        vae_canvas_metrics.rel_max_abs,
+        vae_rgb8_metrics.mean_abs,
+        vae_report.elapsed_ms
+    );
+
+    let (vae_bad_canvas, _) = image_decode_with_device(
+        &dev,
+        &model,
+        [lh, lw],
+        &fix.final_latent_ref,
+        &VaeDecodeOptions {
+            transpose_rope_hw: true,
+        },
+    )?;
+    let m_vae_ctrl = compute_f32_metrics(&vae_bad_canvas, &fix.vae_canvas_ref)?;
+    let min_vae_ctrl = STEP3_CONTROL_MIN_MULT * STEP3_VAE_CANVAS_REL_L2_TOL;
+    let vae_rope_control = ControlReport {
+        name: "vae_rope_hw_transpose".into(),
+        rel_l2: m_vae_ctrl.rel_l2,
+        rel_max_abs: m_vae_ctrl.rel_max_abs,
+        min_expected_rel_l2: min_vae_ctrl,
+        failed_as_required: m_vae_ctrl.rel_l2 > min_vae_ctrl,
+    };
+    println!(
+        "TPU_STEP3_CONTROL name={} rel_l2={:.6e} min_expected={:.6e} mult_over_tol={:.2}x failed_as_required={}",
+        vae_rope_control.name,
+        vae_rope_control.rel_l2,
+        vae_rope_control.min_expected_rel_l2,
+        vae_rope_control.rel_l2 / STEP3_VAE_CANVAS_REL_L2_TOL,
+        vae_rope_control.failed_as_required
+    );
+
+    // Stage 4: Composed E2E `image_latents_with_device` using CPU `image_noise_draw`.
+    let mut req = ImageRequest::new(STEP3_PROMPT, STEP3_WIDTH, STEP3_HEIGHT, STEP3_SEED);
+    req.min_generation_area = STEP3_MIN_AREA;
+    let e2e = image_latents_with_device(&dev, &model, &req, None)?;
+    let (e2e_canvas, _) = image_decode_with_device(
+        &dev,
+        &model,
+        [lh, lw],
+        &e2e.values,
+        &VaeDecodeOptions::default(),
+    )?;
+    let e2e_latent_metrics = compute_f32_metrics(&e2e.values, &fix.final_latent_ref)?;
+    let e2e_canvas_metrics = compute_f32_metrics(&e2e_canvas, &fix.vae_canvas_ref)?;
+    let e2e_rgb8_metrics = compute_rgb8_metrics(&e2e.rgb, &fix.vae_rgb8_ref)?;
+    let e2e_pass = e2e_latent_metrics.all_finite
+        && e2e_latent_metrics.rel_l2 <= STEP3_E2E_LATENT_REL_L2_TOL
+        && e2e_latent_metrics.rel_max_abs <= STEP3_E2E_LATENT_REL_MAX_ABS_TOL
+        && e2e_canvas_metrics.all_finite
+        && e2e_canvas_metrics.rel_l2 <= STEP3_E2E_CANVAS_REL_L2_TOL
+        && e2e_canvas_metrics.rel_max_abs <= STEP3_E2E_CANVAS_REL_MAX_ABS_TOL
+        && e2e_rgb8_metrics.mean_abs <= STEP3_E2E_RGB8_MEAN_ABS_TOL;
+    println!(
+        "TPU_STEP3_STAGE4_E2E lat_rel_l2={:.6e} canvas_rel_l2={:.6e} rgb8_mean={:.4} pass={e2e_pass}",
+        e2e_latent_metrics.rel_l2, e2e_canvas_metrics.rel_l2, e2e_rgb8_metrics.mean_abs
+    );
+
+    let overall_pass = cond_pass
+        && pdd_probe.passed
+        && dit_pass
+        && forced_disk_pass
+        && dit_controls_pass
+        && vae_pass
+        && vae_rope_control.failed_as_required
+        && e2e_pass;
+    let summary = Step3Summary {
+        device: dev.attributes.clone(),
+        prompt: STEP3_PROMPT.into(),
+        width: STEP3_WIDTH,
+        height: STEP3_HEIGHT,
+        seed: STEP3_SEED,
+        init_noise_bit_diffs,
+        conditioner: cond_report,
+        conditioner_metrics: cond_metrics,
+        pdd_probe,
+        dit_report,
+        dit_step0_metrics,
+        dit_final_metrics,
+        dit_forced_disk,
+        dit_controls,
+        vae_report,
+        vae_canvas_metrics,
+        vae_rgb8_metrics,
+        vae_rope_control,
+        e2e_latent_metrics,
+        e2e_canvas_metrics,
+        e2e_rgb8_metrics,
+        passed: overall_pass,
+    };
+    if let Some(dir) = out_dir {
+        fs::create_dir_all(&dir)?;
+        fs::write(
+            dir.join("tpu-step3-summary.json"),
+            serde_json::to_string_pretty(&summary)?,
+        )?;
+        write_rgb_png(
+            &dir.join("tpu_1024x512_vae_iso.png"),
+            STEP3_WIDTH,
+            STEP3_HEIGHT,
+            &vae_rgb8,
+        )?;
+        write_rgb_png(
+            &dir.join("tpu_1024x512_e2e.png"),
+            STEP3_WIDTH,
+            STEP3_HEIGHT,
+            &e2e.rgb,
+        )?;
+    }
+    println!(
+        "TPU_STEP3_RESULT overall_pass={overall_pass} cond={cond_pass} pdd={} dit={dit_pass} disk_forced={forced_disk_pass} dit_ctrls={dit_controls_pass} vae={vae_pass} vae_ctrl={} e2e={e2e_pass}",
+        summary.pdd_probe.passed, summary.vae_rope_control.failed_as_required
+    );
+    ensure!(
+        overall_pass,
+        "TPU Step 3 H3-Image full pipeline gate failed"
+    );
     Ok(())
 }

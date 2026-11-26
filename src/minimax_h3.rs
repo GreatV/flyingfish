@@ -14,6 +14,8 @@ pub use crate::backend::cuda::engine::minimax_h3::VideoSession;
 pub use crate::backend::cuda::engine::minimax_h3::{
     ImageSession, generate, image_decode, image_encode, image_latents, image_sample,
 };
+#[cfg(feature = "tpu")]
+pub use crate::backend::tpu::minimax_h3::{image_decode, image_latents, image_sample};
 
 /// Row modality tags; the AdaLN table row of a sequence row is `timestep_index * MODALITIES + tag`.
 pub const VIDEO_TAG: u8 = 0;
@@ -50,6 +52,52 @@ pub const STREAM_VIDEO_NOISE: u64 = 2;
 pub const STREAM_AUDIO_ROWS: u64 = 3;
 /// Philox stream of the image generation noise. No identity with the model definition's torch generator is claimed.
 pub const STREAM_IMAGE_NOISE: u64 = 4;
+
+/// Standard-normal Philox4x32-10 draw on CPU matching `kernels/sample.cu::philox_normal_f32`.
+pub fn philox_normal_f32(seed: u64, stream: u64, count: usize) -> Vec<f32> {
+    const INV_2_24: f64 = 1.0 / 16_777_216.0;
+    const TAU_F32: f32 = 6.283_185_5;
+    let mut out = Vec::with_capacity(count);
+    let blocks = count.div_ceil(4);
+    for base in 0..blocks {
+        let r = crate::sampling::philox_words(seed, stream, base as u64);
+        let u0 = ((((r[0] >> 8) as f64 + 0.5) * INV_2_24) as f32).max(1e-7f32);
+        let u1 = ((((r[1] >> 8) as f64) * INV_2_24) as f32) * TAU_F32;
+        let u2 = ((((r[2] >> 8) as f64 + 0.5) * INV_2_24) as f32).max(1e-7f32);
+        let u3 = ((((r[3] >> 8) as f64) * INV_2_24) as f32) * TAU_F32;
+        let rad0 = (-2.0f32 * u0.ln()).sqrt();
+        let rad1 = (-2.0f32 * u2.ln()).sqrt();
+        let vals = [
+            rad0 * u1.cos(),
+            rad0 * u1.sin(),
+            rad1 * u3.cos(),
+            rad1 * u3.sin(),
+        ];
+        let take = (count - base * 4).min(4);
+        out.extend_from_slice(&vals[..take]);
+    }
+    out
+}
+
+/// Uniform `[0, 1)` Philox4x32-10 draw on CPU matching `kernels/sample.cu::philox_uniform_f32`.
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn philox_uniform_f32(seed: u64, stream: u64, count: usize) -> Vec<f32> {
+    const INV_2_24: f64 = 1.0 / 16_777_216.0;
+    let mut out = Vec::with_capacity(count);
+    let blocks = count.div_ceil(4);
+    for base in 0..blocks {
+        let r = crate::sampling::philox_words(seed, stream, base as u64);
+        let vals = r.map(|w| ((w >> 8) as f64 * INV_2_24) as f32);
+        let take = (count - base * 4).min(4);
+        out.extend_from_slice(&vals[..take]);
+    }
+    out
+}
+
+/// CPU image-generation normal draw on `STREAM_IMAGE_NOISE`.
+pub fn image_noise_draw(seed: u64, count: usize) -> Vec<f32> {
+    philox_normal_f32(seed, STREAM_IMAGE_NOISE, count)
+}
 /// Latent frame `i` spans `ROPE_FRAME_RESCALE * ROPE_FRAMES_PER_LATENT[i % 5]` rotary time units.
 const ROPE_FRAME_RESCALE: f64 = 5.0 / 3.0;
 const ROPE_FRAMES_PER_LATENT: [f64; 5] = [1.0, 4.0, 4.0, 4.0, 4.0];

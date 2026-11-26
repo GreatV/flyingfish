@@ -1067,7 +1067,7 @@ fn parse_image_size(text: &str) -> Result<(usize, usize)> {
     Ok((width, height))
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm", test))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "tpu", test))]
 fn png_output(path: &Path) -> Result<()> {
     ensure!(
         path.extension().is_some_and(|extension| extension == "png"),
@@ -1106,9 +1106,9 @@ fn image(cli: &Cli, request: ImageCliRequest, output: &Path, json: bool) -> Resu
         output,
         json,
     );
-    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
-    bail!("image requires CUDA or ROCm");
-    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    #[cfg(not(any(feature = "cuda", feature = "rocm", feature = "tpu")))]
+    bail!("image requires CUDA, ROCm or TPU");
+    #[cfg(any(feature = "cuda", feature = "rocm", feature = "tpu"))]
     flyingfish::backend::with_verbose(cli.verbose, || {
         png_output(output)?;
         let output = output_path(output, &cli.model)?;
@@ -1119,7 +1119,7 @@ fn image(cli: &Cli, request: ImageCliRequest, output: &Path, json: bool) -> Resu
     })
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "tpu"))]
 fn prepare_image_request(request: ImageCliRequest) -> Result<flyingfish::minimax_h3::ImageRequest> {
     let expander = request
         .expander
@@ -1154,7 +1154,7 @@ fn prepare_image_request(request: ImageCliRequest) -> Result<flyingfish::minimax
     Ok(request)
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "tpu"))]
 fn image_options(cli: &Cli) -> Result<flyingfish::minimax_h3::ImageRunOptions> {
     Ok(flyingfish::minimax_h3::ImageRunOptions {
         device: cli.device,
@@ -1162,7 +1162,7 @@ fn image_options(cli: &Cli) -> Result<flyingfish::minimax_h3::ImageRunOptions> {
     })
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "tpu"))]
 fn write_image(
     output: &Path,
     request: &flyingfish::minimax_h3::ImageRequest,
@@ -1224,8 +1224,10 @@ fn image_requests(
     json: bool,
 ) -> Result<()> {
     let _ = (cli, path, width, height, json);
-    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
-    bail!("image requires CUDA or ROCm");
+    #[cfg(feature = "tpu")]
+    bail!("multi-request image --requests is not yet implemented on TPU");
+    #[cfg(not(any(feature = "cuda", feature = "rocm", feature = "tpu")))]
+    bail!("image requires CUDA, ROCm or TPU");
     #[cfg(any(feature = "cuda", feature = "rocm"))]
     flyingfish::backend::with_verbose(cli.verbose, || {
         #[derive(serde::Deserialize)]
@@ -1688,7 +1690,7 @@ fn resolve_runtime_dir(given: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 impl Cli {
-    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    #[cfg(any(feature = "cuda", feature = "rocm", feature = "tpu"))]
     fn runtime_dir(&self) -> PathBuf {
         self.kernels
             .runtime_dir

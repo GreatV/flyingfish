@@ -115,7 +115,7 @@ pub(crate) enum DecoderNarrow {
     F32ToFp16,
 }
 
-#[cfg(any(test, feature = "cuda", feature = "rocm"))]
+#[cfg(any(test, feature = "cuda", feature = "rocm", feature = "tpu"))]
 pub(crate) fn decoder_weight_is_raw_f32(name: &str) -> bool {
     name.split('.')
         .any(|part| matches!(part, "norm1" | "norm2" | "norm_out" | "scale1" | "scale2"))

@@ -1059,7 +1059,8 @@ impl ProductKernel {
                 }
                 crate::backend::setup::DeviceArchitecture::Cuda(120)
                 | crate::backend::setup::DeviceArchitecture::Hip(_) => "convrot_product_m_fast",
-                crate::backend::setup::DeviceArchitecture::Cuda(_) => {
+                crate::backend::setup::DeviceArchitecture::Cuda(_)
+                | crate::backend::setup::DeviceArchitecture::Tpu(_) => {
                     "convrot_product_m_fast_unsupported"
                 }
             },

@@ -209,6 +209,15 @@ impl MappedCheckpoint {
     }
     /// Opens a safetensors component stem or an explicit stored-ZIP `.pth` component.
     pub fn open_component(dir: &Path, stem: &str) -> Result<Self> {
+        Self::open_component_shards(dir, stem, |_| true)
+    }
+
+    /// Opens only the shards containing tensors matching `keep_tensor`, while preserving the full index for key validation.
+    pub fn open_component_shards(
+        dir: &Path,
+        stem: &str,
+        mut keep_tensor: impl FnMut(&str) -> bool,
+    ) -> Result<Self> {
         ensure!(
             Path::new(stem).components().count() == 1
                 && matches!(
@@ -237,11 +246,23 @@ impl MappedCheckpoint {
         };
         ensure!(!index.weight_map.is_empty(), "empty checkpoint index");
         let base = dir.canonicalize()?;
+        let mut needed_shards = BTreeSet::new();
+        let mut required_names = BTreeSet::new();
+        for (name, shard) in &index.weight_map {
+            if keep_tensor(name) {
+                needed_shards.insert(shard);
+                required_names.insert(name.as_str());
+            }
+        }
+        ensure!(
+            !needed_shards.is_empty(),
+            "checkpoint shard filter matched zero tensors"
+        );
         let mut maps = BTreeMap::new();
         #[cfg(any(feature = "cuda", feature = "rocm"))]
         let mut files = BTreeMap::new();
         let mut seen = BTreeSet::new();
-        for shard in index.weight_map.values().collect::<BTreeSet<_>>() {
+        for shard in needed_shards {
             ensure!(
                 Path::new(shard)
                     .components()
@@ -271,7 +292,7 @@ impl MappedCheckpoint {
             files.insert(shard.clone(), file);
         }
         ensure!(
-            seen.len() == index.weight_map.len(),
+            required_names.iter().all(|name| seen.contains(*name)),
             "index names missing from shard headers"
         );
         Ok(Self {
@@ -3248,6 +3269,119 @@ impl MappedCheckpoint {
             planned,
             None,
         )
+    }
+
+    /// Validates the full Qwen3-VL conditioner index key set while inspecting only opened shards covering
+    /// `embed_tokens` and decoder layers `0..layers` (permitting dormant/vision-only shards to remain unopened).
+    pub fn minimax_h3_conditioner_text_manifest(
+        &self,
+        spec: &crate::model_spec::ModelSpec,
+        layers: usize,
+    ) -> Result<TensorManifest> {
+        ensure!(
+            spec.architecture == crate::model_spec::Architecture::Qwen3Vl
+                && layers <= spec.layers.len(),
+            "conditioner manifest needs Qwen3-VL with at least {layers} decoder layers"
+        );
+        let mut expected = BTreeMap::new();
+        Self::text_entries(spec, &mut expected)?;
+        Self::qwen3_vl_vision_entries(spec, &mut expected)?;
+        for (name, (_, _, scope)) in expected.iter_mut() {
+            let layer = name
+                .strip_prefix("model.language_model.layers.")
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|index| index.parse::<usize>().ok());
+            if *scope == TensorScope::Text && layer.is_none_or(|layer| layer >= layers) {
+                *scope = TensorScope::Dormant;
+            }
+        }
+        if expected.len() != self.index.weight_map.len() {
+            let missing: Vec<_> = expected
+                .keys()
+                .filter(|name| !self.index.weight_map.contains_key(*name))
+                .take(3)
+                .collect();
+            let unexpected: Vec<_> = self
+                .index
+                .weight_map
+                .keys()
+                .filter(|name| !expected.contains_key(*name))
+                .take(3)
+                .collect();
+            bail!(
+                "MiniMax-H3 conditioner tensor count mismatch: expected={} actual={} missing={missing:?} unexpected={unexpected:?}",
+                expected.len(),
+                self.index.weight_map.len()
+            );
+        }
+        let planned = planned_bytes(&expected, LoadPolicy::TextOnly)?;
+        let views = self.views()?;
+        let mut entries = BTreeMap::new();
+        let mut resident_bytes = 0usize;
+        for (name, shard) in &self.index.weight_map {
+            let (dtype, shape, scope) = expected
+                .remove(name)
+                .with_context(|| format!("unknown MiniMax-H3 conditioner tensor {name}"))?;
+            let load = LoadPolicy::TextOnly.selects_tensor(scope, name);
+            let required = load || name == "model.language_model.embed_tokens.weight";
+            let Some(view) = views.get(shard) else {
+                ensure!(
+                    !required,
+                    "required MiniMax-H3 conditioner tensor {name} resides in unopened shard {shard}"
+                );
+                continue;
+            };
+            let t = view.tensor(name)?;
+            ensure!(
+                t.dtype() == dtype && t.shape() == shape,
+                "MiniMax-H3 conditioner dtype/shape mismatch: {name}"
+            );
+            if load {
+                resident_bytes = resident_bytes
+                    .checked_add(t.data().len())
+                    .context("resident size overflow")?;
+            }
+            let map = &self.maps[shard];
+            let data_start = 8u64
+                .checked_add(u64::from_le_bytes(map[..8].try_into()?))
+                .context("data start overflow")?;
+            let file_offset = (t.data().as_ptr() as usize)
+                .checked_sub(map.as_ptr() as usize)
+                .context("tensor outside mapping")? as u64;
+            let start = file_offset
+                .checked_sub(data_start)
+                .context("tensor overlaps header")?;
+            let end = start
+                .checked_add(t.data().len() as u64)
+                .context("tensor offset overflow")?;
+            let (layer, role) = split_layer_role(name)?;
+            entries.insert(
+                name.clone(),
+                TensorEntry {
+                    dtype,
+                    shape,
+                    shard: shard.clone(),
+                    bytes: t.data().len(),
+                    load,
+                    data_start,
+                    data_offsets: [start, end],
+                    scope,
+                    layer,
+                    role,
+                    scale_name: None,
+                    quant: None,
+                    swap_halves: false,
+                },
+            );
+        }
+        ensure!(
+            expected.is_empty() && resident_bytes == planned,
+            "MiniMax-H3 conditioner manifest incomplete"
+        );
+        Ok(TensorManifest {
+            entries,
+            resident_bytes,
+        })
     }
 
     /// MiniMax-H3 LoRA file: `{linear}.lora_A.default.weight [rank, in]` and `{linear}.lora_B.default.weight
@@ -7356,6 +7490,61 @@ mod image_manifest_tests {
                 .minimax_h3_image_manifest(&spec)
                 .is_err(),
             "accepted an audio projection"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn open_component_shards_skips_unneeded_shards_and_rejects_missing_active_shard() -> Result<()>
+    {
+        let root =
+            std::env::temp_dir().join(format!("flyingfish-shard-filter-{}", std::process::id()));
+        std::fs::create_dir_all(&root)?;
+        let dir = Scratch(root);
+        let active_bytes = safetensors::serialize(
+            [(
+                "active.weight",
+                TensorView::new(Dtype::BF16, vec![4], &[0u8; 8])?,
+            )],
+            None,
+        )?;
+        let dormant_bytes = safetensors::serialize(
+            [(
+                "dormant.weight",
+                TensorView::new(Dtype::BF16, vec![4], &[0u8; 8])?,
+            )],
+            None,
+        )?;
+        std::fs::write(dir.0.join("model-00001-of-00002.safetensors"), active_bytes)?;
+        std::fs::write(
+            dir.0.join("model-00002-of-00002.safetensors"),
+            dormant_bytes,
+        )?;
+        let index = serde_json::json!({
+            "weight_map": {
+                "active.weight": "model-00001-of-00002.safetensors",
+                "dormant.weight": "model-00002-of-00002.safetensors"
+            }
+        });
+        std::fs::write(
+            dir.0.join("model.safetensors.index.json"),
+            serde_json::to_vec(&index)?,
+        )?;
+
+        // Removing shard 2 succeeds when only shard 1 is requested; full open fails.
+        std::fs::remove_file(dir.0.join("model-00002-of-00002.safetensors"))?;
+        assert!(MappedCheckpoint::open_component(&dir.0, "model").is_err());
+        let partial =
+            MappedCheckpoint::open_component_shards(&dir.0, "model", |n| n == "active.weight")?;
+        assert_eq!(partial.index.weight_map.len(), 2);
+        assert_eq!(partial.tensor("active.weight")?.shape(), &[4]);
+        assert!(partial.tensor("dormant.weight").is_err());
+
+        // Removing shard 1 fails even with the active filter.
+        std::fs::remove_file(dir.0.join("model-00001-of-00002.safetensors"))?;
+        assert!(
+            MappedCheckpoint::open_component_shards(&dir.0, "model", |n| n == "active.weight")
+                .is_err()
         );
         Ok(())
     }

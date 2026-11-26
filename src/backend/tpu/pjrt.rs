@@ -1282,12 +1282,12 @@ impl PjrtApi {
         };
     }
 
-    pub(crate) fn execute_single_device(
+    pub(crate) fn execute_single_device_async(
         &self,
         executable: *mut c_void,
         inputs: &[*mut c_void],
         num_outputs: usize,
-    ) -> Result<Vec<*mut c_void>> {
+    ) -> Result<(Vec<*mut c_void>, *mut c_void)> {
         let mut options = PjrtExecuteOptions {
             struct_size: offset_of!(PjrtExecuteOptions, num_custom_options) + size_of::<usize>(),
             extension_start: ptr::null_mut(),
@@ -1336,14 +1336,19 @@ impl PjrtApi {
                 &mut args,
             )?
         };
-        self.await_and_destroy_event(complete_event, "PJRT_LoadedExecutable_Execute")?;
         for (idx, &buf) in out_storage.iter().enumerate() {
-            ensure!(
-                !buf.is_null(),
-                "PJRT_LoadedExecutable_Execute output[{idx}] is null"
-            );
+            if buf.is_null() {
+                let _ = self.await_and_destroy_event(
+                    complete_event,
+                    "PJRT_LoadedExecutable_Execute cleanup",
+                );
+                for &out in &out_storage {
+                    self.destroy_buffer(out);
+                }
+                bail!("PJRT_LoadedExecutable_Execute output[{idx}] is null");
+            }
         }
-        Ok(out_storage)
+        Ok((out_storage, complete_event))
     }
 
     pub(crate) unsafe fn buffer_from_host_buffer(
@@ -1449,6 +1454,19 @@ impl PjrtApi {
         buffer: *mut c_void,
         dst_memory: *mut c_void,
     ) -> Result<*mut c_void> {
+        let dst = self.buffer_copy_to_memory_async(buffer, dst_memory)?;
+        if let Err(err) = self.await_buffer_ready(dst) {
+            self.destroy_buffer(dst);
+            return Err(err);
+        }
+        Ok(dst)
+    }
+
+    pub(crate) fn buffer_copy_to_memory_async(
+        &self,
+        buffer: *mut c_void,
+        dst_memory: *mut c_void,
+    ) -> Result<*mut c_void> {
         let mut args = PjrtBufferCopyToMemoryArgs {
             struct_size: offset_of!(PjrtBufferCopyToMemoryArgs, dst_buffer)
                 + size_of::<*mut c_void>(),
@@ -1468,10 +1486,6 @@ impl PjrtApi {
             !args.dst_buffer.is_null(),
             "PJRT_Buffer_CopyToMemory returned null buffer"
         );
-        if let Err(err) = self.await_buffer_ready(args.dst_buffer) {
-            self.destroy_buffer(args.dst_buffer);
-            return Err(err);
-        }
         Ok(args.dst_buffer)
     }
 

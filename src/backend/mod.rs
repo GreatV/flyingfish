@@ -169,22 +169,22 @@ impl SpecBudget {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "tpu"))]
 thread_local! {
     static VERBOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "tpu"))]
 struct VerboseGuard(bool);
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "tpu"))]
 impl Drop for VerboseGuard {
     fn drop(&mut self) {
         VERBOSE.with(|verbose| verbose.set(self.0));
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "tpu"))]
 pub fn with_verbose<T>(verbose: bool, run: impl FnOnce() -> T) -> T {
     let guard = VerboseGuard(VERBOSE.with(|current| current.replace(verbose)));
     let result = run();
