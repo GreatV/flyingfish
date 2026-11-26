@@ -1701,11 +1701,132 @@ impl DecoderVisitCost {
 }
 
 #[cfg(feature = "cuda")]
+fn pre_fault_bytes(len: usize) -> Result<Vec<u8>> {
+    let mut buffer = vec![0u8; len];
+    if len == 0 {
+        return Ok(buffer);
+    }
+    // SAFETY: sysconf takes no pointer arguments.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    ensure!(
+        page > 0,
+        "sysconf(_SC_PAGESIZE) returned {page}: {}",
+        std::io::Error::last_os_error()
+    );
+    let page = usize::try_from(page).context("sysconf(_SC_PAGESIZE) exceeds usize")?;
+    let pages = len.div_ceil(page);
+    let workers = std::thread::available_parallelism()
+        .context("detect available parallelism for RGB pre-fault")?
+        .get()
+        .min(pages);
+    let touch = |slice: &mut [u8]| {
+        for chunk in slice.chunks_mut(page) {
+            // SAFETY: chunk is non-empty and exclusively borrowed; volatile write forces page faults on zeroed pages.
+            unsafe {
+                std::ptr::write_volatile(chunk.as_mut_ptr(), 0);
+            }
+        }
+    };
+    if workers <= 1 {
+        touch(&mut buffer);
+        return Ok(buffer);
+    }
+    let base = pages / workers;
+    let extra = pages % workers;
+    std::thread::scope(|scope| {
+        let mut rest = buffer.as_mut_slice();
+        for index in 0..workers {
+            let count = base + usize::from(index < extra);
+            let bytes = (count * page).min(rest.len());
+            let (slice, next) = rest.split_at_mut(bytes);
+            rest = next;
+            scope.spawn(move || touch(slice));
+        }
+    });
+    Ok(buffer)
+}
+
+#[cfg(feature = "cuda")]
+fn readback_pinned_chunks(
+    upload: &std::sync::Arc<crate::backend::gpu::CudaStream>,
+    src_ptr: u64,
+    dst: &mut [u8],
+    staging: &mut [u8],
+    done: &[crate::backend::gpu::CudaEvent; 2],
+) -> Result<()> {
+    if dst.is_empty() {
+        return Ok(());
+    }
+    upload.context().bind_to_thread()?;
+    let result: Result<()> = (|| {
+        if staging.len() >= dst.len() {
+            // SAFETY: staging and src_ptr..src_ptr+dst.len() stay live until done[0] synchronizes.
+            unsafe {
+                crate::backend::cuda::copy::dtoh_raw(
+                    staging.as_mut_ptr().cast(),
+                    src_ptr,
+                    dst.len(),
+                    upload,
+                )?;
+            }
+            done[0].record(upload)?;
+            done[0].synchronize()?;
+            dst.copy_from_slice(&staging[..dst.len()]);
+            return Ok(());
+        }
+        let chunk = staging.len() / 2;
+        ensure!(
+            chunk > 0,
+            "RGB pinned staging requires at least 2 bytes for chunked readback"
+        );
+        let (slot0, rest) = staging.split_at_mut(chunk);
+        let slots = [slot0, &mut rest[..chunk]];
+        let mut pending: Option<(usize, usize, usize)> = None;
+        let mut slot_idx = 0usize;
+        let mut offset = 0usize;
+        while offset < dst.len() {
+            let len = chunk.min(dst.len() - offset);
+            // SAFETY: slots[slot_idx] was synchronized and copied before reuse; src_ptr stays live until return.
+            unsafe {
+                crate::backend::cuda::copy::dtoh_raw(
+                    slots[slot_idx].as_mut_ptr().cast(),
+                    src_ptr + offset as u64,
+                    len,
+                    upload,
+                )?;
+            }
+            done[slot_idx].record(upload)?;
+            if let Some((prev_slot, prev_offset, prev_len)) =
+                pending.replace((slot_idx, offset, len))
+            {
+                done[prev_slot].synchronize()?;
+                dst[prev_offset..prev_offset + prev_len]
+                    .copy_from_slice(&slots[prev_slot][..prev_len]);
+            }
+            slot_idx ^= 1;
+            offset += len;
+        }
+        if let Some((prev_slot, prev_offset, prev_len)) = pending {
+            done[prev_slot].synchronize()?;
+            dst[prev_offset..prev_offset + prev_len].copy_from_slice(&slots[prev_slot][..prev_len]);
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = upload.synchronize();
+    }
+    result
+}
+
+#[cfg(feature = "cuda")]
 struct VideoDecodeStage {
     geometry: VideoDecodeGeometry,
     video: VideoDecoder,
     audio: AudioDecoder,
     work: TileWork,
+    rgb_staging: crate::backend::gpu::PinnedHostSlice<u8>,
+    rgb_ready: crate::backend::gpu::CudaEvent,
+    rgb_done: [crate::backend::gpu::CudaEvent; 2],
 }
 
 #[cfg(feature = "cuda")]
@@ -1716,6 +1837,7 @@ impl VideoDecodeStage {
         (geometry, vae, audio_spec): (&Geometry, &VaeSpec, &AudioVaeSpec),
         (video, audio): (&[f32], &[f32]),
     ) -> Result<H3Output> {
+        use crate::backend::gpu::DevicePtr;
         let decoded = video_decode_device(
             (device, blas),
             (&self.video, &mut self.work, &self.geometry.tiles),
@@ -1734,14 +1856,34 @@ impl VideoDecodeStage {
                 geometry.height * geometry.width,
             ),
         )?;
-        let video = s.clone_dtoh(&rgb)?;
+        self.rgb_ready.record(s)?;
+        // Stream-ordered release returns decoded VRAM before audio_decoder allocates on `s`.
         drop(decoded);
-        let input = s.clone_htod(audio)?;
-        let audio = s.clone_dtoh(&self.audio.decode(
-            (s, blas),
-            &input,
-            (2, geometry.audio_latents),
-        )?)?;
+        let (rgb_ptr, _rgb_guard) = rgb.device_ptr(&device.upload);
+        device.upload.wait(&self.rgb_ready)?;
+        let mut video = pre_fault_bytes(self.geometry.rgb_bytes)?;
+        let staging = self.rgb_staging.as_mut_slice()?;
+        let done = &self.rgb_done;
+        let (readback, audio) = std::thread::scope(|scope| {
+            let d2h = scope.spawn(|| {
+                readback_pinned_chunks(&device.upload, rgb_ptr, &mut video, staging, done)
+            });
+            let audio = (|| -> Result<Vec<f32>> {
+                let input = s.clone_htod(audio)?;
+                let decoded_audio =
+                    self.audio
+                        .decode((s, blas), &input, (2, geometry.audio_latents))?;
+                Ok(s.clone_dtoh(&decoded_audio)?)
+            })();
+            let readback = match d2h.join() {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("RGB pinned readback thread panicked")),
+            };
+            (readback, audio)
+        });
+        drop(_rgb_guard);
+        readback?;
+        let audio = audio?;
         Ok(H3Output {
             frames: geometry.frames,
             height: geometry.height,
@@ -1886,6 +2028,9 @@ impl VideoSession {
                 .minimax_h3_audio_vae_manifest(&audio)?;
         let audio_decoder = AudioDecoder::new(&device, &audio, &audio_dir, &audio_manifest)?;
         let decode_geometry = VideoDecodeGeometry::new(&vae, &geometry)?;
+        let rgb_staging_bytes = decode_geometry
+            .rgb_bytes
+            .min(crate::backend::cuda::weights::UPLOAD_CHUNK_BYTES);
         let slots = decode_geometry.tiles.count();
         let cap = VideoDecoder::work_batch_cap(&device, &vae, decode_geometry.tile, slots)?;
         let one_tile = TileWork::charged_bytes(
@@ -1998,6 +2143,7 @@ impl VideoSession {
                 )?)?;
                 let host = available
                     .checked_sub(4 << 30)
+                    .and_then(|bytes| bytes.checked_sub(rgb_staging_bytes))
                     .context("resident video host reserve")?;
                 let (batch, device_budget, priced, alternatives) = visit.price_groups(
                     (&vae, &decode_geometry, cap),
@@ -2045,7 +2191,8 @@ impl VideoSession {
                     "{}",
                     serde_json::json!({"h3_video_resident_plan": {
                         "device_budget": device_budget, "host_budget": host, "transient_bytes": transient,
-                        "shared_ffn_rgb_bytes": decode_geometry.rgb_bytes, "decoder_group_prices": alternatives,
+                        "shared_ffn_rgb_bytes": decode_geometry.rgb_bytes, "rgb_d2h_staging_bytes": rgb_staging_bytes,
+                        "decoder_group_prices": alternatives,
                         "decoder_launch_seconds": visit.launch_seconds, "decoder_handoff_seconds": visit.handoff_seconds,
                         "device_memory_bytes_per_second": device.info.memory_bytes_per_second,
                         "pcie_bytes_per_second": pcie, "disk_bytes_per_second": disk, "disk_probe_bytes": disk_probe_bytes,
@@ -2082,6 +2229,13 @@ impl VideoSession {
         let video = VideoDecoder::with_plan(&device, (&vae, &vae_dir, &vae_manifest), decode_plan)?;
         video.bind_groups(&mut sample_blas, &work, cap)?;
         let kernels = BlockKernels::new(&device)?;
+        let rgb_staging = crate::backend::cuda::copy::pinned_zeros(&device.ctx, rgb_staging_bytes)?;
+        let untimed = Some(crate::backend::gpu::EVENT_DISABLE_TIMING);
+        let rgb_ready = device.ctx.new_event(untimed)?;
+        let rgb_done = [
+            device.ctx.new_event(untimed)?,
+            device.ctx.new_event(untimed)?,
+        ];
         device.finish_upload()?;
         let (free, total) = device.ctx.mem_get_info()?;
         ensure!(
@@ -2115,6 +2269,9 @@ impl VideoSession {
                 video,
                 audio: audio_decoder,
                 work,
+                rgb_staging,
+                rgb_ready,
+                rgb_done,
             },
         })
     }
@@ -5181,5 +5338,80 @@ fn packed_decoder_handoffs_preserve_video_patches_and_stereo_channels() -> Resul
             .is_err()
         );
     }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "cuda"))]
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn rgb_pinned_chunked_readback_matches_clone_dtoh() -> Result<()> {
+    use crate::backend::gpu::DevicePtr;
+    for len in [0usize, 1, 4095, 4096, 4097, 200_003] {
+        let zeros = pre_fault_bytes(len)?;
+        assert_eq!(zeros.len(), len);
+        assert!(zeros.iter().all(|&b| b == 0));
+    }
+    let device = Device::new(0)?;
+    let untimed = Some(crate::backend::gpu::EVENT_DISABLE_TIMING);
+    let ready = device.ctx.new_event(untimed)?;
+    let done = [
+        device.ctx.new_event(untimed)?,
+        device.ctx.new_event(untimed)?,
+    ];
+    let mut staging = crate::backend::cuda::copy::pinned_zeros::<u8>(&device.ctx, 65_536)?;
+    for &len in &[0usize, 17_389, 131_072, 200_003] {
+        let host: Vec<u8> = (0..len).map(|i| ((i * 73 + 19) % 251) as u8).collect();
+        let gpu = if len == 0 {
+            device.stream.alloc_zeros::<u8>(1)?
+        } else {
+            device.stream.clone_htod(&host)?
+        };
+        ready.record(&device.stream)?;
+        let (ptr, _guard) = gpu.device_ptr(&device.upload);
+        device.upload.wait(&ready)?;
+        let mut out = pre_fault_bytes(len)?;
+        readback_pinned_chunks(
+            &device.upload,
+            ptr,
+            &mut out,
+            staging.as_mut_slice()?,
+            &done,
+        )?;
+        drop(_guard);
+        let reference = if len == 0 {
+            Vec::new()
+        } else {
+            device.stream.clone_dtoh(&gpu)?
+        };
+        assert_eq!(out, reference, "pinned readback mismatch for len={len}");
+        if len == 200_003 {
+            let mut shifted = pre_fault_bytes(len - 1)?;
+            let (ptr_shift, _guard_shift) = gpu.device_ptr(&device.upload);
+            readback_pinned_chunks(
+                &device.upload,
+                ptr_shift + 1,
+                &mut shifted,
+                staging.as_mut_slice()?,
+                &done,
+            )?;
+            drop(_guard_shift);
+            assert_ne!(shifted, reference[..len - 1], "offset mutant must fail");
+        }
+    }
+    let mut tiny_staging = crate::backend::cuda::copy::pinned_zeros::<u8>(&device.ctx, 1)?;
+    let pair = device.stream.clone_htod(&[1u8, 2u8])?;
+    let (ptr, _guard) = pair.device_ptr(&device.upload);
+    let mut two = [0u8; 2];
+    assert!(
+        readback_pinned_chunks(
+            &device.upload,
+            ptr,
+            &mut two,
+            tiny_staging.as_mut_slice()?,
+            &done,
+        )
+        .is_err()
+    );
+    drop(_guard);
     Ok(())
 }

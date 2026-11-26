@@ -23,7 +23,7 @@ use std::{
     time::Instant,
 };
 
-const UPLOAD_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const UPLOAD_CHUNK_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy, Default, serde::Serialize)]
 struct UploadTimings {
