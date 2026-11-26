@@ -464,6 +464,7 @@ struct PjrtBufferCopyToMemoryArgs {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
 pub enum BufferType {
+    S32 = 4,
     U8 = 6,
     F32 = 11,
     Bf16 = 13,
@@ -474,7 +475,7 @@ impl BufferType {
         match self {
             Self::U8 => 1,
             Self::Bf16 => 2,
-            Self::F32 => 4,
+            Self::S32 | Self::F32 => 4,
         }
     }
 }

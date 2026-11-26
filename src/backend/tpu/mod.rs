@@ -1,7 +1,9 @@
 //! TPU execution backend built directly on the PJRT C API and StableHLO.
 
+pub mod dit_block;
 pub mod hlo;
 pub mod pjrt;
+pub mod plan;
 
 use anyhow::{Context, Result, bail, ensure};
 use half::bf16;
@@ -126,11 +128,28 @@ impl TpuDevice {
         })
     }
 
+    pub fn pinned_host_memory(&self) -> Option<&MemoryKindInfo> {
+        self.attributes
+            .addressable_memories
+            .iter()
+            .find(|m| m.kind == "pinned_host")
+    }
+
     pub fn upload_bf16(
         &self,
         data: &[bf16],
         dims: &[i64],
         semantics: HostSemantics,
+    ) -> Result<TpuBuffer> {
+        self.upload_bf16_to_memory(data, dims, semantics, None)
+    }
+
+    pub fn upload_bf16_to_memory(
+        &self,
+        data: &[bf16],
+        dims: &[i64],
+        semantics: HostSemantics,
+        target_memory: Option<&MemoryKindInfo>,
     ) -> Result<TpuBuffer> {
         let elems = checked_elements(dims)?;
         ensure!(
@@ -138,12 +157,48 @@ impl TpuDevice {
             "upload_bf16 length {} != dims product {elems}",
             data.len()
         );
+        let (device, memory) = match target_memory {
+            Some(info) => (ptr::null_mut(), info.handle),
+            None => (self.device, ptr::null_mut()),
+        };
         let handle = unsafe {
             self.inner.api.buffer_from_host_buffer(
                 self.inner.client,
                 HostBufferSpec {
                     data: data.as_ptr() as *const c_void,
                     buffer_type: BufferType::Bf16,
+                    dims,
+                    semantics,
+                    device,
+                    memory,
+                },
+            )?
+        };
+        Ok(TpuBuffer {
+            inner: Rc::clone(&self.inner),
+            handle,
+            byte_len: elems * BufferType::Bf16.byte_width(),
+        })
+    }
+
+    pub fn upload_i32(
+        &self,
+        data: &[i32],
+        dims: &[i64],
+        semantics: HostSemantics,
+    ) -> Result<TpuBuffer> {
+        let elems = checked_elements(dims)?;
+        ensure!(
+            data.len() == elems,
+            "upload_i32 length {} != dims product {elems}",
+            data.len()
+        );
+        let handle = unsafe {
+            self.inner.api.buffer_from_host_buffer(
+                self.inner.client,
+                HostBufferSpec {
+                    data: data.as_ptr() as *const c_void,
+                    buffer_type: BufferType::S32,
                     dims,
                     semantics,
                     device: self.device,
@@ -154,7 +209,7 @@ impl TpuDevice {
         Ok(TpuBuffer {
             inner: Rc::clone(&self.inner),
             handle,
-            byte_len: elems * BufferType::Bf16.byte_width(),
+            byte_len: elems * BufferType::S32.byte_width(),
         })
     }
 
