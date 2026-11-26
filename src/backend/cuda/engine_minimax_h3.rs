@@ -311,7 +311,7 @@ pub(crate) struct OwnedRead {
 
 /// Destination form of one fill read: the stored bytes, their BF16 narrowing, or BF16
 /// weight bits rewritten as FP16. F32, I8, and U8 stay [`FillCast::Raw`].
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FillCast {
     Raw,
     F32ToBf16,
@@ -353,24 +353,709 @@ fn runtime_half_finite(bytes: &[u8], dtype: Dtype) -> bool {
     width2_finite(bytes, exponent)
 }
 
-/// The resident ring's raw windows keep the loader's finite check: unquantized F32 kept as
-/// F32 is scanned before the window is published as a completed tensor.
+/// The resident ring's raw windows keep the loader's finite check: unquantized F32, BF16, and
+/// F16 kept in raw form are scanned before publication; every I8 code is finite.
 pub(super) fn resident_raw_finite(
     name: &str,
     entry: &TensorEntry,
     cast: FillCast,
     window: &[u8],
 ) -> Result<()> {
-    if cast == FillCast::Raw && entry.quant.is_none() && entry.dtype == Dtype::F32 {
-        ensure!(<f32 as Element>::finite(window), "{name}: nonfinite value");
+    if cast == FillCast::Raw && entry.quant.is_none() {
+        match entry.dtype {
+            Dtype::F32 => ensure!(<f32 as Element>::finite(window), "{name}: nonfinite value"),
+            Dtype::BF16 => ensure!(<bf16 as Element>::finite(window), "{name}: nonfinite value"),
+            Dtype::F16 => ensure!(
+                runtime_half_finite(window, Dtype::F16),
+                "{name}: nonfinite value"
+            ),
+            Dtype::I8 => {}
+            other => bail!("{name}: unsupported raw resident dtype {other:?}"),
+        }
     }
     Ok(())
 }
 
+const MIN_RING_CHUNK_BYTES: usize = 4 << 20;
+const RESIDENT_RING_HOST_RESERVE: usize = 4 << 30;
+
+fn parse_dev_pair(text: &str, context: &str) -> Result<(u64, u64)> {
+    let trimmed = text.trim();
+    let (maj, min) = trimmed
+        .split_once(':')
+        .with_context(|| format!("{context}: invalid major:minor {trimmed:?}"))?;
+    Ok((
+        maj.parse::<u64>()
+            .with_context(|| format!("{context}: invalid major {maj:?}"))?,
+        min.parse::<u64>()
+            .with_context(|| format!("{context}: invalid minor {min:?}"))?,
+    ))
+}
+
+fn collect_leaf_drives(
+    root: &Path,
+    maj: u64,
+    min: u64,
+    visited: &mut std::collections::BTreeSet<(u64, u64)>,
+    leaves: &mut std::collections::BTreeSet<(u64, u64)>,
+) -> Result<()> {
+    if !visited.insert((maj, min)) {
+        return Ok(());
+    }
+    let node = root.join(format!("sys/dev/block/{maj}:{min}"));
+    ensure!(node.exists(), "sysfs block node {} missing", node.display());
+    let slaves_dir = node.join("slaves");
+    let mut slaves = Vec::new();
+    if slaves_dir.is_dir() {
+        for entry in std::fs::read_dir(&slaves_dir)
+            .with_context(|| format!("read {}", slaves_dir.display()))?
+        {
+            let entry = entry?;
+            let dev_path = entry.path().join("dev");
+            let text = std::fs::read_to_string(&dev_path)
+                .with_context(|| format!("read {}", dev_path.display()))?;
+            slaves.push(parse_dev_pair(&text, &dev_path.display().to_string())?);
+        }
+    }
+    if !slaves.is_empty() {
+        for (smaj, smin) in slaves {
+            collect_leaf_drives(root, smaj, smin, visited, leaves)?;
+        }
+        return Ok(());
+    }
+    if node.join("partition").exists() {
+        let canonical = std::fs::canonicalize(&node)
+            .with_context(|| format!("canonicalize {}", node.display()))?;
+        let parent = canonical
+            .parent()
+            .with_context(|| format!("partition {} lacks parent disk", canonical.display()))?;
+        let dev_path = parent.join("dev");
+        let text = std::fs::read_to_string(&dev_path)
+            .with_context(|| format!("read {}", dev_path.display()))?;
+        leaves.insert(parse_dev_pair(&text, &dev_path.display().to_string())?);
+    } else {
+        leaves.insert((maj, min));
+    }
+    Ok(())
+}
+
+fn overlay_backing_path(super_opts: &str) -> Option<&str> {
+    for opt in super_opts.split(',') {
+        if let Some(path) = opt.strip_prefix("upperdir=")
+            && !path.is_empty()
+        {
+            return Some(path);
+        }
+    }
+    for opt in super_opts.split(',') {
+        if let Some(paths) = opt.strip_prefix("lowerdir=")
+            && let Some(first) = paths.split(':').find(|p| !p.is_empty())
+        {
+            return Some(first);
+        }
+    }
+    None
+}
+
+fn block_drive_count_for_dev(dev: u64, root: &Path, dir: &Path) -> Result<usize> {
+    use std::os::unix::fs::MetadataExt;
+    let (maj, min) = (u64::from(libc::major(dev)), u64::from(libc::minor(dev)));
+    if maj == 0 {
+        let mountinfo_path = root.join("proc/self/mountinfo");
+        let mountinfo = std::fs::read_to_string(&mountinfo_path)
+            .with_context(|| format!("read {}", mountinfo_path.display()))?;
+        let target = format!("0:{min}");
+        let line = mountinfo
+            .lines()
+            .find(|line| line.split_whitespace().nth(2) == Some(target.as_str()))
+            .with_context(|| {
+                format!(
+                    "mountinfo {} lacks device {target} for {}",
+                    mountinfo_path.display(),
+                    dir.display()
+                )
+            })?;
+        let (_, tail) = line
+            .split_once(" - ")
+            .with_context(|| format!("mountinfo line missing separator: {line}"))?;
+        let mut fields = tail.split_whitespace();
+        let fstype = fields.next().context("mountinfo missing fstype")?;
+        let _source = fields.next();
+        let super_opts = fields.next().unwrap_or("");
+        if fstype == "overlay" {
+            let backing = overlay_backing_path(super_opts).with_context(|| {
+                format!(
+                    "overlay mount 0:{min} lacks upperdir/lowerdir for {}",
+                    dir.display()
+                )
+            })?;
+            let backing_path = if root == Path::new("/") {
+                PathBuf::from(backing)
+            } else {
+                root.join(backing.trim_start_matches('/'))
+            };
+            let backing_dev = std::fs::metadata(&backing_path)
+                .with_context(|| format!("stat overlay backing {}", backing_path.display()))?
+                .dev();
+            let bmaj = u64::from(libc::major(backing_dev));
+            if bmaj == 0 {
+                return Ok(1);
+            }
+            return block_drive_count_for_dev(backing_dev, root, &backing_path);
+        }
+        if matches!(
+            fstype,
+            "tmpfs" | "ramfs" | "fuse" | "fuseblk" | "nfs" | "nfs4" | "9p" | "virtiofs"
+        ) || fstype.starts_with("fuse.")
+        {
+            return Ok(1);
+        }
+        bail!(
+            "unsupported virtual filesystem {fstype} on 0:{min} for {}",
+            dir.display()
+        );
+    }
+    let mut visited = std::collections::BTreeSet::new();
+    let mut leaves = std::collections::BTreeSet::new();
+    collect_leaf_drives(root, maj, min, &mut visited, &mut leaves)?;
+    ensure!(
+        !leaves.is_empty(),
+        "no physical drives resolved for {maj}:{min} ({})",
+        dir.display()
+    );
+    Ok(leaves.len())
+}
+
+fn block_drive_count(dir: &Path) -> Result<usize> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = std::fs::metadata(dir)
+        .with_context(|| format!("stat {}", dir.display()))?
+        .dev();
+    block_drive_count_for_dev(dev, Path::new("/"), dir)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ResidentRingSpec {
+    pub(super) src_bytes: usize,
+    pub(super) cast: FillCast,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ResidentRingPlan {
+    pub(super) ring: bool,
+    pub(super) drives: usize,
+    pub(super) shards: usize,
+    pub(super) tensors: usize,
+    pub(super) chunks: usize,
+    pub(super) in_flight: usize,
+    pub(super) chunk_bytes: usize,
+    pub(super) slot_bytes: usize,
+    pub(super) ring_bytes: usize,
+    pub(super) bounce_bound_bytes: usize,
+    pub(super) host_available_bytes: usize,
+    pub(super) host_reserve_bytes: usize,
+}
+
+fn dest_bytes_for_src_chunk(cast: FillCast, src_len: usize) -> Result<usize> {
+    match cast {
+        FillCast::Raw | FillCast::Bf16ToFp16 => Ok(src_len),
+        FillCast::F32ToBf16 | FillCast::F32ToFp16 => {
+            ensure!(
+                src_len.is_multiple_of(4),
+                "narrowing chunk length {src_len} is not a multiple of 4"
+            );
+            Ok(src_len / 2)
+        }
+    }
+}
+
+fn ring_chunk_candidates(max_src: usize) -> Vec<usize> {
+    let cap = (READ_CHUNK_BYTES as usize).min(max_src);
+    let cap = if cap >= 4 {
+        cap - (cap % 4)
+    } else {
+        cap.max(1)
+    };
+    let floor = MIN_RING_CHUNK_BYTES.min(cap);
+    let floor = if floor >= 4 {
+        floor - (floor % 4)
+    } else {
+        floor.max(1)
+    };
+    let mut out = Vec::new();
+    let mut current = cap;
+    loop {
+        if out.last().copied() != Some(current) {
+            out.push(current);
+        }
+        if current <= floor {
+            break;
+        }
+        let next = (current / 2).max(floor);
+        current = if next >= 4 { next - (next % 4) } else { next };
+    }
+    out
+}
+
+fn ring_geometry(
+    specs: &[ResidentRingSpec],
+    chunk_bytes: usize,
+    alignment: usize,
+) -> Result<(usize, usize, usize)> {
+    let mut chunks = 0usize;
+    let mut slot_bytes = 0usize;
+    let mut max_src_chunk = 0usize;
+    for spec in specs {
+        let step = chunk_bytes.min(spec.src_bytes.max(1));
+        chunks = chunks
+            .checked_add(spec.src_bytes.div_ceil(step))
+            .context("resident ring chunk count overflow")?;
+        let chunk_src = spec.src_bytes.min(chunk_bytes);
+        max_src_chunk = max_src_chunk.max(chunk_src);
+        let chunk_dst = dest_bytes_for_src_chunk(spec.cast, chunk_src)?;
+        slot_bytes = slot_bytes.max(chunk_dst);
+    }
+    let bounce_per_worker = max_src_chunk
+        .checked_add(alignment - 1)
+        .map(|v| v & !(alignment - 1))
+        .and_then(|v| v.checked_add(alignment))
+        .context("resident ring bounce bound overflow")?;
+    Ok((chunks, slot_bytes, bounce_per_worker))
+}
+
+fn derive_resident_ring(
+    specs: &[ResidentRingSpec],
+    (drives, shards): (usize, usize),
+    (host_available_bytes, host_reserve_bytes): (usize, usize),
+    alignment: usize,
+) -> Result<ResidentRingPlan> {
+    ensure!(
+        drives > 0 && alignment > 0 && alignment.is_power_of_two(),
+        "invalid resident ring drives={drives} alignment={alignment}"
+    );
+    let serial = ResidentRingPlan {
+        ring: false,
+        drives,
+        shards,
+        tensors: specs.len(),
+        chunks: specs.len(),
+        in_flight: 1,
+        chunk_bytes: 0,
+        slot_bytes: 0,
+        ring_bytes: 0,
+        bounce_bound_bytes: 0,
+        host_available_bytes,
+        host_reserve_bytes,
+    };
+    let max_src = specs.iter().map(|s| s.src_bytes).max().unwrap_or(0);
+    if specs.is_empty() || max_src == 0 {
+        return Ok(serial);
+    }
+    let headroom = host_available_bytes.saturating_sub(host_reserve_bytes);
+    let preferred_budget = headroom / 4;
+    let target_workers = (2 * drives).clamp(4, 8);
+    let candidates = ring_chunk_candidates(max_src);
+    let fits =
+        |workers: usize, chunk_bytes: usize, budget: usize| -> Result<Option<ResidentRingPlan>> {
+            let (chunks, slot_bytes, bounce_per_worker) =
+                ring_geometry(specs, chunk_bytes, alignment)?;
+            let in_flight = workers.min(chunks);
+            if in_flight < 2 {
+                return Ok(None);
+            }
+            let ring_bytes = in_flight
+                .checked_mul(slot_bytes)
+                .context("resident ring bytes overflow")?;
+            let bounce_bound_bytes = in_flight
+                .checked_mul(bounce_per_worker)
+                .context("resident ring bounce overflow")?;
+            let total = ring_bytes
+                .checked_add(bounce_bound_bytes)
+                .context("resident ring total host bytes overflow")?;
+            if total <= budget {
+                Ok(Some(ResidentRingPlan {
+                    ring: true,
+                    drives,
+                    shards,
+                    tensors: specs.len(),
+                    chunks,
+                    in_flight,
+                    chunk_bytes,
+                    slot_bytes,
+                    ring_bytes,
+                    bounce_bound_bytes,
+                    host_available_bytes,
+                    host_reserve_bytes,
+                }))
+            } else {
+                Ok(None)
+            }
+        };
+    for &chunk_bytes in &candidates {
+        if let Some(plan) = fits(target_workers, chunk_bytes, preferred_budget)? {
+            return Ok(plan);
+        }
+    }
+    for &chunk_bytes in &candidates {
+        if let Some(plan) = fits(target_workers, chunk_bytes, headroom)? {
+            return Ok(plan);
+        }
+    }
+    let floor = *candidates.last().context("ring chunk candidates empty")?;
+    for workers in (2..target_workers).rev() {
+        if let Some(plan) = fits(workers, floor, headroom)? {
+            return Ok(plan);
+        }
+    }
+    Ok(serial)
+}
+
+#[derive(Clone)]
+pub(super) struct ResidentRingRequest {
+    pub(super) name: String,
+    pub(super) entry: TensorEntry,
+    pub(super) destination: u64,
+    pub(super) dest_len: usize,
+    pub(super) cast: FillCast,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResidentChunk {
+    request: usize,
+    src_offset: usize,
+    src_len: usize,
+    dst_ptr: u64,
+    dst_len: usize,
+}
+
+fn build_resident_chunks(
+    requests: &[ResidentRingRequest],
+    chunk_bytes: usize,
+) -> Result<Vec<ResidentChunk>> {
+    ensure!(chunk_bytes > 0, "resident ring chunk_bytes is zero");
+    let mut chunks = Vec::new();
+    for (index, req) in requests.iter().enumerate() {
+        let expected_dst = dest_bytes_for_src_chunk(req.cast, req.entry.bytes)?;
+        ensure!(
+            req.dest_len == expected_dst,
+            "{}: resident ring dest_len {} differs from expected {expected_dst}",
+            req.name,
+            req.dest_len
+        );
+        let step = chunk_bytes.min(req.entry.bytes.max(1));
+        if matches!(req.cast, FillCast::F32ToBf16 | FillCast::F32ToFp16) {
+            ensure!(
+                step.is_multiple_of(4),
+                "{}: narrowing step {step} is not a multiple of 4",
+                req.name
+            );
+        } else if req.cast == FillCast::Bf16ToFp16
+            || matches!(req.entry.dtype, Dtype::BF16 | Dtype::F16)
+        {
+            ensure!(
+                step.is_multiple_of(2),
+                "{}: half-width step {step} is not a multiple of 2",
+                req.name
+            );
+        } else if req.entry.dtype == Dtype::F32 {
+            ensure!(
+                step.is_multiple_of(4),
+                "{}: F32 step {step} is not a multiple of 4",
+                req.name
+            );
+        }
+        let mut src_offset = 0usize;
+        while src_offset < req.entry.bytes {
+            let src_len = step.min(req.entry.bytes - src_offset);
+            let dst_offset = dest_bytes_for_src_chunk(req.cast, src_offset)?;
+            let dst_len = dest_bytes_for_src_chunk(req.cast, src_len)?;
+            let dst_ptr = req
+                .destination
+                .checked_add(u64::try_from(dst_offset)?)
+                .with_context(|| format!("{}: resident ring destination overflow", req.name))?;
+            chunks.push(ResidentChunk {
+                request: index,
+                src_offset,
+                src_len,
+                dst_ptr,
+                dst_len,
+            });
+            src_offset += src_len;
+        }
+    }
+    Ok(chunks)
+}
+
+pub(super) fn plan_resident_ring(
+    component: &'static str,
+    dir: &Path,
+    specs: &[ResidentRingSpec],
+    shards: usize,
+) -> Result<ResidentRingPlan> {
+    let drives = block_drive_count(dir)?;
+    let raw_available = usize::try_from(crate::backend::cuda::calibrate::host_memory(Path::new(
+        "/",
+    ))?)?;
+    let live_bounce = LIVE_FILL_BOUNCE_BYTES.load(std::sync::atomic::Ordering::SeqCst);
+    let available = raw_available.saturating_sub(live_bounce);
+    let plan = derive_resident_ring(
+        specs,
+        (drives, shards),
+        (available, RESIDENT_RING_HOST_RESERVE),
+        align_min(),
+    )?;
+    if crate::backend::diagnostics_enabled() {
+        eprintln!(
+            "{}",
+            serde_json::json!({"h3_fill_schedule": {
+                "component": component,
+                "decision": if plan.ring { "ring" } else { "serial" },
+                "drives": plan.drives,
+                "requests": plan.tensors,
+                "chunks": plan.chunks,
+                "shards": plan.shards,
+                "in_flight": plan.in_flight,
+                "chunk_bytes": plan.chunk_bytes,
+                "ring_bytes": plan.ring_bytes,
+                "slot_bytes": plan.slot_bytes,
+                "bounce_bound_bytes": plan.bounce_bound_bytes,
+                "live_fill_bounce_bytes": live_bounce,
+                "host_available_bytes": plan.host_available_bytes,
+                "host_reserve_bytes": plan.host_reserve_bytes}})
+        );
+    }
+    Ok(plan)
+}
+
+fn execute_resident_ring(
+    d: &Device,
+    dir: &Path,
+    requests: &[ResidentRingRequest],
+    chunks: &[ResidentChunk],
+    plan: &ResidentRingPlan,
+) -> Result<()> {
+    ensure!(
+        plan.ring && plan.in_flight >= 2,
+        "resident ring not admitted"
+    );
+    ensure!(!chunks.is_empty(), "resident ring chunk list is empty");
+    let ready = d
+        .stream
+        .record_event(Some(crate::backend::gpu::EVENT_DISABLE_TIMING))?;
+    d.upload.wait(&ready)?;
+    let in_flight = plan.in_flight;
+    let slot_bytes = plan.slot_bytes;
+    let mut pin = unsafe { d.ctx.alloc_pinned_with_flags::<u8>(plan.ring_bytes, 0)? };
+    struct RingBase(*mut u8);
+    unsafe impl Send for RingBase {}
+    unsafe impl Sync for RingBase {}
+    let producer_base = RingBase(pin.as_mut_ptr()?);
+    let consumer_base = pin.as_mut_ptr()?;
+    let events = (0..in_flight)
+        .map(|_| {
+            d.ctx
+                .new_event(Some(crate::backend::gpu::EVENT_DISABLE_TIMING))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let free = Arc::new((
+        std::sync::Mutex::new((0..in_flight).collect::<Vec<_>>()),
+        std::sync::Condvar::new(),
+    ));
+    let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(usize, usize)>>();
+    let producer_dir = dir.to_path_buf();
+    let producer_requests = requests.to_vec();
+    let producer_chunks = chunks.to_vec();
+    let producer_free = Arc::clone(&free);
+    let producer_abort = Arc::clone(&abort);
+    let producer = std::thread::Builder::new()
+        .name("resident-ring".to_owned())
+        .spawn(move || -> Result<()> {
+            let base = &producer_base;
+            let mut reader = EntryReader::new(&producer_dir);
+            let readers = reader.open_shards(
+                producer_requests
+                    .iter()
+                    .map(|request| request.entry.shard.as_str()),
+            )?;
+            let order = claim_order(&producer_chunks, |chunk| {
+                producer_requests[chunk.request].entry.shard.as_str()
+            });
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|scope| -> Result<()> {
+                let handles: Vec<_> = (0..in_flight)
+                    .map(|_| {
+                        let readers = &readers;
+                        let requests = &producer_requests;
+                        let chunks = &producer_chunks;
+                        let order = &order;
+                        let next = &next;
+                        let free = &producer_free;
+                        let abort = &producer_abort;
+                        let done = &done_tx;
+                        scope.spawn(move || -> Result<()> {
+                            let mut bounce = AlignedBytes::new(align_min(), align_min())?;
+                            loop {
+                                let claimed =
+                                    next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                let Some(&chunk_index) = order.get(claimed) else {
+                                    return Ok(());
+                                };
+                                if abort.load(std::sync::atomic::Ordering::SeqCst) {
+                                    return Ok(());
+                                }
+                                let slot = {
+                                    let mut guard = free.0.lock().map_err(|_| {
+                                        anyhow::anyhow!("resident-ring lock poisoned")
+                                    })?;
+                                    loop {
+                                        if let Some(slot) = guard.pop() {
+                                            break slot;
+                                        }
+                                        if abort.load(std::sync::atomic::Ordering::SeqCst) {
+                                            return Ok(());
+                                        }
+                                        guard = free
+                                            .1
+                                            .wait_timeout(
+                                                guard,
+                                                std::time::Duration::from_millis(100),
+                                            )
+                                            .map_err(|_| {
+                                                anyhow::anyhow!("resident-ring lock poisoned")
+                                            })?
+                                            .0;
+                                    }
+                                };
+                                let chunk = chunks[chunk_index];
+                                let request = &requests[chunk.request];
+                                let window = unsafe {
+                                    std::slice::from_raw_parts_mut(
+                                        base.0.add(slot * slot_bytes),
+                                        chunk.dst_len,
+                                    )
+                                };
+                                let result = EntryReader::read_bounced_range(
+                                    readers,
+                                    &request.name,
+                                    &request.entry,
+                                    (chunk.src_offset, chunk.src_len),
+                                    request.cast,
+                                    window,
+                                    &mut bounce,
+                                )
+                                .and_then(|()| {
+                                    resident_raw_finite(
+                                        &request.name,
+                                        &request.entry,
+                                        request.cast,
+                                        window,
+                                    )
+                                });
+                                if let Err(error) = result {
+                                    abort.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    let _ = done.send(Err(error));
+                                    return Ok(());
+                                }
+                                if done.send(Ok((chunk_index, slot))).is_err() {
+                                    abort.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    return Ok(());
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("resident-ring worker panicked"))??;
+                }
+                Ok(())
+            })
+        })?;
+    let mut received = 0usize;
+    let mut inflight: Vec<usize> = Vec::new();
+    let error = loop {
+        let mut still = Vec::new();
+        let mut polled: Result<()> = Ok(());
+        for &slot in &inflight {
+            match events[slot].try_is_complete() {
+                Ok(true) => {
+                    free.0
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("resident-ring lock poisoned"))?
+                        .push(slot);
+                    free.1.notify_all();
+                }
+                Ok(false) => still.push(slot),
+                Err(error) => {
+                    polled = Err::<(), _>(error).context("resident-ring slot event query");
+                    still.push(slot);
+                }
+            }
+        }
+        inflight = still;
+        if let Err(error) = polled {
+            break Err(error);
+        }
+        match done_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(Ok((chunk_index, slot))) => {
+                let chunk = chunks[chunk_index];
+                let window = unsafe {
+                    std::slice::from_raw_parts(consumer_base.add(slot * slot_bytes), chunk.dst_len)
+                };
+                let recorded: Result<()> = (|| {
+                    unsafe {
+                        super::copy::htod_async(chunk.dst_ptr, window, &d.upload)?;
+                    }
+                    events[slot].record(&d.upload)?;
+                    Ok(())
+                })();
+                if let Err(error) = recorded {
+                    break Err(error.context("resident-ring slot upload"));
+                }
+                inflight.push(slot);
+                received += 1;
+                if received == chunks.len() {
+                    break Ok(());
+                }
+            }
+            Ok(Err(error)) => break Err(error),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(anyhow::anyhow!("resident-ring producer ended early"));
+            }
+        }
+    };
+    abort.store(true, std::sync::atomic::Ordering::SeqCst);
+    free.1.notify_all();
+    let joined = producer
+        .join()
+        .map_err(|_| anyhow::anyhow!("resident-ring producer panicked"));
+    d.upload.synchronize()?;
+    drop(pin);
+    joined??;
+    error?;
+    Ok(())
+}
+
+pub(super) fn run_resident_ring(
+    d: &Device,
+    dir: &Path,
+    requests: &[ResidentRingRequest],
+    plan: &ResidentRingPlan,
+) -> Result<()> {
+    let chunks = build_resident_chunks(requests, plan.chunk_bytes)?;
+    execute_resident_ring(d, dir, requests, &chunks, plan)
+}
+
 /// Round-robin claim order across the shard queues of `requests`: position-major over the
 /// per-shard tensor queues, so concurrent claimers spread across shards.
-pub(crate) fn claim_order<T>(requests: &[T], shard: impl Fn(&T) -> &str) -> Vec<usize> {
-    let mut queues: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+pub(crate) fn claim_order<'a, T>(
+    requests: &'a [T],
+    shard: impl Fn(&'a T) -> &'a str,
+) -> Vec<usize> {
+    let mut queues: BTreeMap<&'a str, Vec<usize>> = BTreeMap::new();
     for (index, request) in requests.iter().enumerate() {
         queues.entry(shard(request)).or_default().push(index);
     }
@@ -395,10 +1080,6 @@ impl OwnedRead {
 
     pub(crate) fn entry(&self) -> &TensorEntry {
         &self.entry
-    }
-
-    pub(crate) fn dest_len(&self) -> usize {
-        self.dest_len
     }
 
     pub(crate) fn cast(&self) -> FillCast {
@@ -929,35 +1610,79 @@ impl EntryReader {
         destination: &mut [u8],
         bounce: &mut AlignedBytes,
     ) -> Result<()> {
+        Self::read_bounced_range(
+            readers,
+            name,
+            entry,
+            (0, entry.bytes),
+            cast,
+            destination,
+            bounce,
+        )
+    }
+
+    /// Byte range `(src_offset, src_len)` of `entry` through an aligned worker bounce.
+    pub(super) fn read_bounced_range(
+        readers: &BTreeMap<String, SpanReader>,
+        name: &str,
+        entry: &TensorEntry,
+        (src_offset, src_len): (usize, usize),
+        cast: FillCast,
+        destination: &mut [u8],
+        bounce: &mut AlignedBytes,
+    ) -> Result<()> {
+        ensure!(
+            src_offset
+                .checked_add(src_len)
+                .is_some_and(|end| end <= entry.bytes),
+            "{name}: range {src_offset}+{src_len} outside {} B",
+            entry.bytes
+        );
         let reader = readers
             .get(&entry.shard)
             .with_context(|| format!("{name}: shard {} not open", entry.shard))?;
         let start = entry
             .data_start
             .checked_add(entry.data_offsets[0])
+            .and_then(|v| v.checked_add(src_offset as u64))
             .context("tensor offset overflow")?;
         let align = reader.alignment as usize;
         let head = start as usize % align;
         let begin = start - head as u64;
-        let width = entry
-            .bytes
+        let width = src_len
             .checked_add(head)
             .and_then(|v| v.checked_add(align - 1))
             .context("pinned span overflow")?
             & !(align - 1);
         let width = width
             .min(usize::try_from(reader.file_len() - begin)?)
-            .max(entry.bytes + head);
+            .max(src_len + head);
         let filled = match cast {
-            FillCast::Raw => entry.bytes,
+            FillCast::Raw => {
+                if entry.quant.is_none() {
+                    match entry.dtype {
+                        Dtype::F32 => ensure!(
+                            src_offset.is_multiple_of(4) && src_len.is_multiple_of(4),
+                            "{name}: unaligned F32 range {src_offset}+{src_len}"
+                        ),
+                        Dtype::BF16 | Dtype::F16 => ensure!(
+                            src_offset.is_multiple_of(2) && src_len.is_multiple_of(2),
+                            "{name}: unaligned half range {src_offset}+{src_len}"
+                        ),
+                        _ => {}
+                    }
+                }
+                src_len
+            }
             FillCast::Bf16ToFp16 => {
                 ensure!(
                     entry.dtype == Dtype::BF16
                         && entry.quant.is_none()
-                        && entry.bytes.is_multiple_of(2),
+                        && src_offset.is_multiple_of(2)
+                        && src_len.is_multiple_of(2),
                     "{name}: BF16 to FP16 fill source"
                 );
-                entry.bytes
+                src_len
             }
             FillCast::F32ToBf16 | FillCast::F32ToFp16 => {
                 let kind = if cast == FillCast::F32ToFp16 {
@@ -968,10 +1693,11 @@ impl EntryReader {
                 ensure!(
                     entry.dtype == Dtype::F32
                         && entry.quant.is_none()
-                        && entry.bytes.is_multiple_of(4),
+                        && src_offset.is_multiple_of(4)
+                        && src_len.is_multiple_of(4),
                     "{name}: F32 to {kind} fill source"
                 );
-                entry.bytes / 2
+                src_len / 2
             }
         };
         ensure!(
@@ -985,11 +1711,11 @@ impl EntryReader {
         }
         let span = bounce.as_mut();
         reader.read_direct(begin, width as u64, span)?;
-        let source = &span[head..head + entry.bytes];
+        let source = &span[head..head + src_len];
         match cast {
-            FillCast::Raw => destination[..entry.bytes].copy_from_slice(source),
+            FillCast::Raw => destination[..src_len].copy_from_slice(source),
             FillCast::Bf16ToFp16 => {
-                let output = &mut destination[..entry.bytes];
+                let output = &mut destination[..src_len];
                 output.copy_from_slice(source);
                 crate::tensors::bf16_weight_to_fp16(name, output, true)?;
             }
@@ -5906,6 +6632,296 @@ type VideoPlacementChooser<'a> = dyn FnMut(
     ) -> Result<crate::prefill::DensePlacement>
     + 'a;
 
+fn preload_resident_dense_storage(
+    d: &Device,
+    base: &Source<'_>,
+    blocks: &[(usize, String)],
+    component: &'static str,
+) -> Result<BTreeMap<usize, (MatrixLayout, CudaSlice<bf16>)>> {
+    if blocks.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut eligible = Vec::new();
+    let mut specs = Vec::new();
+    let mut shards = std::collections::BTreeSet::new();
+    for (index, block) in blocks {
+        let (layout, elements) = matrix_layout(base.manifest, block, &LINEAR_ROLES)?;
+        let mut unquantized = true;
+        for role in layout.keys() {
+            let name = format!("{block}.{role}");
+            let entry = base
+                .manifest
+                .entries
+                .get(&name)
+                .with_context(|| format!("manifest lacks {name}"))?;
+            if entry.quant.is_some() {
+                unquantized = false;
+                break;
+            }
+        }
+        if !unquantized {
+            continue;
+        }
+        for role in layout.keys() {
+            let name = format!("{block}.{role}");
+            let entry = &base.manifest.entries[&name];
+            shards.insert(entry.shard.as_str());
+            specs.push(ResidentRingSpec {
+                src_bytes: entry.bytes,
+                cast: weight_fill_cast(base.fp16_weights, entry),
+            });
+        }
+        eligible.push((*index, block.clone(), layout, elements));
+    }
+    if specs.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let plan = plan_resident_ring(component, &base.reader.dir, &specs, shards.len())?;
+    if !plan.ring {
+        return Ok(BTreeMap::new());
+    }
+    let s = &d.stream;
+    let mut out = BTreeMap::new();
+    let mut requests = Vec::with_capacity(specs.len());
+    for (index, block, layout, elements) in eligible {
+        let storage = unsafe { s.alloc::<bf16>(elements)? };
+        let at = pointer(&storage, s);
+        for (role, &(offset, shape)) in &layout {
+            let name = format!("{block}.{role}");
+            let entry = &base.manifest.entries[&name];
+            let expected = 2 * shape[0] as usize * shape[1] as usize;
+            ensure!(
+                entry.dtype == Dtype::BF16 && entry.bytes == expected,
+                "{name}: {:?} {} B does not fill {expected} B",
+                entry.dtype,
+                entry.bytes
+            );
+            let destination = at
+                .checked_add(u64::try_from(2 * offset)?)
+                .context("resident block address overflow")?;
+            requests.push(ResidentRingRequest {
+                name,
+                entry: entry.clone(),
+                destination,
+                dest_len: entry.bytes,
+                cast: weight_fill_cast(base.fp16_weights, entry),
+            });
+        }
+        out.insert(index, (layout, storage));
+    }
+    run_resident_ring(d, &base.reader.dir, &requests, &plan)?;
+    Ok(out)
+}
+
+fn preload_stored_resident_linears(
+    d: &Device,
+    spec: &H3Spec,
+    base: &mut Source<'_>,
+    resident_layers: &[usize],
+) -> Result<BTreeMap<usize, [BlockLinear; 6]>> {
+    if resident_layers.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut specs = Vec::new();
+    let mut shards = std::collections::BTreeSet::new();
+    for &layer in resident_layers {
+        let block = format!("transformer_blocks.{layer}");
+        for role in LINEAR_ROLES {
+            let suffix = role.strip_suffix(".weight").context("linear role")?;
+            let name = format!("{block}.{suffix}");
+            match spec.linear_storage(&name)? {
+                LinearStorage::Dense => {
+                    let wname = format!("{name}.weight");
+                    let _ = factor_shape(base, &wname, Dtype::BF16)?;
+                    let entry = &base.manifest.entries[&wname];
+                    shards.insert(entry.shard.as_str());
+                    specs.push(ResidentRingSpec {
+                        src_bytes: entry.bytes,
+                        cast: weight_fill_cast(base.fp16_weights, entry),
+                    });
+                }
+                LinearStorage::Int8 { .. } => {
+                    let qname = format!("{name}.qweight");
+                    let _ = factor_shape(base, &qname, Dtype::I8)?;
+                    let entry = &base.manifest.entries[&qname];
+                    shards.insert(entry.shard.as_str());
+                    specs.push(ResidentRingSpec {
+                        src_bytes: entry.bytes,
+                        cast: FillCast::Raw,
+                    });
+                }
+                LinearStorage::LowRank { .. } => {
+                    for part in ["down.weight", "up.weight"] {
+                        let pname = format!("{name}.{part}");
+                        let _ = factor_shape(base, &pname, Dtype::BF16)?;
+                        let entry = &base.manifest.entries[&pname];
+                        shards.insert(entry.shard.as_str());
+                        specs.push(ResidentRingSpec {
+                            src_bytes: entry.bytes,
+                            cast: weight_fill_cast(base.fp16_weights, entry),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    let plan = plan_resident_ring("dit-resident", &base.reader.dir, &specs, shards.len())?;
+    if !plan.ring {
+        return Ok(BTreeMap::new());
+    }
+    let s = &d.stream;
+    let optin = crate::backend::cuda::optin_shared_bytes(s.context())?;
+    let mut requests = Vec::with_capacity(specs.len());
+    let mut preloaded = BTreeMap::new();
+    for &layer in resident_layers {
+        let block = format!("transformer_blocks.{layer}");
+        let mut linears = Vec::with_capacity(LINEAR_ROLES.len());
+        for role in LINEAR_ROLES {
+            let suffix = role.strip_suffix(".weight").context("linear role")?;
+            let name = format!("{block}.{suffix}");
+            let linear = match spec.linear_storage(&name)? {
+                LinearStorage::Dense => {
+                    let wname = format!("{name}.weight");
+                    let (rows, cols) = factor_shape(base, &wname, Dtype::BF16)?;
+                    let entry = base.manifest.entries[&wname].clone();
+                    ensure!(
+                        entry.bytes == 2 * rows * cols,
+                        "{wname}: {} B does not match [{rows}, {cols}]",
+                        entry.bytes
+                    );
+                    let owned = unsafe { s.alloc::<bf16>(rows * cols)? };
+                    let weight = matrix(&owned, s, rows, cols)?;
+                    requests.push(ResidentRingRequest {
+                        name: wname,
+                        destination: pointer(&owned, s),
+                        dest_len: entry.bytes,
+                        cast: weight_fill_cast(base.fp16_weights, &entry),
+                        entry,
+                    });
+                    BlockLinear::Dense {
+                        weight,
+                        owned: Some(owned),
+                    }
+                }
+                LinearStorage::Int8 { group } => {
+                    let qname = format!("{name}.qweight");
+                    let (rows, cols) = factor_shape(base, &qname, Dtype::I8)?;
+                    let group_usize = usize::try_from(group)?;
+                    ensure!(
+                        group_usize > 0 && cols.is_multiple_of(group_usize),
+                        "{name} convrot group {group}"
+                    );
+                    crate::convrot::ensure_group(group, optin)
+                        .with_context(|| format!("{name} convrot group"))?;
+                    let entry = base.manifest.entries[&qname].clone();
+                    ensure!(
+                        entry.bytes == rows * cols,
+                        "{qname}: {} B does not match [{rows}, {cols}]",
+                        entry.bytes
+                    );
+                    let wscale = base.vector::<f32>(s, &format!("{name}.wscale"), rows)?;
+                    let owned = unsafe { s.alloc::<i8>(rows * cols)? };
+                    let qweight = view(
+                        &owned,
+                        s,
+                        0,
+                        [u32::try_from(rows)?, u32::try_from(cols)?],
+                        [u64::try_from(cols)?, 1],
+                    )?;
+                    requests.push(ResidentRingRequest {
+                        name: qname,
+                        destination: pointer(&owned, s),
+                        dest_len: entry.bytes,
+                        cast: FillCast::Raw,
+                        entry,
+                    });
+                    BlockLinear::Int8 {
+                        qweight,
+                        wscale,
+                        group,
+                        owned: Some(owned),
+                    }
+                }
+                LinearStorage::LowRank { rank } => {
+                    let down_name = format!("{name}.down.weight");
+                    let up_name = format!("{name}.up.weight");
+                    let (down_rows, down_cols) = factor_shape(base, &down_name, Dtype::BF16)?;
+                    let (up_rows, up_cols) = factor_shape(base, &up_name, Dtype::BF16)?;
+                    ensure!(
+                        down_rows == rank && up_cols == rank && rank > 0,
+                        "{name} low-rank {rank}"
+                    );
+                    let (pitch, bytes) = low_rank_overread(&down_name, rank, down_cols)?;
+                    let elements = pitch
+                        .checked_mul(down_cols)
+                        .with_context(|| format!("{down_name} low-rank down allocation"))?;
+                    let down_entry = base.manifest.entries[&down_name].clone();
+                    let stored = rank
+                        .checked_mul(down_cols)
+                        .with_context(|| format!("{down_name} low-rank down allocation"))?;
+                    ensure!(
+                        down_entry.bytes == 2 * stored,
+                        "{down_name}: {} B does not match [{rank}, {down_cols}]",
+                        down_entry.bytes
+                    );
+                    let down_owned = s.alloc_zeros::<bf16>(elements)?;
+                    let base_ptr = pointer(&down_owned, s);
+                    let span = u64::try_from(
+                        down_owned
+                            .len()
+                            .checked_mul(2)
+                            .context("resident factor bytes")?,
+                    )?;
+                    let end = base_ptr
+                        .checked_add(span)
+                        .context("resident factor bytes")?;
+                    ensure!(
+                        base_ptr
+                            .checked_add(u64::try_from(bytes)?)
+                            .is_some_and(|stop| stop <= end),
+                        "{down_name}: low-rank over-read exceeds the allocation"
+                    );
+                    let down = matrix(&down_owned, s, pitch, down_cols)?;
+                    requests.push(ResidentRingRequest {
+                        name: down_name,
+                        destination: base_ptr,
+                        dest_len: down_entry.bytes,
+                        cast: weight_fill_cast(base.fp16_weights, &down_entry),
+                        entry: down_entry,
+                    });
+                    let up_entry = base.manifest.entries[&up_name].clone();
+                    ensure!(
+                        up_entry.bytes == 2 * up_rows * up_cols,
+                        "{up_name}: {} B does not match [{up_rows}, {up_cols}]",
+                        up_entry.bytes
+                    );
+                    let up_owned = unsafe { s.alloc::<bf16>(up_rows * up_cols)? };
+                    let up = matrix(&up_owned, s, up_rows, up_cols)?;
+                    requests.push(ResidentRingRequest {
+                        name: up_name,
+                        destination: pointer(&up_owned, s),
+                        dest_len: up_entry.bytes,
+                        cast: weight_fill_cast(base.fp16_weights, &up_entry),
+                        entry: up_entry,
+                    });
+                    BlockLinear::LowRank {
+                        down,
+                        up,
+                        owned: vec![down_owned, up_owned],
+                    }
+                }
+            };
+            linears.push(linear);
+        }
+        let linears: [BlockLinear; 6] = linears
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("block linear count"))?;
+        preloaded.insert(layer, linears);
+    }
+    run_resident_ring(d, &base.reader.dir, &requests, &plan)?;
+    Ok(preloaded)
+}
+
 impl Dit {
     #[cfg(feature = "cuda")]
     fn qualify_projections(&self, blas: &Blas, table: &AdalnTable) -> Result<()> {
@@ -6013,30 +7029,53 @@ impl Dit {
         ];
         let final_norm = base.tensor(s, "token_refiner.final_norm.weight", h)?;
         let norm_out = base.tensor(s, "norm_out.norm.weight", h)?;
+        let refiner_names: Vec<(usize, String)> = (0..spec.refiner_layers)
+            .map(|i| (i, format!("token_refiner.refiner_blocks.{i}")))
+            .collect();
+        let mut refiner_storage =
+            preload_resident_dense_storage(d, &base, &refiner_names, "dit-refiners")?;
         let refiners = if hyperflow {
-            (0..spec.refiner_layers)
-                .map(|i| {
-                    BlockWeights::resident::<false>(
-                        s,
-                        spec,
-                        r,
-                        &format!("token_refiner.refiner_blocks.{i}"),
-                        &mut base,
-                        None,
-                    )
+            refiner_names
+                .iter()
+                .map(|(i, name)| match refiner_storage.remove(i) {
+                    Some((layout, storage)) => {
+                        let at = pointer(&storage, s);
+                        let mut weights = BlockWeights::with_linears::<false>(
+                            s,
+                            spec,
+                            r,
+                            name,
+                            (at, &layout),
+                            &mut base,
+                            None,
+                        )?;
+                        weights.storage = Some(storage);
+                        Ok(weights)
+                    }
+                    None => BlockWeights::resident::<false>(s, spec, r, name, &mut base, None),
                 })
                 .collect::<Result<Vec<_>>>()?
         } else {
-            (0..spec.refiner_layers)
-                .map(|i| {
-                    BlockWeights::resident::<true>(
-                        s,
-                        spec,
-                        r,
-                        &format!("token_refiner.refiner_blocks.{i}"),
-                        &mut base,
-                        lora.as_mut(),
-                    )
+            refiner_names
+                .iter()
+                .map(|(i, name)| match refiner_storage.remove(i) {
+                    Some((layout, storage)) => {
+                        let at = pointer(&storage, s);
+                        let mut weights = BlockWeights::with_linears::<true>(
+                            s,
+                            spec,
+                            r,
+                            name,
+                            (at, &layout),
+                            &mut base,
+                            lora.as_mut(),
+                        )?;
+                        weights.storage = Some(storage);
+                        Ok(weights)
+                    }
+                    None => {
+                        BlockWeights::resident::<true>(s, spec, r, name, &mut base, lora.as_mut())
+                    }
                 })
                 .collect::<Result<Vec<_>>>()?
         };
@@ -6160,6 +7199,16 @@ impl Dit {
                 .dropped_blocks
                 .as_deref()
                 .context("HyperFlow dropped blocks")?;
+            let resident_layers: Vec<usize> = (0..packed.len())
+                .filter(|layer| {
+                    !dropped.contains(layer)
+                        && !tier
+                            .as_ref()
+                            .is_some_and(|tier| tier.dense.plan.slots[*layer].is_some())
+                })
+                .collect();
+            let mut preloaded =
+                preload_stored_resident_linears(d, spec, &mut base, &resident_layers)?;
             let mut blocks = Vec::with_capacity(spec.layers);
             for (layer, factors) in packed.iter().enumerate() {
                 #[cfg(test)]
@@ -6188,7 +7237,13 @@ impl Dit {
                     )),
                     _ => None,
                 };
-                blocks.push(BlockWeights::stored(s, spec, &name, &mut base, slot)?);
+                let block = match preloaded.remove(&layer) {
+                    Some(linears) => BlockWeights::with_linears_ready::<false>(
+                        s, spec, 0, &name, linears, &mut base, None,
+                    )?,
+                    None => BlockWeights::stored(s, spec, &name, &mut base, slot)?,
+                };
+                blocks.push(block);
                 #[cfg(test)]
                 eprintln!(
                     "{}",
@@ -6233,6 +7288,16 @@ impl Dit {
                 )?
                 .tier
             };
+            let resident_names: Vec<(usize, String)> = (0..sizing.layers.len())
+                .filter(|layer| {
+                    !tier
+                        .as_ref()
+                        .is_some_and(|tier| tier.dense.plan.slots[*layer].is_some())
+                })
+                .map(|layer| (layer, format!("transformer_blocks.{layer}")))
+                .collect();
+            let mut resident_storage =
+                preload_resident_dense_storage(d, &base, &resident_names, "dit-resident")?;
             let mut blocks = Vec::with_capacity(spec.layers);
             for (layer, &bytes) in sizing.layers.iter().enumerate() {
                 let name = format!("transformer_blocks.{layer}");
@@ -6252,9 +7317,30 @@ impl Dit {
                         &mut base,
                         lora.as_mut(),
                     )?,
-                    None => {
-                        BlockWeights::resident::<true>(s, spec, r, &name, &mut base, lora.as_mut())?
-                    }
+                    None => match resident_storage.remove(&layer) {
+                        Some((layout, storage)) => {
+                            let at = pointer(&storage, s);
+                            let mut weights = BlockWeights::with_linears::<true>(
+                                s,
+                                spec,
+                                r,
+                                &name,
+                                (at, &layout),
+                                &mut base,
+                                lora.as_mut(),
+                            )?;
+                            weights.storage = Some(storage);
+                            weights
+                        }
+                        None => BlockWeights::resident::<true>(
+                            s,
+                            spec,
+                            r,
+                            &name,
+                            &mut base,
+                            lora.as_mut(),
+                        )?,
+                    },
                 });
             }
             (tier, blocks)
@@ -21109,6 +22195,667 @@ mod h3_direct_batch_tests {
             Ok(())
         })();
         std::fs::remove_dir_all(&root)?;
+        result
+    }
+
+    #[test]
+    fn resident_ring_derivation_scales_by_drives_and_host_memory() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("ff-h3-ring-derive-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let result = (|| -> Result<()> {
+            // 1. Synthetic sysfs topologies: 1-drive partition (T4), 2 partitions on 1 disk,
+            //    3-drive LVM (4090), tmpfs, and missing sysfs node error.
+            let sys_block = root.join("sys/dev/block");
+            let devices = root.join("sys/devices");
+            std::fs::create_dir_all(&sys_block)?;
+            // Disk sda (8:0) with two partitions sda1 (8:1) and sda2 (8:2).
+            let sda = devices.join("sda");
+            let sda1 = sda.join("sda1");
+            let sda2 = sda.join("sda2");
+            std::fs::create_dir_all(&sda1)?;
+            std::fs::create_dir_all(&sda2)?;
+            std::fs::write(sda.join("dev"), "8:0\n")?;
+            std::fs::write(sda1.join("dev"), "8:1\n")?;
+            std::fs::write(sda1.join("partition"), "1\n")?;
+            std::fs::write(sda2.join("dev"), "8:2\n")?;
+            std::fs::write(sda2.join("partition"), "2\n")?;
+            std::os::unix::fs::symlink(&sda, sys_block.join("8:0"))?;
+            std::os::unix::fs::symlink(&sda1, sys_block.join("8:1"))?;
+            std::os::unix::fs::symlink(&sda2, sys_block.join("8:2"))?;
+            // LVM dm-1 (252:1) spanning sda1 + sda2 -> 1 physical disk.
+            let dm1 = devices.join("dm-1");
+            std::fs::create_dir_all(dm1.join("slaves"))?;
+            std::fs::write(dm1.join("dev"), "252:1\n")?;
+            std::os::unix::fs::symlink(&sda1, dm1.join("slaves/sda1"))?;
+            std::os::unix::fs::symlink(&sda2, dm1.join("slaves/sda2"))?;
+            std::os::unix::fs::symlink(&dm1, sys_block.join("252:1"))?;
+            // 3-NVMe LVM dm-0 (252:0): nvme0n1 (259:0), nvme1n1p3 (259:5 -> nvme1n1 259:2), nvme2n1 (259:1).
+            let nvme0 = devices.join("nvme0n1");
+            let nvme1 = devices.join("nvme1n1");
+            let nvme1p3 = nvme1.join("nvme1n1p3");
+            let nvme2 = devices.join("nvme2n1");
+            for d in [&nvme0, &nvme1p3, &nvme2] {
+                std::fs::create_dir_all(d)?;
+            }
+            std::fs::write(nvme0.join("dev"), "259:0\n")?;
+            std::fs::write(nvme1.join("dev"), "259:2\n")?;
+            std::fs::write(nvme1p3.join("dev"), "259:5\n")?;
+            std::fs::write(nvme1p3.join("partition"), "3\n")?;
+            std::fs::write(nvme2.join("dev"), "259:1\n")?;
+            std::os::unix::fs::symlink(&nvme0, sys_block.join("259:0"))?;
+            std::os::unix::fs::symlink(&nvme1, sys_block.join("259:2"))?;
+            std::os::unix::fs::symlink(&nvme1p3, sys_block.join("259:5"))?;
+            std::os::unix::fs::symlink(&nvme2, sys_block.join("259:1"))?;
+            let dm0 = devices.join("dm-0");
+            std::fs::create_dir_all(dm0.join("slaves"))?;
+            std::fs::write(dm0.join("dev"), "252:0\n")?;
+            std::os::unix::fs::symlink(&nvme0, dm0.join("slaves/nvme0n1"))?;
+            std::os::unix::fs::symlink(&nvme1p3, dm0.join("slaves/nvme1n1p3"))?;
+            std::os::unix::fs::symlink(&nvme2, dm0.join("slaves/nvme2n1"))?;
+            std::os::unix::fs::symlink(&dm0, sys_block.join("252:0"))?;
+            std::fs::create_dir_all(root.join("proc/self"))?;
+            std::fs::write(
+                root.join("proc/self/mountinfo"),
+                "28 24 0:25 / /run rw - tmpfs tmpfs rw\n",
+            )?;
+            let makedev = |maj: u64, min: u64| libc::makedev(maj as u32, min as u32);
+            assert_eq!(block_drive_count_for_dev(makedev(8, 1), &root, &root)?, 1);
+            assert_eq!(block_drive_count_for_dev(makedev(252, 1), &root, &root)?, 1);
+            assert_eq!(block_drive_count_for_dev(makedev(252, 0), &root, &root)?, 3);
+            assert_eq!(block_drive_count_for_dev(makedev(0, 25), &root, &root)?, 1);
+            assert!(block_drive_count_for_dev(makedev(8, 99), &root, &root).is_err());
+
+            // 2. Ring derivation for 4090 (drives=3) and T4 12.7 GiB (drives=1) across host budgets.
+            let gib = 1usize << 30;
+            let mib = 1usize << 20;
+            let dit_specs = vec![
+                ResidentRingSpec {
+                    src_bytes: 308 * mib,
+                    cast: FillCast::Raw,
+                };
+                12
+            ];
+            let vae_specs = vec![
+                ResidentRingSpec {
+                    src_bytes: 128 * mib,
+                    cast: FillCast::F32ToBf16,
+                };
+                32
+            ];
+            // 4090 cold one-shot: drives=3, 43 GiB available -> in_flight=6, chunk=32 MiB.
+            let p4090_dit = derive_resident_ring(
+                &dit_specs,
+                (3, 3),
+                (43 * gib, RESIDENT_RING_HOST_RESERVE),
+                4096,
+            )?;
+            assert!(p4090_dit.ring);
+            assert_eq!(p4090_dit.in_flight, 6);
+            assert_eq!(p4090_dit.chunk_bytes, 32 * mib);
+            assert_eq!(p4090_dit.slot_bytes, 32 * mib);
+            assert_eq!(p4090_dit.ring_bytes, 192 * mib);
+            let p4090_vae = derive_resident_ring(
+                &vae_specs,
+                (3, 3),
+                (6 * gib + 440 * mib, RESIDENT_RING_HOST_RESERVE),
+                4096,
+            )?;
+            assert!(p4090_vae.ring);
+            assert_eq!(p4090_vae.in_flight, 6);
+            assert_eq!(p4090_vae.chunk_bytes, 32 * mib);
+            assert_eq!(p4090_vae.slot_bytes, 16 * mib);
+            assert_eq!(p4090_vae.ring_bytes, 96 * mib);
+
+            // Colab T4 12.7 GiB (drives=1): fresh (10.5 GiB), tight (4.5 GiB), very tight (4.10 GiB),
+            // extreme (4.02 GiB), and sub-minimum (4.005 GiB).
+            let t4_specs = vec![
+                ResidentRingSpec {
+                    src_bytes: 154 * mib,
+                    cast: FillCast::Bf16ToFp16,
+                };
+                12
+            ];
+            let t4_fresh = derive_resident_ring(
+                &t4_specs,
+                (1, 3),
+                (10 * gib + 512 * mib, RESIDENT_RING_HOST_RESERVE),
+                4096,
+            )?;
+            assert!(t4_fresh.ring);
+            assert_eq!(t4_fresh.in_flight, 4);
+            assert_eq!(t4_fresh.chunk_bytes, 32 * mib);
+            assert_eq!(t4_fresh.ring_bytes, 128 * mib);
+
+            let t4_tight = derive_resident_ring(
+                &t4_specs,
+                (1, 3),
+                (4 * gib + 512 * mib, RESIDENT_RING_HOST_RESERVE),
+                4096,
+            )?;
+            assert!(t4_tight.ring);
+            assert_eq!(t4_tight.in_flight, 4);
+            assert_eq!(t4_tight.chunk_bytes, 8 * mib);
+
+            let t4_very_tight = derive_resident_ring(
+                &t4_specs,
+                (1, 3),
+                (4 * gib + 100 * mib, RESIDENT_RING_HOST_RESERVE),
+                4096,
+            )?;
+            assert!(t4_very_tight.ring);
+            assert_eq!(t4_very_tight.in_flight, 4);
+            assert_eq!(t4_very_tight.chunk_bytes, 8 * mib);
+
+            let t4_min_chunk = derive_resident_ring(
+                &t4_specs,
+                (1, 3),
+                (4 * gib + 40 * mib, RESIDENT_RING_HOST_RESERVE),
+                4096,
+            )?;
+            assert!(t4_min_chunk.ring);
+            assert_eq!(t4_min_chunk.in_flight, 4);
+            assert_eq!(t4_min_chunk.chunk_bytes, 4 * mib);
+
+            let t4_extreme = derive_resident_ring(
+                &t4_specs,
+                (1, 3),
+                (4 * gib + 20 * mib, RESIDENT_RING_HOST_RESERVE),
+                4096,
+            )?;
+            assert!(t4_extreme.ring);
+            assert_eq!(t4_extreme.in_flight, 2);
+            assert_eq!(t4_extreme.chunk_bytes, 4 * mib);
+
+            let t4_serial = derive_resident_ring(
+                &t4_specs,
+                (1, 3),
+                (4 * gib + 5 * mib, RESIDENT_RING_HOST_RESERVE),
+                4096,
+            )?;
+            assert!(!t4_serial.ring);
+            assert_eq!(t4_serial.in_flight, 1);
+
+            // Small batch caps in_flight to chunk count.
+            let two_chunks = vec![
+                ResidentRingSpec {
+                    src_bytes: 64 * mib,
+                    cast: FillCast::Raw,
+                };
+                1
+            ];
+            let p_small = derive_resident_ring(
+                &two_chunks,
+                (3, 1),
+                (43 * gib, RESIDENT_RING_HOST_RESERVE),
+                4096,
+            )?;
+            assert!(p_small.ring);
+            assert_eq!(p_small.chunks, 2);
+            assert_eq!(p_small.in_flight, 2);
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&root).ok();
+        result
+    }
+
+    #[test]
+    fn resident_ring_chunks_cover_every_byte_and_validate_every_chunk() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("ff-h3-ring-chunks-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir)?;
+        let result = (|| -> Result<()> {
+            let unaligned = 137usize;
+            let chunk_bytes = 4096usize;
+            // Build 3 shards with coprime byte patterns across BF16, I8, and F32 tensors (> 3 chunks each).
+            let bf16_elems = 7000usize;
+            let bf16_bytes = bf16_elems * 2;
+            let i8_bytes = 14003usize;
+            let f32_elems = 3500usize;
+            let f32_bytes = f32_elems * 4;
+
+            let mut shard0 = vec![0x5au8; unaligned];
+            for i in 0..bf16_elems {
+                let v = bf16::from_f32(((i % 251) as f32 - 125.0) * 0.125);
+                shard0.extend_from_slice(&v.to_bits().to_le_bytes());
+            }
+            shard0.resize(shard0.len().next_multiple_of(4096) + 4096, 0);
+            std::fs::write(dir.join("s0.bin"), &shard0)?;
+
+            let mut shard1 = vec![0x3cu8; unaligned + 64];
+            for i in 0..i8_bytes {
+                shard1.push(((i * 7 + 13) % 251) as u8);
+            }
+            shard1.resize(shard1.len().next_multiple_of(4096) + 4096, 0);
+            std::fs::write(dir.join("s1.bin"), &shard1)?;
+
+            let mut shard2 = vec![0x7eu8; unaligned + 128];
+            for i in 0..f32_elems {
+                let v = ((i % 257) as f32 - 128.0) * 0.0625;
+                shard2.extend_from_slice(&v.to_le_bytes());
+            }
+            shard2.resize(shard2.len().next_multiple_of(4096) + 4096, 0);
+            std::fs::write(dir.join("s2.bin"), &shard2)?;
+
+            let mk_entry = |shard: &str, dtype: Dtype, start: usize, bytes: usize| TensorEntry {
+                dtype,
+                shape: vec![bytes],
+                shard: shard.to_owned(),
+                bytes,
+                load: true,
+                data_start: start as u64,
+                data_offsets: [0, bytes as u64],
+                scope: crate::checkpoint::TensorScope::Text,
+                layer: None,
+                role: String::new(),
+                scale_name: None,
+                quant: None,
+                swap_halves: false,
+            };
+            let e_bf16 = mk_entry("s0.bin", Dtype::BF16, unaligned, bf16_bytes);
+            let e_i8 = mk_entry("s1.bin", Dtype::I8, unaligned + 64, i8_bytes);
+            let e_f32 = mk_entry("s2.bin", Dtype::F32, unaligned + 128, f32_bytes);
+
+            let requests = vec![
+                ResidentRingRequest {
+                    name: "blk.dense.weight".into(),
+                    entry: e_bf16.clone(),
+                    destination: 0,
+                    dest_len: bf16_bytes,
+                    cast: FillCast::Raw,
+                },
+                ResidentRingRequest {
+                    name: "blk.dense.fp16".into(),
+                    entry: e_bf16.clone(),
+                    destination: 0,
+                    dest_len: bf16_bytes,
+                    cast: FillCast::Bf16ToFp16,
+                },
+                ResidentRingRequest {
+                    name: "blk.int8.qweight".into(),
+                    entry: e_i8.clone(),
+                    destination: 0,
+                    dest_len: i8_bytes,
+                    cast: FillCast::Raw,
+                },
+                ResidentRingRequest {
+                    name: "vae.f32.weight".into(),
+                    entry: e_f32.clone(),
+                    destination: 0,
+                    dest_len: f32_bytes,
+                    cast: FillCast::Raw,
+                },
+                ResidentRingRequest {
+                    name: "vae.bf16.weight".into(),
+                    entry: e_f32.clone(),
+                    destination: 0,
+                    dest_len: f32_bytes / 2,
+                    cast: FillCast::F32ToBf16,
+                },
+                ResidentRingRequest {
+                    name: "vae.fp16.weight".into(),
+                    entry: e_f32.clone(),
+                    destination: 0,
+                    dest_len: f32_bytes / 2,
+                    cast: FillCast::F32ToFp16,
+                },
+            ];
+            let chunks = build_resident_chunks(&requests, chunk_bytes)?;
+            ensure!(chunks.len() >= 20, "expected >= 3 chunks per tensor");
+
+            let mut reader = EntryReader::new(&dir);
+            let readers = reader.open_shards(["s0.bin", "s1.bin", "s2.bin"].into_iter())?;
+            let mut bounce = AlignedBytes::new(4096, 4096)?;
+
+            // Full-tensor references + chunked reassembly parity.
+            let mut refs: Vec<Vec<u8>> = Vec::new();
+            let mut got: Vec<Vec<u8>> = Vec::new();
+            for req in &requests {
+                let mut full = vec![0u8; req.dest_len];
+                EntryReader::read_bounced(
+                    readers,
+                    &req.name,
+                    &req.entry,
+                    req.cast,
+                    &mut full,
+                    &mut bounce,
+                )?;
+                resident_raw_finite(&req.name, &req.entry, req.cast, &full)?;
+                refs.push(full);
+                got.push(vec![0u8; req.dest_len]);
+            }
+            for chunk in &chunks {
+                let req = &requests[chunk.request];
+                let dst_off = usize::try_from(chunk.dst_ptr)?;
+                let slice = &mut got[chunk.request][dst_off..dst_off + chunk.dst_len];
+                EntryReader::read_bounced_range(
+                    readers,
+                    &req.name,
+                    &req.entry,
+                    (chunk.src_offset, chunk.src_len),
+                    req.cast,
+                    slice,
+                    &mut bounce,
+                )?;
+                resident_raw_finite(&req.name, &req.entry, req.cast, slice)?;
+            }
+            for (req, (expected, actual)) in requests.iter().zip(refs.iter().zip(&got)) {
+                ensure!(
+                    expected == actual,
+                    "{}: chunked reassembly differed",
+                    req.name
+                );
+            }
+
+            // Discriminating control: misplace chunk 1 destination offset by +2 bytes.
+            let mut bad_chunks = chunks.clone();
+            bad_chunks[1].dst_ptr += 2;
+            let mut bad = vec![0u8; bf16_bytes];
+            for chunk in bad_chunks.iter().filter(|c| c.request == 0) {
+                let dst_off = usize::try_from(chunk.dst_ptr)?;
+                let slice = &mut bad[dst_off..dst_off + chunk.dst_len];
+                EntryReader::read_bounced_range(
+                    readers,
+                    &requests[0].name,
+                    &requests[0].entry,
+                    (chunk.src_offset, chunk.src_len),
+                    requests[0].cast,
+                    slice,
+                    &mut bounce,
+                )?;
+            }
+            ensure!(bad != refs[0], "misplaced chunk offset went undetected");
+
+            // Planted non-finite BF16 (NaN) in final chunk -> rejected naming tensor.
+            let mut bad_s0 = shard0.clone();
+            let last_elem_off = unaligned + 2 * (bf16_elems - 1);
+            bad_s0[last_elem_off..last_elem_off + 2].copy_from_slice(&0x7fc0u16.to_le_bytes());
+            std::fs::write(dir.join("s0_nan.bin"), &bad_s0)?;
+            let e_nan = mk_entry("s0_nan.bin", Dtype::BF16, unaligned, bf16_bytes);
+            // Planted sm75 BF16->FP16 overflow (65536.0 = 0x4780) in chunk 2 -> rejected naming tensor.
+            let mut ovf_s0 = shard0.clone();
+            let mid_elem_off = unaligned + 2 * chunk_bytes + 16;
+            ovf_s0[mid_elem_off..mid_elem_off + 2]
+                .copy_from_slice(&bf16::from_f32(65_536.0).to_bits().to_le_bytes());
+            std::fs::write(dir.join("s0_ovf.bin"), &ovf_s0)?;
+            let e_ovf = mk_entry("s0_ovf.bin", Dtype::BF16, unaligned, bf16_bytes);
+            // Planted F32 +Inf and F32->FP16 overflow (70000.0) in middle chunk -> rejected naming tensor.
+            let mut bad_s2 = shard2.clone();
+            let f32_mid = unaligned + 128 + chunk_bytes + 16;
+            bad_s2[f32_mid..f32_mid + 4].copy_from_slice(&f32::INFINITY.to_le_bytes());
+            std::fs::write(dir.join("s2_inf.bin"), &bad_s2)?;
+            let e_inf = mk_entry("s2_inf.bin", Dtype::F32, unaligned + 128, f32_bytes);
+            let mut ovf_s2 = shard2.clone();
+            ovf_s2[f32_mid..f32_mid + 4].copy_from_slice(&70_000.0f32.to_le_bytes());
+            std::fs::write(dir.join("s2_fp16_ovf.bin"), &ovf_s2)?;
+            let e_f32_ovf = mk_entry("s2_fp16_ovf.bin", Dtype::F32, unaligned + 128, f32_bytes);
+
+            let mut check_reader = EntryReader::new(&dir);
+            let check_readers = check_reader.open_shards(
+                ["s0_nan.bin", "s0_ovf.bin", "s2_inf.bin", "s2_fp16_ovf.bin"].into_iter(),
+            )?;
+            let mut verify_reject =
+                |name: &str, entry: &TensorEntry, cast: FillCast| -> Result<()> {
+                    let req = vec![ResidentRingRequest {
+                        name: name.to_owned(),
+                        entry: entry.clone(),
+                        destination: 0,
+                        dest_len: dest_bytes_for_src_chunk(cast, entry.bytes)?,
+                        cast,
+                    }];
+                    let chunks = build_resident_chunks(&req, chunk_bytes)?;
+                    let mut err_seen = None;
+                    for chunk in &chunks {
+                        let mut buf = vec![0u8; chunk.dst_len];
+                        let res = EntryReader::read_bounced_range(
+                            check_readers,
+                            name,
+                            entry,
+                            (chunk.src_offset, chunk.src_len),
+                            cast,
+                            &mut buf,
+                            &mut bounce,
+                        )
+                        .and_then(|()| resident_raw_finite(name, entry, cast, &buf));
+                        if let Err(error) = res {
+                            err_seen = Some(error);
+                            break;
+                        }
+                    }
+                    let error =
+                        err_seen.with_context(|| format!("{name} fault was not rejected"))?;
+                    ensure!(
+                        format!("{error:#}").contains(name),
+                        "error did not name tensor {name}: {error:#}"
+                    );
+                    Ok(())
+                };
+            verify_reject("planted.bf16.nan", &e_nan, FillCast::Raw)?;
+            verify_reject("planted.sm75.bf16_ovf", &e_ovf, FillCast::Bf16ToFp16)?;
+            verify_reject("planted.f32.inf_raw", &e_inf, FillCast::Raw)?;
+            verify_reject("planted.f32.inf_narrow", &e_inf, FillCast::F32ToBf16)?;
+            verify_reject("planted.sm75.f32_ovf", &e_f32_ovf, FillCast::F32ToFp16)?;
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir).ok();
+        result
+    }
+
+    #[test]
+    #[ignore = "requires a reserved GPU window"]
+    fn resident_ring_upload_matches_serial_and_catches_misplaced_chunk() -> Result<()> {
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let dir = std::env::temp_dir().join(format!("ff-h3-ring-gpu-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir)?;
+        let result = (|| -> Result<()> {
+            let chunk_bytes = 64 * 1024usize;
+            let unaligned = 259usize;
+            let bf16_elems = 100_000usize;
+            let bf16_bytes = bf16_elems * 2;
+            let lr_rows = 31usize;
+            let lr_pitch = crate::minimax_h3::stored_low_rank_pitch(lr_rows);
+            let lr_cols = 4096usize;
+            let lr_bytes = lr_rows * lr_cols * 2;
+            let i8_bytes = 205_003usize;
+            let f32_elems = 50_000usize;
+            let f32_bytes = f32_elems * 4;
+
+            let mut s0 = vec![0x11u8; unaligned];
+            for i in 0..bf16_elems {
+                let v = bf16::from_f32(((i % 251) as f32 - 125.0) * 0.25);
+                s0.extend_from_slice(&v.to_bits().to_le_bytes());
+            }
+            let lr_start = s0.len();
+            for i in 0..(lr_rows * lr_cols) {
+                let v = bf16::from_f32(((i % 197) as f32 - 98.0) * 0.5);
+                s0.extend_from_slice(&v.to_bits().to_le_bytes());
+            }
+            s0.resize(s0.len().next_multiple_of(4096) + 4096, 0);
+            std::fs::write(dir.join("s0.bin"), &s0)?;
+
+            let mut s1 = vec![0x22u8; unaligned + 32];
+            for i in 0..i8_bytes {
+                s1.push(((i * 11 + 5) % 251) as u8);
+            }
+            s1.resize(s1.len().next_multiple_of(4096) + 4096, 0);
+            std::fs::write(dir.join("s1.bin"), &s1)?;
+
+            let mut s2 = vec![0x33u8; unaligned + 96];
+            for i in 0..f32_elems {
+                let v = ((i % 257) as f32 - 128.0) * 0.125;
+                s2.extend_from_slice(&v.to_le_bytes());
+            }
+            s2.resize(s2.len().next_multiple_of(4096) + 4096, 0);
+            std::fs::write(dir.join("s2.bin"), &s2)?;
+
+            let mk = |shard: &str, dtype: Dtype, start: usize, bytes: usize| TensorEntry {
+                dtype,
+                shape: vec![bytes],
+                shard: shard.to_owned(),
+                bytes,
+                load: true,
+                data_start: start as u64,
+                data_offsets: [0, bytes as u64],
+                scope: crate::checkpoint::TensorScope::Text,
+                layer: None,
+                role: String::new(),
+                scale_name: None,
+                quant: None,
+                swap_halves: false,
+            };
+            let e_bf16 = mk("s0.bin", Dtype::BF16, unaligned, bf16_bytes);
+            let e_lr = mk("s0.bin", Dtype::BF16, lr_start, lr_bytes);
+            let e_i8 = mk("s1.bin", Dtype::I8, unaligned + 32, i8_bytes);
+            let e_f32 = mk("s2.bin", Dtype::F32, unaligned + 96, f32_bytes);
+
+            let d_bf16 = unsafe { s.alloc::<u8>(bf16_bytes)? };
+            let d_bf16_fp16 = unsafe { s.alloc::<u8>(bf16_bytes)? };
+            let d_lr = s.alloc_zeros::<u8>(lr_pitch * lr_cols * 2)?;
+            let d_i8 = unsafe { s.alloc::<u8>(i8_bytes)? };
+            let d_f32_bf16 = unsafe { s.alloc::<u8>(f32_bytes / 2)? };
+
+            let requests = vec![
+                ResidentRingRequest {
+                    name: "gpu.bf16.raw".into(),
+                    entry: e_bf16.clone(),
+                    destination: pointer(&d_bf16, s),
+                    dest_len: bf16_bytes,
+                    cast: FillCast::Raw,
+                },
+                ResidentRingRequest {
+                    name: "gpu.bf16.sm75".into(),
+                    entry: e_bf16.clone(),
+                    destination: pointer(&d_bf16_fp16, s),
+                    dest_len: bf16_bytes,
+                    cast: FillCast::Bf16ToFp16,
+                },
+                ResidentRingRequest {
+                    name: "gpu.lowrank.down".into(),
+                    entry: e_lr.clone(),
+                    destination: pointer(&d_lr, s),
+                    dest_len: lr_bytes,
+                    cast: FillCast::Raw,
+                },
+                ResidentRingRequest {
+                    name: "gpu.i8.qweight".into(),
+                    entry: e_i8.clone(),
+                    destination: pointer(&d_i8, s),
+                    dest_len: i8_bytes,
+                    cast: FillCast::Raw,
+                },
+                ResidentRingRequest {
+                    name: "gpu.f32.bf16".into(),
+                    entry: e_f32.clone(),
+                    destination: pointer(&d_f32_bf16, s),
+                    dest_len: f32_bytes / 2,
+                    cast: FillCast::F32ToBf16,
+                },
+            ];
+            let chunks = build_resident_chunks(&requests, chunk_bytes)?;
+            let plan = ResidentRingPlan {
+                ring: true,
+                drives: 3,
+                shards: 3,
+                tensors: requests.len(),
+                chunks: chunks.len(),
+                in_flight: 4,
+                chunk_bytes,
+                slot_bytes: chunk_bytes,
+                ring_bytes: 4 * chunk_bytes,
+                bounce_bound_bytes: 4 * (chunk_bytes + 4096),
+                host_available_bytes: 16 << 30,
+                host_reserve_bytes: RESIDENT_RING_HOST_RESERVE,
+            };
+            execute_resident_ring(&device, &dir, &requests, &chunks, &plan)?;
+
+            let mut reader = EntryReader::new(&dir);
+            let readers = reader.open_shards(["s0.bin", "s1.bin", "s2.bin"].into_iter())?;
+            let mut bounce = AlignedBytes::new(4096, 4096)?;
+            let got_slices = [
+                s.clone_dtoh(&d_bf16)?,
+                s.clone_dtoh(&d_bf16_fp16)?,
+                s.clone_dtoh(&d_lr)?,
+                s.clone_dtoh(&d_i8)?,
+                s.clone_dtoh(&d_f32_bf16)?,
+            ];
+            for (index, (req, got)) in requests.iter().zip(&got_slices).enumerate() {
+                let mut expected = vec![0u8; req.dest_len];
+                EntryReader::read_bounced(
+                    readers,
+                    &req.name,
+                    &req.entry,
+                    req.cast,
+                    &mut expected,
+                    &mut bounce,
+                )?;
+                ensure!(
+                    &got[..req.dest_len] == expected.as_slice(),
+                    "{}: GPU ring bytes differed from serial",
+                    req.name
+                );
+                if index == 2 {
+                    ensure!(
+                        got[lr_bytes..].iter().all(|&b| b == 0),
+                        "low-rank over-read tail was overwritten"
+                    );
+                }
+            }
+
+            // Discriminating control: swap chunk 0 and chunk 1 destination offsets (disjoint, deterministic).
+            let mut bad_chunks = chunks.clone();
+            let p0 = bad_chunks[0].dst_ptr;
+            bad_chunks[0].dst_ptr = bad_chunks[1].dst_ptr;
+            bad_chunks[1].dst_ptr = p0;
+            execute_resident_ring(&device, &dir, &requests, &bad_chunks, &plan)?;
+            let got_bad = s.clone_dtoh(&d_bf16)?;
+            ensure!(
+                got_bad != got_slices[0],
+                "misplaced GPU chunk offset matched serial reference"
+            );
+
+            // GPU chunk-level validation controls: NaN (BF16 Raw) and sm75 FP16 overflow in chunk 2.
+            let mut s0_nan = s0.clone();
+            let pos = unaligned + 2 * chunk_bytes + 8;
+            s0_nan[pos..pos + 2].copy_from_slice(&0x7fc0u16.to_le_bytes());
+            std::fs::write(dir.join("s0_nan.bin"), &s0_nan)?;
+            let nan_req = vec![ResidentRingRequest {
+                name: "gpu.planted.nan".into(),
+                entry: mk("s0_nan.bin", Dtype::BF16, unaligned, bf16_bytes),
+                destination: pointer(&d_bf16, s),
+                dest_len: bf16_bytes,
+                cast: FillCast::Raw,
+            }];
+            let nan_chunks = build_resident_chunks(&nan_req, chunk_bytes)?;
+            let err = execute_resident_ring(&device, &dir, &nan_req, &nan_chunks, &plan)
+                .expect_err("GPU ring accepted NaN in chunk 2");
+            ensure!(format!("{err:#}").contains("gpu.planted.nan"), "{err:#}");
+
+            let mut s0_ovf = s0.clone();
+            s0_ovf[pos..pos + 2].copy_from_slice(&bf16::from_f32(65_536.0).to_bits().to_le_bytes());
+            std::fs::write(dir.join("s0_ovf.bin"), &s0_ovf)?;
+            let ovf_req = vec![ResidentRingRequest {
+                name: "gpu.planted.sm75_ovf".into(),
+                entry: mk("s0_ovf.bin", Dtype::BF16, unaligned, bf16_bytes),
+                destination: pointer(&d_bf16_fp16, s),
+                dest_len: bf16_bytes,
+                cast: FillCast::Bf16ToFp16,
+            }];
+            let ovf_chunks = build_resident_chunks(&ovf_req, chunk_bytes)?;
+            let err = execute_resident_ring(&device, &dir, &ovf_req, &ovf_chunks, &plan)
+                .expect_err("GPU ring accepted sm75 FP16 overflow in chunk 2");
+            ensure!(
+                format!("{err:#}").contains("gpu.planted.sm75_ovf"),
+                "{err:#}"
+            );
+            println!(
+                "PASS resident_ring_upload tensors={} chunks={} misplaced_chunk=detected nan_chunk=rejected sm75_ovf_chunk=rejected",
+                requests.len(),
+                chunks.len()
+            );
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir).ok();
         result
     }
 }
