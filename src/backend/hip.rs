@@ -177,6 +177,8 @@ pub struct Properties {
     pub host_register_supported: i32,
     pub max_grid_x: i32,
     pub max_grid_z: i32,
+    pub clock_khz: i32,
+    pub reserved: i32,
 }
 
 static ALLOCATION_GRANULARITIES: OnceLock<Mutex<BTreeMap<usize, usize>>> = OnceLock::new();
@@ -205,6 +207,7 @@ impl Context {
             sm_shared_bytes: usize::try_from(p.unit_shared_bytes)?,
             cooperative: p.cooperative != 0,
             optin_shared_bytes: usize::try_from(p.optin_shared_bytes)?,
+            clock_khz: p.clock_khz,
             memory_bytes_per_second: 2.0
                 * f64::from(p.memory_clock_khz)
                 * 1000.0
@@ -253,6 +256,7 @@ impl Context {
                 && properties.unit_shared_bytes > 0
                 && properties.l2_bytes >= 0
                 && properties.memory_clock_khz > 0
+                && properties.clock_khz > 0
                 && properties.memory_bus_bits > 0
                 && properties.max_grid_y > 0
                 && properties.max_grid_x > 0

@@ -2157,21 +2157,329 @@ fn qualification_plan_family(base_family: bool, ff_in: bool) -> bool {
     ff_in && base_family
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FfnStorage {
+    FullAlias,
+    HalfAlias,
+    Owned,
+}
+
+impl FfnStorage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FullAlias => "full_alias",
+            Self::HalfAlias => "half_alias",
+            Self::Owned => "owned",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct FfnPlan {
     chunk: usize,
-    borrowed: bool,
+    storage: FfnStorage,
     allocation: usize,
     workspace: usize,
     tensor_cost: f64,
     launches: usize,
 }
 
+/// Real per-block FFN weight bytes, FLOPs/row, and sensed hardware throughput for chunk costing.
+#[derive(Clone, Copy, Debug)]
+struct FfnBlockProfile {
+    dense_in_blocks: usize,
+    dense_out_blocks: usize,
+    int8_in_blocks: usize,
+    int8_out_blocks: usize,
+    lowrank_blocks: usize,
+    kept_blocks: usize,
+    lowrank_flops_per_row: f64,
+    reload_weight_bytes: f64,
+    peak_bf16_ops_s: f64,
+    peak_int8_ops_s: f64,
+    memory_bytes_per_second: f64,
+    sms: usize,
+    convrot_tile_m: usize,
+    convrot_tile_n: usize,
+}
+
+impl FfnBlockProfile {
+    fn has_dense_ffn(&self) -> bool {
+        self.dense_in_blocks > 0 || self.dense_out_blocks > 0
+    }
+
+    fn from_manifest(
+        spec: &H3Spec,
+        manifest: &TensorManifest,
+        lora_rank: usize,
+        info: &crate::backend::setup::DeviceInfo,
+    ) -> Result<Self> {
+        ensure!(
+            info.sms > 0
+                && info.memory_bytes_per_second.is_finite()
+                && info.memory_bytes_per_second > 0.0,
+            "invalid device topology for FFN profile"
+        );
+        let peak_bf16_ops_s = info.peak_tensor_ops_per_second(false)?;
+        let peak_int8_ops_s = info.peak_tensor_ops_per_second(true)?;
+        let (tile_m, tile_n) = ProductKernel::MFastLdsm { stages: 2 }.tile_dims(&info.arch);
+        let hyperflow = spec.is_hyperflow()?;
+        let dropped = spec.dropped_blocks.as_deref().unwrap_or(&[]);
+        let (h, f) = (spec.hidden, spec.ffn);
+        let mut kept_blocks = 0usize;
+        let mut dense_in_blocks = 0usize;
+        let mut dense_out_blocks = 0usize;
+        let mut int8_in_blocks = 0usize;
+        let mut int8_out_blocks = 0usize;
+        let mut lowrank_blocks = 0usize;
+        let mut lowrank_flops_sum = 0.0f64;
+        let mut reload_weight_sum = 0.0f64;
+        let lora_bytes = if !hyperflow && lora_rank > 0 {
+            (lora_rank * (h + 2 * f) + lora_rank * (f + h)) * std::mem::size_of::<bf16>()
+        } else {
+            0
+        };
+        for layer in 0..spec.layers {
+            if hyperflow && dropped.contains(&layer) {
+                continue;
+            }
+            kept_blocks += 1;
+            let mut block_bytes = lora_bytes;
+            let mut block_lowrank = false;
+            for (is_in, suffix, out, input) in
+                [(true, "ff.net.0.proj", 2 * f, h), (false, "ff.net.2", h, f)]
+            {
+                let prefix = format!("transformer_blocks.{layer}.{suffix}");
+                let qweight_key = format!("{prefix}.qweight");
+                let down_key = format!("{prefix}.down.weight");
+                let up_key = format!("{prefix}.up.weight");
+                let weight_key = format!("{prefix}.weight");
+                if let Some(entry) = manifest.entries.get(&qweight_key) {
+                    if is_in {
+                        int8_in_blocks += 1;
+                    } else {
+                        int8_out_blocks += 1;
+                    }
+                    block_bytes = block_bytes
+                        .checked_add(entry.bytes)
+                        .context("Int8 FFN weight bytes")?;
+                    if let Some(scale) = manifest.entries.get(&format!("{prefix}.wscale")) {
+                        block_bytes = block_bytes
+                            .checked_add(scale.bytes)
+                            .context("Int8 FFN wscale bytes")?;
+                    }
+                } else if let (Some(down), Some(up)) = (
+                    manifest.entries.get(&down_key),
+                    manifest.entries.get(&up_key),
+                ) {
+                    block_lowrank = true;
+                    block_bytes = block_bytes
+                        .checked_add(down.bytes)
+                        .and_then(|n| n.checked_add(up.bytes))
+                        .context("LowRank FFN weight bytes")?;
+                    let rank = spec
+                        .lowrank_ranks
+                        .as_ref()
+                        .and_then(|ranks| ranks.get(&prefix))
+                        .copied()
+                        .with_context(|| format!("{prefix}: missing low-rank rank"))?;
+                    let pitch = crate::minimax_h3::stored_low_rank_pitch(rank);
+                    lowrank_flops_sum +=
+                        2.0 * ((pitch as f64) * (input as f64) + (out as f64) * (rank as f64));
+                } else if let Some(entry) = manifest.entries.get(&weight_key) {
+                    if is_in {
+                        dense_in_blocks += 1;
+                    } else {
+                        dense_out_blocks += 1;
+                    }
+                    block_bytes = block_bytes
+                        .checked_add(entry.bytes)
+                        .context("Dense FFN weight bytes")?;
+                } else {
+                    bail!("{prefix}: FFN projection missing from manifest");
+                }
+            }
+            if block_lowrank {
+                lowrank_blocks += 1;
+            }
+            reload_weight_sum += block_bytes as f64;
+        }
+        ensure!(kept_blocks > 0, "no kept transformer blocks in manifest");
+        let denom = kept_blocks as f64;
+        Ok(Self {
+            dense_in_blocks,
+            dense_out_blocks,
+            int8_in_blocks,
+            int8_out_blocks,
+            lowrank_blocks,
+            kept_blocks,
+            lowrank_flops_per_row: lowrank_flops_sum / denom,
+            reload_weight_bytes: reload_weight_sum / denom,
+            peak_bf16_ops_s,
+            peak_int8_ops_s,
+            memory_bytes_per_second: info.memory_bytes_per_second,
+            sms: info.sms,
+            convrot_tile_m: tile_m as usize,
+            convrot_tile_n: tile_n as usize,
+        })
+    }
+
+    #[cfg(test)]
+    fn dense_default(
+        spec: &H3Spec,
+        lora_rank: usize,
+        info: &crate::backend::setup::DeviceInfo,
+    ) -> Result<Self> {
+        let peak_bf16_ops_s = info.peak_tensor_ops_per_second(false)?;
+        let peak_int8_ops_s = info.peak_tensor_ops_per_second(true)?;
+        let (tile_m, tile_n) = ProductKernel::MFastLdsm { stages: 2 }.tile_dims(&info.arch);
+        let (h, f) = (spec.hidden, spec.ffn);
+        let dense_bytes = (2 * f * h + h * f) * std::mem::size_of::<bf16>()
+            + (lora_rank * (h + 2 * f) + lora_rank * (f + h)) * std::mem::size_of::<bf16>();
+        let kept = spec.layers.max(1);
+        Ok(Self {
+            dense_in_blocks: kept,
+            dense_out_blocks: kept,
+            int8_in_blocks: 0,
+            int8_out_blocks: 0,
+            lowrank_blocks: 0,
+            kept_blocks: kept,
+            lowrank_flops_per_row: 0.0,
+            reload_weight_bytes: dense_bytes as f64,
+            peak_bf16_ops_s,
+            peak_int8_ops_s,
+            memory_bytes_per_second: info.memory_bytes_per_second,
+            sms: info.sms,
+            convrot_tile_m: tile_m as usize,
+            convrot_tile_n: tile_n as usize,
+        })
+    }
+
+    fn reload_seconds(&self, chunks: usize) -> f64 {
+        (chunks as f64) * self.reload_weight_bytes / self.memory_bytes_per_second
+    }
+
+    fn stored_compute_seconds_and_launches(
+        &self,
+        total_rows: usize,
+        chunk: usize,
+        spec: &H3Spec,
+    ) -> (f64, usize) {
+        let mut seconds = 0.0f64;
+        let mut launches = 0usize;
+        let kept = self.kept_blocks.max(1) as f64;
+        let (h, f) = (spec.hidden, spec.ffn);
+        for (rows, count) in [(chunk, total_rows / chunk), (total_rows % chunk, 1)] {
+            if rows == 0 || count == 0 {
+                continue;
+            }
+            let m_tiles = rows.div_ceil(self.convrot_tile_m);
+            for (proj_blocks, out, input) in [
+                (self.int8_in_blocks, 2 * f, h),
+                (self.int8_out_blocks, h, f),
+            ] {
+                if proj_blocks == 0 {
+                    continue;
+                }
+                let n_tiles = out.div_ceil(self.convrot_tile_n);
+                let ctas = (m_tiles * n_tiles).max(1);
+                let wave_cost = (ctas.div_ceil(self.sms) * self.sms) as f64 / ctas as f64;
+                let flops = 2.0 * (rows as f64) * (out as f64) * (input as f64) * wave_cost;
+                seconds +=
+                    ((proj_blocks as f64 / kept) * flops * (count as f64)) / self.peak_int8_ops_s;
+            }
+            if self.lowrank_blocks > 0 {
+                seconds += (self.lowrank_flops_per_row * (rows as f64) * (count as f64))
+                    / self.peak_bf16_ops_s;
+            }
+            let per_chunk = if self.lowrank_blocks > 0 {
+                5
+            } else if self.int8_in_blocks > 0 || self.int8_out_blocks > 0 {
+                4
+            } else {
+                0
+            };
+            launches += count * per_chunk;
+        }
+        (seconds, launches)
+    }
+
+    fn stored_choices(
+        &self,
+        (total_rows, baseline_chunk, attention_elems, budget): (usize, usize, usize, usize),
+        spec: &H3Spec,
+    ) -> Result<Vec<FfnPlan>> {
+        ensure!(
+            !self.has_dense_ffn(),
+            "stored FFN choices called on a profile with dense FFN blocks"
+        );
+        let mut choices = Vec::new();
+        for chunks in 1..=total_rows.div_ceil(baseline_chunk) {
+            let chunk = total_rows.div_ceil(chunks);
+            let tail = total_rows % chunk;
+            if tail > 0 && tail <= crate::linear_plan::MAX_SKINNY_ROWS {
+                continue;
+            }
+            let (storage, allocation) =
+                FfnPlan::storage_for(chunk, baseline_chunk, attention_elems, spec.ffn)?;
+            if allocation > budget {
+                continue;
+            }
+            let (compute_s, launches) =
+                self.stored_compute_seconds_and_launches(total_rows, chunk, spec);
+            choices.push(FfnPlan {
+                chunk,
+                storage,
+                allocation,
+                workspace: 0,
+                tensor_cost: self.reload_seconds(total_rows.div_ceil(chunk)) + compute_s,
+                launches,
+            });
+        }
+        ensure!(
+            choices
+                .iter()
+                .any(|p| p.chunk == baseline_chunk && p.allocation == 0),
+            "existing FFN plan missing from workspace choices"
+        );
+        Ok(choices)
+    }
+}
+
 impl FfnPlan {
-    fn alias_capacity(attention: (usize, usize), ffn: usize) -> Result<usize> {
+    /// Max FFN chunk rows where `hidden [chunk, 2*ffn]` at offset 0 and 256-byte-aligned
+    /// `gated [chunk, ffn]` at the high end of `attention_kv` fit disjointly (`0 B` new allocation).
+    fn full_alias_capacity(attention_kv_elems: usize, ffn: usize) -> Result<usize> {
         ensure!(ffn > 0, "zero FFN width");
         let hidden = ffn.checked_mul(2).context("FFN hidden width overflow")?;
-        Ok((attention.0 / hidden).min(attention.1 / ffn))
+        let per_row = hidden.checked_add(ffn).context("FFN row width overflow")?;
+        let mut cap = attention_kv_elems / per_row;
+        while cap > 0 {
+            let hidden_elems = cap.checked_mul(hidden).context("FFN hidden elements")?;
+            let gated_elems = cap.checked_mul(ffn).context("FFN gated elements")?;
+            if let Some(tail) = attention_kv_elems.checked_sub(gated_elems) {
+                let gated_offset = tail & !127usize;
+                if hidden_elems <= gated_offset {
+                    break;
+                }
+            }
+            cap -= 1;
+        }
+        Ok(cap)
+    }
+
+    /// Max FFN chunk rows where `hidden [chunk, 2*ffn]` aliases `attention_kv` (`gated` owned).
+    fn half_alias_capacity(attention_kv_elems: usize, ffn: usize) -> Result<usize> {
+        ensure!(ffn > 0, "zero FFN width");
+        let hidden = ffn.checked_mul(2).context("FFN hidden width overflow")?;
+        Ok(attention_kv_elems / hidden)
+    }
+
+    fn gated_allocation(chunk: usize, ffn: usize) -> Result<usize> {
+        chunk
+            .checked_mul(ffn)
+            .and_then(|n| n.checked_mul(std::mem::size_of::<bf16>()))
+            .context("FFN gated workspace extent overflow")
     }
 
     fn allocation(chunk: usize, ffn: usize) -> Result<usize> {
@@ -2179,6 +2487,23 @@ impl FfnPlan {
             .checked_mul(ffn)
             .and_then(|n| n.checked_mul(3 * std::mem::size_of::<bf16>()))
             .context("FFN workspace extent overflow")
+    }
+
+    fn storage_for(
+        chunk: usize,
+        baseline_chunk: usize,
+        attention_kv_elems: usize,
+        ffn: usize,
+    ) -> Result<(FfnStorage, usize)> {
+        if chunk <= Self::full_alias_capacity(attention_kv_elems, ffn)? {
+            Ok((FfnStorage::FullAlias, 0))
+        } else if chunk == baseline_chunk {
+            Ok((FfnStorage::Owned, 0))
+        } else if chunk <= Self::half_alias_capacity(attention_kv_elems, ffn)? {
+            Ok((FfnStorage::HalfAlias, Self::gated_allocation(chunk, ffn)?))
+        } else {
+            Ok((FfnStorage::Owned, Self::allocation(chunk, ffn)?))
+        }
     }
 
     fn select(choices: &[Self], budget: usize) -> Result<Self> {
@@ -3121,15 +3446,16 @@ pub(crate) struct BlockWork {
     #[cfg(test)]
     normed_probe: Vec<bf16>,
     normed: CudaSlice<bf16>,
-    q_raw: CudaSlice<bf16>,
-    k_raw: CudaSlice<bf16>,
+    /// Four 256-byte-aligned attention slots (`0=q_raw`, `1=k_raw`, `2=q`, `3=k`),
+    /// each of length `attn_stride` elements; dead during FFN and aliased by `hidden` (and `gated` in `FullAlias`).
+    attn_stride: usize,
+    attention_kv: CudaSlice<bf16>,
     v_raw: CudaSlice<bf16>,
-    q: CudaSlice<bf16>,
-    k: CudaSlice<bf16>,
     lora: CudaSlice<bf16>,
     hidden: Tensor<bf16, 2>,
     gated: Tensor<bf16, 2>,
-    ffn_owned: Option<(CudaSlice<bf16>, CudaSlice<bf16>)>,
+    ffn_hidden: Option<CudaSlice<bf16>>,
+    ffn_gated: Option<CudaSlice<bf16>>,
     stored: Option<StoredScratch>,
     wide: Option<CudaSlice<f32>>,
     wide_launch: Option<WideResidual>,
@@ -3169,6 +3495,36 @@ struct StoredPtrs {
 }
 
 impl BlockWork {
+    fn q_raw_offset(&self) -> usize {
+        0
+    }
+
+    fn k_raw_offset(&self) -> usize {
+        self.attn_stride
+    }
+
+    fn q_offset(&self) -> usize {
+        2 * self.attn_stride
+    }
+
+    fn k_offset(&self) -> usize {
+        3 * self.attn_stride
+    }
+
+    fn attn_ptr(&self, s: &Arc<CudaStream>, offset: usize) -> u64 {
+        pointer(&self.attention_kv, s) + (offset * std::mem::size_of::<bf16>()) as u64
+    }
+
+    fn attn_rows_view(
+        &self,
+        s: &Arc<CudaStream>,
+        offset: usize,
+        rows: usize,
+        width: usize,
+    ) -> Result<Tensor<bf16, 2>> {
+        rows_view(&self.attention_kv, s, offset, rows, width, width)
+    }
+
     fn plan_rotation(&mut self, device: &Device, spec: &H3Spec) -> Result<()> {
         let Some((group, _)) = spec.int8_convrot.as_ref() else {
             return Ok(());
@@ -3308,40 +3664,50 @@ impl BlockWork {
         &self,
         blas: &Blas,
         spec: &H3Spec,
-        chunk: usize,
+        profile: &FfnBlockProfile,
+        (chunk, storage, allocation): (usize, FfnStorage, usize),
         describe: bool,
     ) -> Result<FfnPlan> {
+        let chunks = self.rows.div_ceil(chunk);
         let mut plan = FfnPlan {
             chunk,
-            borrowed: false,
-            allocation: if chunk == self.chunk {
-                0
-            } else {
-                FfnPlan::allocation(chunk, spec.ffn)?
-            },
+            storage,
+            allocation,
             workspace: 0,
-            tensor_cost: 0.0,
+            tensor_cost: profile.reload_seconds(chunks),
             launches: 0,
         };
+        let (stored_s, stored_launches) =
+            profile.stored_compute_seconds_and_launches(self.rows, chunk, spec);
+        plan.tensor_cost += stored_s;
+        if !profile.has_dense_ffn() {
+            plan.launches = stored_launches;
+            return Ok(plan);
+        }
         #[cfg(feature = "cuda")]
         let base_family = blas.bf16_row_family();
         #[cfg(not(feature = "cuda"))]
         let base_family = false;
+        let kept = profile.kept_blocks.max(1) as f64;
+        let mut dense_flops = 0.0f64;
         for (rows, count) in [(chunk, self.rows / chunk), (self.rows % chunk, 1)] {
             if rows == 0 || count == 0 {
                 continue;
             }
             let mut launches = 1;
             let shapes = [
-                (2 * spec.ffn, spec.hidden),
-                (spec.hidden, spec.ffn),
-                (self.rank, spec.hidden),
-                (self.rank, spec.ffn),
-                (2 * spec.ffn, self.rank),
-                (spec.hidden, self.rank),
+                (2 * spec.ffn, spec.hidden, profile.dense_in_blocks),
+                (spec.hidden, spec.ffn, profile.dense_out_blocks),
+                (self.rank, spec.hidden, profile.dense_in_blocks),
+                (self.rank, spec.ffn, profile.dense_out_blocks),
+                (2 * spec.ffn, self.rank, profile.dense_in_blocks),
+                (spec.hidden, self.rank, profile.dense_out_blocks),
             ];
             let counted = if LORA { shapes.len() } else { 2 };
-            for (index, &(output, input)) in shapes[..counted].iter().enumerate() {
+            for (index, &(output, input, blocks)) in shapes[..counted].iter().enumerate() {
+                if blocks == 0 {
+                    continue;
+                }
                 let family = ffn_projection_family(base_family, index);
                 let shape = crate::backend::setup::LinearShape {
                     rows,
@@ -3349,13 +3715,19 @@ impl BlockWork {
                     input,
                 };
                 let (wave_cost, reduction) = blas.fixed_plan_cost(shape, describe, family)?;
-                plan.tensor_cost +=
-                    2.0 * rows as f64 * output as f64 * input as f64 * count as f64 * wave_cost;
+                dense_flops += (blocks as f64 / kept)
+                    * 2.0
+                    * rows as f64
+                    * output as f64
+                    * input as f64
+                    * count as f64
+                    * wave_cost;
                 plan.workspace = plan.workspace.max(blas.fixed_workspace(shape, family)?);
                 launches += 1 + reduction;
             }
             plan.launches += count * launches;
         }
+        plan.tensor_cost += dense_flops / profile.peak_bf16_ops_s;
         Ok(plan)
     }
 
@@ -3363,25 +3735,36 @@ impl BlockWork {
         &self,
         blas: &Blas,
         spec: &H3Spec,
+        profile: &FfnBlockProfile,
         budget: usize,
     ) -> Result<Vec<FfnPlan>> {
+        if !profile.has_dense_ffn() {
+            return profile.stored_choices(
+                (self.rows, self.chunk, self.attention_kv.len(), budget),
+                spec,
+            );
+        }
         let mut choices = Vec::new();
+        let attention_elems = self.attention_kv.len();
         for chunks in 1..=self.rows.div_ceil(self.chunk) {
             let chunk = self.rows.div_ceil(chunks);
             let tail = self.rows % chunk;
             if tail > 0 && tail <= crate::linear_plan::MAX_SKINNY_ROWS {
                 continue;
             }
-            if chunk != self.chunk && FfnPlan::allocation(chunk, spec.ffn)? > budget {
+            let (storage, allocation) =
+                FfnPlan::storage_for(chunk, self.chunk, attention_elems, spec.ffn)?;
+            if allocation > budget {
                 continue;
             }
-            match self.ffn_cost::<LORA>(blas, spec, chunk, false) {
+            match self.ffn_cost::<LORA>(blas, spec, profile, (chunk, storage, allocation), false) {
                 Ok(plan) => choices.push(plan),
                 Err(error) if Blas::is_not_supported(&error) => {
                     if crate::backend::diagnostics_enabled() {
                         eprintln!(
-                            "FFN_PLAN_REJECT rows={} chunk={chunk} error={error:#}",
-                            self.rows
+                            "FFN_PLAN_REJECT rows={} chunk={chunk} storage={} error={error:#}",
+                            self.rows,
+                            storage.as_str()
                         );
                     }
                 }
@@ -3399,73 +3782,88 @@ impl BlockWork {
         Ok(choices)
     }
 
-    fn alias_choices<const LORA: bool>(
-        &self,
-        blas: &Blas,
-        spec: &H3Spec,
-        owned: FfnPlan,
-    ) -> Result<Vec<FfnPlan>> {
-        let capacity = FfnPlan::alias_capacity((self.q_raw.len(), self.k_raw.len()), spec.ffn)?;
-        let mut choices = vec![owned];
-        for chunks in 1..=self.rows.div_ceil(self.chunk) {
-            let chunk = self.rows.div_ceil(chunks);
-            let tail = self.rows % chunk;
-            if chunk > capacity || (tail > 0 && tail <= crate::linear_plan::MAX_SKINNY_ROWS) {
-                continue;
-            }
-            let mut plan = match self.ffn_cost::<LORA>(blas, spec, chunk, false) {
-                Ok(plan) => plan,
-                Err(error) if Blas::is_not_supported(&error) => {
-                    if crate::backend::diagnostics_enabled() {
-                        eprintln!(
-                            "FFN_ALIAS_REJECT rows={} chunk={chunk} error={error:#}",
-                            self.rows
-                        );
-                    }
-                    continue;
-                }
-                Err(error) => {
-                    return Err(
-                        error.context(format!("FFN alias rows={} chunk={chunk}", self.rows))
-                    );
-                }
-            };
-            if plan.tensor_cost <= owned.tensor_cost && plan.launches <= owned.launches {
-                plan.borrowed = true;
-                plan.allocation = 0;
-                choices.push(plan);
-            }
-        }
-        Ok(choices)
-    }
-
     fn bind_ffn<const LORA: bool>(
         &mut self,
-        s: &Arc<CudaStream>,
-        blas: &Blas,
-        spec: &H3Spec,
+        (s, blas): (&Arc<CudaStream>, &Blas),
+        (spec, profile): (&H3Spec, &FfnBlockProfile),
         plan: FfnPlan,
         residual: (u64, usize),
     ) -> Result<()> {
-        let allocation = if plan.borrowed || plan.chunk == self.chunk {
-            0
-        } else {
-            FfnPlan::allocation(plan.chunk, spec.ffn)?
+        let allocation = match plan.storage {
+            FfnStorage::FullAlias => 0,
+            FfnStorage::HalfAlias => FfnPlan::gated_allocation(plan.chunk, spec.ffn)?,
+            FfnStorage::Owned
+                if plan.chunk == self.chunk
+                    && self.ffn_hidden.is_some()
+                    && self.ffn_gated.is_some() =>
+            {
+                0
+            }
+            FfnStorage::Owned => FfnPlan::allocation(plan.chunk, spec.ffn)?,
         };
         ensure!(
             plan.chunk >= self.chunk && plan.chunk <= self.rows && plan.allocation == allocation,
             "FFN binding differs from the counted allocation"
         );
-        if plan.borrowed {
-            self.hidden = rows_view(&self.q_raw, s, 0, plan.chunk, 2 * spec.ffn, 2 * spec.ffn)?;
-            self.gated = rows_view(&self.k_raw, s, 0, plan.chunk, spec.ffn, spec.ffn)?;
-            self.ffn_owned = None;
-        } else if plan.chunk != self.chunk {
-            let hidden = s.alloc_zeros::<bf16>(plan.chunk * 2 * spec.ffn)?;
-            let gated = s.alloc_zeros::<bf16>(plan.chunk * spec.ffn)?;
-            self.hidden = matrix(&hidden, s, plan.chunk, 2 * spec.ffn)?;
-            self.gated = matrix(&gated, s, plan.chunk, spec.ffn)?;
-            self.ffn_owned = Some((hidden, gated));
+        match plan.storage {
+            FfnStorage::FullAlias => {
+                let gated_elems = plan
+                    .chunk
+                    .checked_mul(spec.ffn)
+                    .context("FFN gated elements")?;
+                let gated_offset = self
+                    .attention_kv
+                    .len()
+                    .checked_sub(gated_elems)
+                    .context("FFN gated alias exceeds attention_kv")?
+                    & !127usize;
+                self.hidden = rows_view(
+                    &self.attention_kv,
+                    s,
+                    0,
+                    plan.chunk,
+                    2 * spec.ffn,
+                    2 * spec.ffn,
+                )?;
+                self.gated = rows_view(
+                    &self.attention_kv,
+                    s,
+                    gated_offset,
+                    plan.chunk,
+                    spec.ffn,
+                    spec.ffn,
+                )?;
+                self.ffn_hidden = None;
+                self.ffn_gated = None;
+            }
+            FfnStorage::HalfAlias => {
+                self.ffn_hidden = None;
+                self.ffn_gated = None;
+                self.hidden = rows_view(
+                    &self.attention_kv,
+                    s,
+                    0,
+                    plan.chunk,
+                    2 * spec.ffn,
+                    2 * spec.ffn,
+                )?;
+                let gated = s.alloc_zeros::<bf16>(plan.chunk * spec.ffn)?;
+                self.gated = matrix(&gated, s, plan.chunk, spec.ffn)?;
+                self.ffn_gated = Some(gated);
+            }
+            FfnStorage::Owned => {
+                if plan.chunk != self.chunk || self.ffn_hidden.is_none() || self.ffn_gated.is_none()
+                {
+                    self.ffn_hidden = None;
+                    self.ffn_gated = None;
+                    let hidden = s.alloc_zeros::<bf16>(plan.chunk * 2 * spec.ffn)?;
+                    let gated = s.alloc_zeros::<bf16>(plan.chunk * spec.ffn)?;
+                    self.hidden = matrix(&hidden, s, plan.chunk, 2 * spec.ffn)?;
+                    self.gated = matrix(&gated, s, plan.chunk, spec.ffn)?;
+                    self.ffn_hidden = Some(hidden);
+                    self.ffn_gated = Some(gated);
+                }
+            }
         }
         crate::backend::cuda::contracts::no_overlap(
             &self.hidden,
@@ -3483,6 +3881,51 @@ impl BlockWork {
         overlap("normed", &self.normed)?;
         if LORA {
             overlap("LoRA", &self.lora)?;
+        }
+        if let Some(stored) = &self.stored {
+            overlap("stored_mid", &stored.mid)?;
+            if let Some((convrot, scales)) = &stored.convrot {
+                let convrot_span = u64::try_from(
+                    convrot
+                        .len()
+                        .checked_mul(std::mem::size_of::<f32>())
+                        .context("convrot span bytes")?,
+                )?;
+                let convrot_view =
+                    unsafe { Tensor::<u8, 1>::new(pointer(convrot, s), [1], [1], convrot_span)? };
+                crate::backend::cuda::contracts::no_overlap(
+                    hidden,
+                    &convrot_view,
+                    "FFN hidden",
+                    "convrot",
+                )?;
+                crate::backend::cuda::contracts::no_overlap(
+                    gated,
+                    &convrot_view,
+                    "FFN gated",
+                    "convrot",
+                )?;
+                let scales_span = u64::try_from(
+                    scales
+                        .len()
+                        .checked_mul(std::mem::size_of::<f32>())
+                        .context("convrot scales span bytes")?,
+                )?;
+                let scales_view =
+                    unsafe { Tensor::<u8, 1>::new(pointer(scales, s), [1], [1], scales_span)? };
+                crate::backend::cuda::contracts::no_overlap(
+                    hidden,
+                    &scales_view,
+                    "FFN hidden",
+                    "convrot_scales",
+                )?;
+                crate::backend::cuda::contracts::no_overlap(
+                    gated,
+                    &scales_view,
+                    "FFN gated",
+                    "convrot_scales",
+                )?;
+            }
         }
         let protected =
             unsafe { Tensor::<u8, 1>::new(residual.0, [1], [1], u64::try_from(residual.1)?)? };
@@ -3513,7 +3956,7 @@ impl BlockWork {
         let per_m_lower_wave = !blas.bf16_row_family();
         #[cfg(not(feature = "cuda"))]
         let per_m_lower_wave = true;
-        if per_m_lower_wave {
+        if per_m_lower_wave && profile.has_dense_ffn() {
             for rows in [self.chunk, self.rows % self.chunk]
                 .into_iter()
                 .filter(|&rows| rows > 0)
@@ -3525,8 +3968,14 @@ impl BlockWork {
                 })?;
             }
         }
-        if self.rows > FFN_CHUNK_ROWS {
-            self.ffn_cost::<LORA>(blas, spec, self.chunk, true)?;
+        if self.rows > FFN_CHUNK_ROWS && profile.has_dense_ffn() {
+            self.ffn_cost::<LORA>(
+                blas,
+                spec,
+                profile,
+                (self.chunk, plan.storage, plan.allocation),
+                true,
+            )?;
         }
         Ok(())
     }
@@ -3540,15 +3989,15 @@ impl BlockWork {
         launch_extents(spec, rows)?;
         let width = spec.heads * spec.head_dim;
         let chunk = ffn_chunk(rows);
-        let attention = || s.alloc_zeros::<bf16>(rows * width);
+        let row_elems = rows.checked_mul(width).context("attention elements")?;
+        let attn_stride = row_elems.next_multiple_of(128);
         let normed = s.alloc_zeros::<bf16>(rows * spec.hidden)?;
-        let (q_raw, k_raw, v_raw, q, k) = (
-            attention()?,
-            attention()?,
-            attention()?,
-            attention()?,
-            attention()?,
-        );
+        let attention_kv = s.alloc_zeros::<bf16>(
+            attn_stride
+                .checked_mul(4)
+                .context("attention_kv elements")?,
+        )?;
+        let v_raw = s.alloc_zeros::<bf16>(row_elems)?;
         let lora = s.alloc_zeros::<bf16>(rows * 3 * rank)?;
         let hidden = s.alloc_zeros::<bf16>(chunk * 2 * spec.ffn)?;
         let gated = s.alloc_zeros::<bf16>(chunk * spec.ffn)?;
@@ -3557,7 +4006,9 @@ impl BlockWork {
         let stored = if let Some((k, low_rank)) = crate::minimax_h3::stored_scratch_extents(spec)? {
             let pitch = crate::minimax_h3::stored_low_rank_pitch(low_rank);
             let convrot = if k > 0 {
-                Some((s.alloc_zeros::<f32>(rows * k)?, s.alloc_zeros::<f32>(rows)?))
+                let bytes = crate::minimax_h3::convrot_scratch_bytes(rows, k)?;
+                let elems = usize::try_from(bytes / 4)?;
+                Some((s.alloc_zeros::<f32>(elems)?, s.alloc_zeros::<f32>(rows)?))
             } else {
                 None
             };
@@ -3590,15 +4041,14 @@ impl BlockWork {
             repeat_ffn_input: false,
             skip_norm1: false,
             normed,
-            q_raw,
-            k_raw,
+            attn_stride,
+            attention_kv,
             v_raw,
-            q,
-            k,
             lora,
             hidden: hidden_view,
             gated: gated_view,
-            ffn_owned: Some((hidden, gated)),
+            ffn_hidden: Some(hidden),
+            ffn_gated: Some(gated),
             stored,
             wide: None,
             wide_launch: None,
@@ -3935,11 +4385,20 @@ fn apply_shared_qkv(
             rotate: work.rotate[Q],
         },
     )?;
-    for ((qweight, wscale, _), out) in [(q.0, q.1, q.2), (k.0, k.1, k.2), (v.0, v.1, v.2)]
-        .into_iter()
-        .zip([&work.q_raw, &work.k_raw, &work.v_raw])
-    {
-        let y = rows_view(out, c.s, 0, rows, width, width)?;
+    for ((qweight, wscale, _), y) in [
+        (
+            (q.0, q.1, q.2),
+            work.attn_rows_view(c.s, work.q_raw_offset(), rows, width)?,
+        ),
+        (
+            (k.0, k.1, k.2),
+            work.attn_rows_view(c.s, work.k_raw_offset(), rows, width)?,
+        ),
+        (
+            (v.0, v.1, v.2),
+            rows_view(&work.v_raw, c.s, 0, rows, width, width)?,
+        ),
+    ] {
         crate::convrot::launch_product(
             c.s,
             &launch.convrot,
@@ -4114,7 +4573,7 @@ fn block_forward_tail<const LORA: bool>(
             );
             (6 * spec.rope_freq_dim, pointer(rotary, s), Some(modulation))
         }
-        Conditioning::Plain => (0, pointer(&work.q, s), None),
+        Conditioning::Plain => (0, work.attn_ptr(s, work.q_offset()), None),
     };
     let wide = work.wide_launch;
     if LORA && wide.is_some() {
@@ -4249,12 +4708,12 @@ fn block_forward_tail<const LORA: bool>(
         hidden_norm(&w.norm1, 0, 1)?;
     }
     if !apply_shared_qkv(c, w, work, scratch)? {
-        for (index, out) in [(Q, &work.q_raw), (K, &work.k_raw), (V, &work.v_raw)] {
-            base(
-                index,
-                rows_view(&work.normed, s, 0, rows, h, h)?,
-                rows_view(out, s, 0, rows, width, width)?,
-            )?;
+        for (index, out) in [
+            (Q, work.attn_rows_view(s, work.q_raw_offset(), rows, width)?),
+            (K, work.attn_rows_view(s, work.k_raw_offset(), rows, width)?),
+            (V, rows_view(&work.v_raw, s, 0, rows, width, width)?),
+        ] {
+            base(index, rows_view(&work.normed, s, 0, rows, h, h)?, out)?;
         }
     }
     if LORA {
@@ -4265,9 +4724,15 @@ fn block_forward_tail<const LORA: bool>(
             &mut TensorMut(rows_view(&work.lora, s, 0, rows, 3 * r, 3 * r)?),
         )?;
         for (i, (b, out)) in [
-            (&w.q_b, &work.q_raw),
-            (&w.k_b, &work.k_raw),
-            (&w.v_b, &work.v_raw),
+            (
+                &w.q_b,
+                work.attn_rows_view(s, work.q_raw_offset(), rows, width)?,
+            ),
+            (
+                &w.k_b,
+                work.attn_rows_view(s, work.k_raw_offset(), rows, width)?,
+            ),
+            (&w.v_b, matrix(&work.v_raw, s, rows, width)?),
         ]
         .into_iter()
         .enumerate()
@@ -4275,7 +4740,7 @@ fn block_forward_tail<const LORA: bool>(
             blas.linear_accumulate(
                 matrix(b, s, width, r)?,
                 rows_view(&work.lora, s, i * r, rows, r, 3 * r)?,
-                &mut TensorMut(matrix(out, s, rows, width)?),
+                &mut TensorMut(out),
                 lora_scale,
             )?;
         }
@@ -4286,12 +4751,16 @@ fn block_forward_tail<const LORA: bool>(
         block_dim: (QK_ROPE_THREADS, 1, 1),
         shared_mem_bytes: 0,
     };
+    let q_raw_ptr = work.attn_ptr(s, work.q_raw_offset());
+    let k_raw_ptr = work.attn_ptr(s, work.k_raw_offset());
+    let q_ptr = work.attn_ptr(s, work.q_offset());
+    let k_ptr = work.attn_ptr(s, work.k_offset());
     kernels.prepare_fp16_store(s, &kernels.norm_module)?;
     unsafe {
         s.launch_builder(&kernels.rotary_q)
-            .arg(&pointer(&work.q_raw, s))
+            .arg(&q_raw_ptr)
             .arg(&w.norm_q.tensor.ptr)
-            .arg(&pointer(&work.q, s))
+            .arg(&q_ptr)
             .arg(&rotary_table)
             .arg(&0i32)
             .arg(&rows_i)
@@ -4306,11 +4775,11 @@ fn block_forward_tail<const LORA: bool>(
     kernels.prepare_fp16_store(s, &kernels.norm_module)?;
     unsafe {
         s.launch_builder(&kernels.rotary_kv)
-            .arg(&pointer(&work.k_raw, s))
+            .arg(&k_raw_ptr)
             .arg(&w.norm_k.tensor.ptr)
             .arg(&pointer(&work.v_raw, s))
-            .arg(&pointer(&work.k, s))
-            .arg(&pointer(&work.q_raw, s))
+            .arg(&k_ptr)
+            .arg(&q_raw_ptr)
             .arg(&rotary_table)
             .arg(&0i32)
             .arg(&rows_i)
@@ -4322,22 +4791,29 @@ fn block_forward_tail<const LORA: bool>(
             .launch(qk_rope_cfg)?;
     }
     kernels.finish_fp16_store(s, &kernels.norm_module, "k")?;
-    flash.run(
-        &work.q,
-        width,
-        &work.k,
-        &work.q_raw,
-        &mut work.v_raw,
-        Shape {
-            rows,
-            start: 0,
-            q_heads: spec.heads,
-            kv_heads: spec.heads,
-            capacity: rows,
-            head_dim: spec.head_dim,
-            causal: false,
-            window_left: None,
+    let flash_offsets = [work.q_offset(), work.k_offset(), work.q_raw_offset(), 0];
+    flash.run_masked_with_offsets(
+        crate::backend::cuda::flash::Query {
+            q: &work.attention_kv,
+            q_row_stride: width,
+            k: &work.attention_kv,
+            v: &work.attention_kv,
+            out: &mut work.v_raw,
+            shape: Shape {
+                rows,
+                start: 0,
+                q_heads: spec.heads,
+                kv_heads: spec.heads,
+                capacity: rows,
+                head_dim: spec.head_dim,
+                causal: false,
+                window_left: None,
+            },
+            keys: rows,
+            prefix: None,
+            image_blocks: None,
         },
+        flash_offsets,
     )?;
     if let Some(wide) = wide {
         wide_dense(
@@ -6620,7 +7096,7 @@ pub(crate) struct Dit {
 
 fn bind_video_ffn(
     (d, blas): (&Device, &mut Blas),
-    (spec, r): (&H3Spec, usize),
+    (spec, profile, r): (&H3Spec, &FfnBlockProfile, usize),
     (work, text_work, x): (&mut BlockWork, &BlockWork, &CudaSlice<bf16>),
     (transient, pending): (usize, usize),
 ) -> Result<()> {
@@ -6642,65 +7118,73 @@ fn bind_video_ffn(
         }
     }
     let budget = d.workspace_budget(free, free, reserve)?;
-    let (choices, owned, chosen) = if hyperflow {
-        let choices = work.ffn_choices::<false>(blas, spec, budget)?;
-        let owned = FfnPlan::select(&choices, budget)?;
-        let aliases = work.alias_choices::<false>(blas, spec, owned)?;
-        let chosen = FfnPlan::select(&aliases, budget)?;
-        (choices, owned, chosen)
+    let (choices, chosen) = if hyperflow {
+        let choices = work.ffn_choices::<false>(blas, spec, profile, budget)?;
+        let chosen = FfnPlan::select(&choices, budget)?;
+        (choices, chosen)
     } else {
-        let choices = work.ffn_choices::<true>(blas, spec, budget)?;
-        let owned = FfnPlan::select(&choices, budget)?;
-        let aliases = work.alias_choices::<true>(blas, spec, owned)?;
-        let chosen = FfnPlan::select(&aliases, budget)?;
-        (choices, owned, chosen)
+        let choices = work.ffn_choices::<true>(blas, spec, profile, budget)?;
+        let chosen = FfnPlan::select(&choices, budget)?;
+        (choices, chosen)
     };
     let previous = *choices
         .iter()
         .find(|p| p.chunk == work.chunk)
         .context("main FFN baseline missing")?;
-    if work.rows > FFN_CHUNK_ROWS {
+    if work.rows > FFN_CHUNK_ROWS && profile.has_dense_ffn() {
         if hyperflow {
-            work.ffn_cost::<false>(blas, spec, work.chunk, true)?;
+            work.ffn_cost::<false>(
+                blas,
+                spec,
+                profile,
+                (work.chunk, previous.storage, previous.allocation),
+                true,
+            )?;
         } else {
-            work.ffn_cost::<true>(blas, spec, work.chunk, true)?;
+            work.ffn_cost::<true>(
+                blas,
+                spec,
+                profile,
+                (work.chunk, previous.storage, previous.allocation),
+                true,
+            )?;
         }
     }
     let description = |plan: FfnPlan| {
         serde_json::json!({
             "rows":work.rows,"previous_chunk":work.chunk,"chunk":plan.chunk,
-            "storage":if plan.borrowed {"attention_scratch"} else {"owned"},
+            "storage":plan.storage.as_str(),
             "chunks":work.rows.div_ceil(plan.chunk),"tail":work.rows%plan.chunk,
             "new_allocation_bytes":plan.allocation,"estimated_tensor_cost":plan.tensor_cost,
             "estimated_launches_per_block":plan.launches,"previous_tensor_cost":previous.tensor_cost,
             "previous_launches_per_block":previous.launches})
     };
     if crate::backend::diagnostics_enabled() {
+        let attention_elems = work.attention_kv.len();
+        let full_cap = FfnPlan::full_alias_capacity(attention_elems, spec.ffn)?;
+        let half_cap = FfnPlan::half_alias_capacity(attention_elems, spec.ffn)?;
         eprintln!(
             "{}",
             serde_json::json!({"h3_ffn_plan":{
                 "workspace_budget":budget,"free_bytes":free,"live_reserve_bytes":reserve,
                 "peak_additional_bytes":chosen.allocation+chosen.workspace,
                 "lt_workspace_replacement_bytes":chosen.workspace,"main":description(chosen),
-                "owned_alternative":description(owned),
-                "alias_capacity_rows":FfnPlan::alias_capacity((work.q_raw.len(),work.k_raw.len()),spec.ffn)?,
+                "alias_capacity_rows":full_cap,
+                "half_alias_capacity_rows":half_cap,
+                "reload_weight_bytes":profile.reload_weight_bytes,
+                "device_memory_bytes_per_second":profile.memory_bytes_per_second,
                 "refiner":{"rows":text_work.rows,"previous_chunk":text_work.chunk,"chunk":text_work.chunk,
                     "chunks":text_work.rows.div_ceil(text_work.chunk),"tail":text_work.rows%text_work.chunk,
                     "new_allocation_bytes":0,"ordinary_plans":true}}})
         );
     }
     blas.bind_workspace(chosen.workspace)?;
+    let residual = (
+        pointer(x, s),
+        x.len().checked_mul(2).context("residual bytes")?,
+    );
     if hyperflow {
-        work.bind_ffn::<false>(
-            s,
-            blas,
-            spec,
-            chosen,
-            (
-                pointer(x, s),
-                x.len().checked_mul(2).context("residual bytes")?,
-            ),
-        )?;
+        work.bind_ffn::<false>((s, blas), (spec, profile), chosen, residual)?;
         if spec.int8_convrot.is_some() {
             work.product[FF_IN] = crate::convrot::gate_up_product_order(
                 d,
@@ -6728,27 +7212,23 @@ fn bind_video_ffn(
             }
         }
     } else {
-        work.bind_ffn::<true>(
-            s,
-            blas,
-            spec,
-            chosen,
-            (
-                pointer(x, s),
-                x.len().checked_mul(2).context("residual bytes")?,
-            ),
-        )?;
+        work.bind_ffn::<true>((s, blas), (spec, profile), chosen, residual)?;
     }
     s.synchronize()?;
     if crate::backend::diagnostics_enabled() {
+        let q_raw_ptr = work.attn_ptr(s, work.q_raw_offset());
+        let k_raw_ptr = work.attn_ptr(s, work.k_raw_offset());
         eprintln!(
             "{}",
             serde_json::json!({"h3_ffn_storage":{
                 "hidden_ptr":work.hidden.ptr,"hidden_shape":work.hidden.shape,"hidden_span_bytes":work.hidden.span_bytes,
                 "gated_ptr":work.gated.ptr,"gated_shape":work.gated.shape,"gated_span_bytes":work.gated.span_bytes,
-                "q_raw_ptr":pointer(&work.q_raw,s),"q_raw_bytes":2*work.q_raw.len(),
-                "k_raw_ptr":pointer(&work.k_raw,s),"k_raw_bytes":2*work.k_raw.len(),
-                "owned":work.ffn_owned.is_some(),"free_after_binding":d.ctx.mem_get_info()?.0}})
+                "attention_kv_ptr":pointer(&work.attention_kv,s),"attention_kv_bytes":2*work.attention_kv.len(),
+                "q_raw_ptr":q_raw_ptr,"q_raw_bytes":2*work.attn_stride,
+                "k_raw_ptr":k_raw_ptr,"k_raw_bytes":2*work.attn_stride,
+                "storage":chosen.storage.as_str(),
+                "owned": work.ffn_hidden.is_some() || work.ffn_gated.is_some(),
+                "free_after_binding": d.ctx.mem_get_info()?.0}})
         );
     }
     Ok(())
@@ -7065,7 +7545,7 @@ impl Dit {
             .context("MiniMax dense setup requires a resident published block")?;
         let qualify = |role: usize,
                        rows: usize,
-                       activation: &CudaSlice<bf16>,
+                       activation: (&CudaSlice<bf16>, usize),
                        output: Tensor<bf16, 2>|
          -> Result<()> {
             let BlockLinear::Dense { weight, .. } = block.linears[role] else {
@@ -7074,34 +7554,65 @@ impl Dit {
             let width = weight.shape[0] as usize;
             let k = weight.shape[1] as usize;
             let elements = rows.checked_mul(width).context("dense setup extent")?;
-            if elements > work.k_raw.len().min(work.v_raw.len()) {
+            let available = work.attn_stride.min(work.v_raw.len());
+            if elements > available {
                 if crate::backend::diagnostics_enabled() {
                     eprintln!(
                         "{}",
-                        serde_json::json!({"dense_lt":{"rows":rows,"output":width,"choice":"incumbent","required_comparison_elements":elements,"available_elements":work.k_raw.len().min(work.v_raw.len())}})
+                        serde_json::json!({"dense_lt":{"rows":rows,"output":width,"choice":"incumbent","required_comparison_elements":elements,"available_elements":available}})
                     );
                 }
                 return Ok(());
             }
-            let input = rows_view(activation, stream, 0, rows, k, k)?;
+            let input = rows_view(activation.0, stream, activation.1, rows, k, k)?;
+            let out_view = output.prefix_rows(u32::try_from(rows)?)?;
             let copies = [
-                rows_view(&work.k_raw, stream, 0, rows, width, width)?,
+                work.attn_rows_view(stream, work.k_raw_offset(), rows, width)?,
                 rows_view(&work.v_raw, stream, 0, rows, width, width)?,
             ];
+            crate::backend::cuda::contracts::no_overlap(
+                &out_view,
+                &copies[0],
+                "dense_lt output",
+                "k_raw",
+            )?;
+            crate::backend::cuda::contracts::no_overlap(
+                &out_view,
+                &copies[1],
+                "dense_lt output",
+                "v_raw",
+            )?;
+            crate::backend::cuda::contracts::no_overlap(
+                &input,
+                &copies[0],
+                "dense_lt input",
+                "k_raw",
+            )?;
+            crate::backend::cuda::contracts::no_overlap(
+                &input,
+                &copies[1],
+                "dense_lt input",
+                "v_raw",
+            )?;
             blas.bind_dense_projection(
-                [weight, input, output.prefix_rows(u32::try_from(rows)?)?],
+                [weight, input, out_view],
                 copies,
                 &table.blocks,
                 (role == FF_IN).then_some(work.rows % work.chunk),
                 qualification_plan_family(blas.bf16_row_family(), role == FF_IN),
             )
         };
-        let q = matrix(&work.q_raw, stream, work.rows, work.q_raw.len() / work.rows)?;
-        qualify(Q, work.rows, &work.normed, q)?;
-        qualify(FF_IN, work.chunk, &work.normed, work.hidden)?;
+        let q = work.attn_rows_view(
+            stream,
+            work.q_raw_offset(),
+            work.rows,
+            work.v_raw.len() / work.rows,
+        )?;
+        qualify(Q, work.rows, (&work.normed, 0), q)?;
+        qualify(FF_IN, work.chunk, (&work.normed, 0), work.hidden)?;
         let tail = work.rows % work.chunk;
         if tail > 0 {
-            qualify(FF_IN, tail, &work.normed, work.hidden)?;
+            qualify(FF_IN, tail, (&work.normed, 0), work.hidden)?;
         }
         ensure!(
             work.rows > 0 && work.normed.len().is_multiple_of(work.rows),
@@ -7109,7 +7620,12 @@ impl Dit {
         );
         let hidden = work.normed.len() / work.rows;
         let out = rows_view(&work.normed, stream, 0, work.rows, hidden, hidden)?;
-        qualify(OUT, work.rows, &work.q_raw, out)?;
+        qualify(
+            OUT,
+            work.rows,
+            (&work.attention_kv, work.q_raw_offset()),
+            out,
+        )?;
         Ok(())
     }
 
@@ -7295,11 +7811,12 @@ impl Dit {
                 .checked_add(wscale)
                 .context("HyperFlow wscale bytes")?;
         }
+        let ffn_profile = FfnBlockProfile::from_manifest(spec, base.manifest, r, &d.info)?;
         let selected = if let Some(choose) = choose {
             let mut bind_work = |pending| {
                 bind_video_ffn(
                     (d, blas),
-                    (spec, r),
+                    (spec, &ffn_profile, r),
                     (&mut work, &text_work, &x),
                     (0, pending),
                 )
@@ -7483,7 +8000,7 @@ impl Dit {
         if !resident {
             bind_video_ffn(
                 (d, blas),
-                (spec, r),
+                (spec, &ffn_profile, r),
                 (&mut work, &text_work, &x),
                 (sizing.transient, 0),
             )?;
@@ -8200,11 +8717,10 @@ impl ImageDit {
         let owned =
             spec.layers * 2 * (2 * h + 2 * spec.head_dim) + sizing.staging + sizing.transient;
         let name = |layer| format!("transformer_blocks.{layer}");
+        let ffn_profile = FfnBlockProfile::from_manifest(spec, manifest, 0, &d.info)?;
         let bind_ffn = |work: &mut BlockWork, blas: &mut Blas, budget| -> Result<FfnPlan> {
-            let choices = work.ffn_choices::<false>(blas, spec, budget)?;
-            let owned_plan = FfnPlan::select(&choices, budget)?;
-            let aliases = work.alias_choices::<false>(blas, spec, owned_plan)?;
-            let plan = FfnPlan::select(&aliases, budget)?;
+            let choices = work.ffn_choices::<false>(blas, spec, &ffn_profile, budget)?;
+            let plan = FfnPlan::select(&choices, budget)?;
             blas.bind_workspace(plan.workspace)?;
             let residual = match &wide_storage {
                 Some(wide) => (
@@ -8216,7 +8732,7 @@ impl ImageDit {
                     x.len().checked_mul(2).context("residual bytes")?,
                 ),
             };
-            work.bind_ffn::<false>(s, blas, spec, plan, residual)?;
+            work.bind_ffn::<false>((s, blas), (spec, &ffn_profile), plan, residual)?;
             Ok(plan)
         };
         let (placed, device_after, prepared_ffn) = match placement {
@@ -9889,7 +10405,7 @@ mod tests {
         }
         let baseline = FfnPlan {
             chunk: 1_002,
-            borrowed: false,
+            storage: FfnStorage::Owned,
             allocation: 0,
             workspace: 0,
             tensor_cost: 80.0,
@@ -9897,7 +10413,7 @@ mod tests {
         };
         let efficient = FfnPlan {
             chunk: 6_675,
-            borrowed: false,
+            storage: FfnStorage::Owned,
             allocation: FfnPlan::allocation(6_675, 14_336)?,
             workspace: 0,
             tensor_cost: 54.0,
@@ -9905,7 +10421,7 @@ mod tests {
         };
         let larger = FfnPlan {
             chunk: 8_009,
-            borrowed: false,
+            storage: FfnStorage::Owned,
             allocation: FfnPlan::allocation(8_009, 14_336)?,
             workspace: 0,
             tensor_cost: 55.0,
@@ -9926,16 +10442,23 @@ mod tests {
             6_675
         );
         assert!(FfnPlan::allocation(usize::MAX, 2).is_err());
-        for (rows, expected) in [(40_045, 10_011), (60_431, 15_107)] {
-            let elements = rows * 7_168;
-            let capacity = FfnPlan::alias_capacity((elements, elements), 14_336)?;
-            assert_eq!(capacity, expected);
-            assert!(capacity * 28_672 <= elements);
-            assert!((capacity + 1) * 28_672 > elements);
-            assert_eq!(FfnPlan::alias_capacity((elements, 14_335), 14_336)?, 0);
+        for (rows, expected_full, expected_half) in [
+            (37_717usize, 25_144usize, 37_717usize),
+            (40_045, 26_696, 40_045),
+            (60_431, 40_287, 60_431),
+        ] {
+            let attn_kv = 4 * (rows * 7_168).next_multiple_of(128);
+            let full_cap = FfnPlan::full_alias_capacity(attn_kv, 14_336)?;
+            let half_cap = FfnPlan::half_alias_capacity(attn_kv, 14_336)?;
+            assert_eq!(full_cap, expected_full);
+            assert_eq!(half_cap, expected_half);
+            assert!(full_cap * 43_008 <= attn_kv);
+            assert!((full_cap + 1) * 43_008 > attn_kv);
+            assert_eq!(FfnPlan::full_alias_capacity(43_007, 14_336)?, 0);
         }
-        assert!(FfnPlan::alias_capacity((usize::MAX, usize::MAX), usize::MAX).is_err());
-        assert!(FfnPlan::alias_capacity((1, 1), 0).is_err());
+        assert!(FfnPlan::full_alias_capacity(usize::MAX, usize::MAX).is_err());
+        assert!(FfnPlan::full_alias_capacity(1, 0).is_err());
+        assert!(FfnPlan::half_alias_capacity(1, 0).is_err());
         let family_ws = 8_192usize;
         let row_ws = 1_024usize;
         let priced = |base_family, index| {
@@ -9978,7 +10501,7 @@ mod tests {
         let element = 86_016usize;
         let plan = |chunk: usize, tensor_cost: f64| FfnPlan {
             chunk,
-            borrowed: false,
+            storage: FfnStorage::Owned,
             allocation: if chunk == initial { 0 } else { chunk * element },
             workspace: 0,
             tensor_cost,
@@ -9999,6 +10522,271 @@ mod tests {
         assert_eq!(FfnPlan::select(&choices, doubled)?.chunk, 1_026);
         assert!(choices[1].allocation <= logged_free);
         assert!(choices[3].allocation <= doubled && choices[2].allocation > doubled);
+        Ok(())
+    }
+
+    #[test]
+    fn ffn_plan_derives_half_alias_on_4090_and_full_alias_on_16gb_from_sensed_bandwidth()
+    -> Result<()> {
+        use crate::backend::setup::{DeviceArchitecture, DeviceInfo};
+        use crate::checkpoint::TensorScope;
+        let mut spec = H3Spec::parse(&serde_json::from_str(include_str!(
+            "../../../tests/data/minimax-h3-transformer-config.json"
+        ))?)?;
+        let dropped = vec![6usize, 21, 22];
+        let mut lowrank_ranks = BTreeMap::new();
+        let mut int8_set = std::collections::BTreeSet::new();
+        let mut entries = BTreeMap::new();
+        let push = |entries: &mut BTreeMap<String, TensorEntry>,
+                    name: String,
+                    layer: usize,
+                    dtype: Dtype,
+                    shape: Vec<usize>,
+                    bytes: usize| {
+            entries.insert(
+                name.clone(),
+                TensorEntry {
+                    dtype,
+                    shape,
+                    shard: String::new(),
+                    bytes,
+                    load: true,
+                    data_start: 0,
+                    data_offsets: [0, bytes as u64],
+                    scope: TensorScope::Text,
+                    layer: Some(layer as u32),
+                    role: name,
+                    scale_name: None,
+                    quant: None,
+                    swap_halves: false,
+                },
+            );
+        };
+        let (h, f) = (spec.hidden, spec.ffn);
+        let lowrank_layers = [
+            1usize, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 23,
+        ];
+        let mut expected_ffn_bytes = 0usize;
+        for layer in 0..spec.layers {
+            if dropped.contains(&layer) {
+                continue;
+            }
+            for (is_in, suffix, out, input) in
+                [(true, "ff.net.0.proj", 2 * f, h), (false, "ff.net.2", h, f)]
+            {
+                let prefix = format!("transformer_blocks.{layer}.{suffix}");
+                let is_lowrank = lowrank_layers.contains(&layer)
+                    || (layer == 2 && is_in)
+                    || (layer == 49 && !is_in);
+                if is_lowrank {
+                    let rank = if is_in { 640 } else { 1536 };
+                    lowrank_ranks.insert(prefix.clone(), rank);
+                    let down_bytes = rank * input * 2;
+                    let up_bytes = out * rank * 2;
+                    push(
+                        &mut entries,
+                        format!("{prefix}.down.weight"),
+                        layer,
+                        Dtype::BF16,
+                        vec![rank, input],
+                        down_bytes,
+                    );
+                    push(
+                        &mut entries,
+                        format!("{prefix}.up.weight"),
+                        layer,
+                        Dtype::BF16,
+                        vec![out, rank],
+                        up_bytes,
+                    );
+                    expected_ffn_bytes += down_bytes + up_bytes;
+                } else {
+                    int8_set.insert(prefix.clone());
+                    let q_bytes = out * input;
+                    let s_bytes = out * 4;
+                    push(
+                        &mut entries,
+                        format!("{prefix}.qweight"),
+                        layer,
+                        Dtype::I8,
+                        vec![out, input],
+                        q_bytes,
+                    );
+                    push(
+                        &mut entries,
+                        format!("{prefix}.wscale"),
+                        layer,
+                        Dtype::F32,
+                        vec![out],
+                        s_bytes,
+                    );
+                    expected_ffn_bytes += q_bytes + s_bytes;
+                }
+            }
+        }
+        spec.hyperflow_gate = Some(0.25);
+        spec.dropped_blocks = Some(dropped);
+        spec.lowrank_ranks = Some(lowrank_ranks);
+        spec.int8_convrot = Some((256, int8_set));
+        let manifest = TensorManifest {
+            entries,
+            resident_bytes: expected_ffn_bytes,
+        };
+        let device_info =
+            |arch: DeviceArchitecture, sms: usize, l2_bytes: usize, clock_khz: i32, bw: f64| {
+                DeviceInfo {
+                    name: String::new(),
+                    arch,
+                    sms,
+                    l2_bytes,
+                    warp: 32,
+                    max_threads: 1024,
+                    shared_bytes: 49_152,
+                    sm_shared_bytes: 65_536,
+                    cooperative: true,
+                    optin_shared_bytes: 65_536,
+                    clock_khz,
+                    memory_bytes_per_second: bw,
+                }
+            };
+        let rtx4090 = device_info(
+            DeviceArchitecture::Cuda(89),
+            128,
+            75_497_472,
+            2_520_000,
+            1_008_000_000_000.0,
+        );
+        let t4 = device_info(
+            DeviceArchitecture::Cuda(75),
+            40,
+            4_194_304,
+            1_590_000,
+            320_000_000_000.0,
+        );
+        let a4000 = device_info(
+            DeviceArchitecture::Cuda(86),
+            48,
+            4_194_304,
+            1_560_000,
+            448_000_000_000.0,
+        );
+
+        let rows = 37_717usize;
+        let baseline = ffn_chunk(rows);
+        let attn_elems = 4 * (rows * spec.heads * spec.head_dim).next_multiple_of(128);
+        let profile_4090 = FfnBlockProfile::from_manifest(&spec, &manifest, 0, &rtx4090)?;
+        assert!(!profile_4090.has_dense_ffn());
+        assert_eq!(profile_4090.kept_blocks, 47);
+        assert_eq!(profile_4090.int8_in_blocks, 30);
+        assert_eq!(profile_4090.int8_out_blocks, 30);
+        let mean_bytes = expected_ffn_bytes as f64 / 47.0;
+        assert!((profile_4090.reload_weight_bytes - mean_bytes).abs() < 1.0);
+
+        let budget_4090 = 2_212_030_464usize;
+        let choices_4090 =
+            profile_4090.stored_choices((rows, baseline, attn_elems, budget_4090), &spec)?;
+        let chosen_4090 = FfnPlan::select(&choices_4090, budget_4090)?;
+        assert_eq!(chosen_4090.storage, FfnStorage::HalfAlias);
+        assert_eq!(chosen_4090.chunk, rows);
+        assert_eq!(rows.div_ceil(chosen_4090.chunk), 1);
+        assert_eq!(chosen_4090.allocation, 1_081_421_824);
+        let starved_4090 = choices_4090
+            .iter()
+            .find(|p| p.chunk == 1_509)
+            .context("1509 choice on 4090")?;
+        assert!(chosen_4090.tensor_cost < starved_4090.tensor_cost);
+        assert_eq!(
+            (rows * f * 4) as u64 - crate::minimax_h3::convrot_scratch_bytes(rows, f)?,
+            1_622_132_736
+        );
+        assert_eq!(
+            FfnPlan::allocation(rows, f)? - chosen_4090.allocation,
+            2_162_843_648
+        );
+
+        for (label, info) in [("t4", &t4), ("a4000", &a4000)] {
+            let profile = FfnBlockProfile::from_manifest(&spec, &manifest, 0, info)?;
+            let choices = profile.stored_choices((rows, baseline, attn_elems, 0), &spec)?;
+            let chosen = FfnPlan::select(&choices, 0)?;
+            assert_eq!(chosen.storage, FfnStorage::FullAlias, "{label}");
+            assert_eq!(chosen.chunk, 18_859, "{label}");
+            assert_eq!(chosen.allocation, 0, "{label}");
+            let starved = choices
+                .iter()
+                .find(|p| p.chunk == 1_509)
+                .context("1509 choice")?;
+            assert!(
+                chosen.tensor_cost < starved.tensor_cost,
+                "{label} must prefer chunks=2 over chunks=25"
+            );
+        }
+
+        let half_bw = device_info(
+            DeviceArchitecture::Cuda(89),
+            128,
+            75_497_472,
+            2_520_000,
+            504_000_000_000.0,
+        );
+        let profile_half = FfnBlockProfile::from_manifest(&spec, &manifest, 0, &half_bw)?;
+        let ratio = (profile_half.reload_seconds(25) - profile_half.reload_seconds(1))
+            / (profile_4090.reload_seconds(25) - profile_4090.reload_seconds(1));
+        assert!((ratio - 2.0).abs() < 1e-12);
+
+        let tiny_rows = 300usize;
+        let tiny_attn = 4 * (tiny_rows * spec.heads * spec.head_dim).next_multiple_of(128);
+        let tiny_choices =
+            profile_4090.stored_choices((tiny_rows, ffn_chunk(tiny_rows), tiny_attn, 0), &spec)?;
+        let tiny_chosen = FfnPlan::select(&tiny_choices, 0)?;
+        assert_eq!(tiny_chosen.chunk, tiny_rows);
+        assert_eq!(tiny_chosen.storage, FfnStorage::Owned);
+        assert_eq!(tiny_chosen.allocation, 0);
+
+        let base_ptr = 0x1_0000_0000u64;
+        let chunk = 18_859usize;
+        let hidden_elems = chunk * 2 * f;
+        let gated_elems = chunk * f;
+        let gated_offset = (attn_elems - gated_elems) & !127usize;
+        let hidden_view = unsafe {
+            Tensor::<bf16, 2>::new(
+                base_ptr,
+                [chunk as u32, (2 * f) as u32],
+                [(2 * f) as u64, 1],
+                (hidden_elems * 2) as u64,
+            )?
+        };
+        let valid_gated = unsafe {
+            Tensor::<bf16, 2>::new(
+                base_ptr + (gated_offset * 2) as u64,
+                [chunk as u32, f as u32],
+                [f as u64, 1],
+                (gated_elems * 2) as u64,
+            )?
+        };
+        crate::backend::cuda::contracts::no_overlap(
+            &hidden_view,
+            &valid_gated,
+            "FFN hidden",
+            "FFN gated",
+        )?;
+        let overlapping_gated = unsafe {
+            Tensor::<bf16, 2>::new(
+                base_ptr + ((hidden_elems - 128) * 2) as u64,
+                [chunk as u32, f as u32],
+                [f as u64, 1],
+                (gated_elems * 2) as u64,
+            )?
+        };
+        ensure!(
+            crate::backend::cuda::contracts::no_overlap(
+                &hidden_view,
+                &overlapping_gated,
+                "FFN hidden",
+                "FFN gated",
+            )
+            .is_err(),
+            "planted overlap inside attention_kv was not rejected by contracts::no_overlap"
+        );
         Ok(())
     }
 
@@ -12877,29 +13665,41 @@ mod tests {
                     input,
                 })?;
             }
-            let plan = owned.ffn_cost::<true>(&blas, &spec, chunk, false)?;
+            let profile = FfnBlockProfile::dense_default(&spec, adapter.rank, &device.info)?;
+            let plan = owned.ffn_cost::<true>(
+                &blas,
+                &spec,
+                &profile,
+                (
+                    chunk,
+                    FfnStorage::Owned,
+                    FfnPlan::allocation(chunk, spec.ffn)?,
+                ),
+                false,
+            )?;
             blas.bind_workspace(plan.workspace)?;
             let mut x = s.clone_htod(&input)?;
             let span = (
                 pointer(&x, s),
                 x.len().checked_mul(2).context("residual bytes")?,
             );
-            owned.bind_ffn::<true>(s, &blas, &spec, plan, span)?;
+            owned.bind_ffn::<true>((s, &blas), (&spec, &profile), plan, span)?;
             borrowed.bind_ffn::<true>(
-                s,
-                &blas,
-                &spec,
+                (s, &blas),
+                (&spec, &profile),
                 FfnPlan {
-                    borrowed: true,
+                    storage: FfnStorage::FullAlias,
                     allocation: 0,
                     ..plan
                 },
                 span,
             )?;
+            let attn_base = pointer(&borrowed.attention_kv, s);
             ensure!(
-                borrowed.hidden.ptr == pointer(&borrowed.q_raw, s)
-                    && borrowed.gated.ptr == pointer(&borrowed.k_raw, s)
-                    && borrowed.hidden.span_bytes + 256 <= (borrowed.q_raw.len() * 2) as u64,
+                borrowed.hidden.ptr == attn_base
+                    && borrowed.gated.ptr >= borrowed.hidden.ptr + borrowed.hidden.span_bytes + 256
+                    && borrowed.gated.ptr + borrowed.gated.span_bytes
+                        <= attn_base + (borrowed.attention_kv.len() * 2) as u64,
                 "borrowed address/control capacity"
             );
             let receipt = blas.bound_plan_receipt()?;
@@ -12959,7 +13759,11 @@ mod tests {
              -> Result<Vec<bf16>> {
                 s.memcpy_htod(&input, &mut x)?;
                 s.memcpy_htod(&input, &mut work.normed)?;
-                let poison = if work.ffn_owned.is_some() { 0x3f } else { 0xbf };
+                let poison = if work.ffn_hidden.is_some() || work.ffn_gated.is_some() {
+                    0x3f
+                } else {
+                    0xbf
+                };
                 unsafe {
                     crate::backend::cuda::copy::memset_bytes(
                         work.hidden.ptr,
@@ -21465,6 +22269,379 @@ mod tests {
             "HYPERFLOW_LOW_RANK_OVERREAD PASS block=2 down_rank={down_rank} down_pitch={} out_rank={out_rank} out_pitch={} rows={rows}",
             down_rank.div_ceil(8) * 8,
             out_rank.div_ceil(8) * 8
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a reserved GPU window; FF_HYPERFLOW_MODEL, FF_Q38_GPU_WINDOW=granted"]
+    fn hyperflow_ffn_alias_and_convrot_chunk_parity_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let model = env_dir("FF_HYPERFLOW_MODEL")?;
+        let spec = H3Spec::parse(&serde_json::from_slice(&fs::read(
+            model.join("config.json"),
+        )?)?)?;
+        ensure!(spec.is_hyperflow()?, "transformer config is not HyperFlow");
+        let manifest = MappedCheckpoint::open_component(&model, "diffusion_pytorch_model")?
+            .minimax_h3_manifest(&spec)?;
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime =
+            std::env::temp_dir().join(format!("ff-hyperflow-ffn-alias-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let _runtime = BlockRuntime(runtime.clone());
+        let blas = open_blas(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(true, "HyperFlow FFN alias parity".into())),
+        )?;
+        let profile = FfnBlockProfile::from_manifest(&spec, &manifest, 0, &device.info)?;
+        let mut source = Source::new(&model, &manifest, device.info.arch.fp16_stored_half());
+        source.pack_vectors(s, &spec)?;
+        let block0 = BlockWeights::stored(s, &spec, "transformer_blocks.0", &mut source, None)?;
+        let block1 = BlockWeights::stored(s, &spec, "transformer_blocks.1", &mut source, None)?;
+        let block2 = BlockWeights::stored(s, &spec, "transformer_blocks.2", &mut source, None)?;
+        ensure!(
+            matches!(block0.linears[FF_IN], BlockLinear::Int8 { .. })
+                && matches!(block0.linears[FF_OUT], BlockLinear::Int8 { .. })
+                && matches!(block1.linears[FF_IN], BlockLinear::LowRank { .. })
+                && matches!(block1.linears[FF_OUT], BlockLinear::LowRank { .. })
+                && matches!(block2.linears[FF_IN], BlockLinear::LowRank { .. })
+                && matches!(block2.linears[FF_OUT], BlockLinear::Int8 { .. }),
+            "unexpected HyperFlow block 0/1/2 FFN linear classes"
+        );
+
+        let rows = 37_717usize;
+        let h = spec.hidden;
+        let f = spec.ffn;
+        let width = spec.heads * spec.head_dim;
+        let mut work = BlockWork::new(s, &spec, 0, rows)?;
+        let convrot_bytes = work
+            .stored
+            .as_ref()
+            .and_then(|st| st.convrot.as_ref())
+            .map(|(buf, _)| buf.len() * std::mem::size_of::<f32>())
+            .context("HyperFlow convrot scratch missing")?;
+        ensure!(
+            convrot_bytes == usize::try_from(crate::minimax_h3::convrot_scratch_bytes(rows, f)?)?
+                && convrot_bytes == rows * f,
+            "convrot scratch bytes={convrot_bytes} expected={}",
+            rows * f
+        );
+        let kernels = BlockKernels::new(&device)?;
+        let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?
+            .with_full_single_probability()?;
+        let base_period = 1511usize;
+        let seed_rows: Vec<bf16> = (0..base_period * h)
+            .map(|i| bf16::from_f32((((i * 29 + 11) % 251) as f32 - 125.0) / 160.0))
+            .collect();
+        let mut input: Vec<bf16> = (0..rows * h)
+            .map(|i| seed_rows[((i / h + 17) % base_period) * h + i % h])
+            .collect();
+        if device.info.arch.fp16_stored_half() {
+            crate::tensors::bf16_table_to_runtime_half("hyperflow_ffn_input", &mut input)?;
+        }
+        let mut x = s.clone_htod(&input)?;
+        let residual = (
+            pointer(&x, s),
+            x.len().checked_mul(2).context("residual bytes")?,
+        );
+        let rotary_host: Vec<bf16> = (0..rows * 6 * spec.rope_freq_dim)
+            .map(|i| {
+                let angle = ((i * 13 + 7) % 509) as f32 * 0.01;
+                bf16::from_f32(if i % 2 == 0 { angle.cos() } else { angle.sin() })
+            })
+            .collect();
+        let rotary = upload_runtime_half(
+            s,
+            device.info.arch.fp16_stored_half(),
+            "rotary",
+            &rotary_host,
+        )?;
+        let entries = MODALITIES;
+        let table_host: Vec<bf16> = (0..entries as usize * 6 * h)
+            .map(|i| bf16::from_f32((((i * 19 + 3) % 241) as f32 - 120.0) / 320.0))
+            .collect();
+        let table =
+            upload_runtime_half(s, device.info.arch.fp16_stored_half(), "adaln", &table_host)?;
+        let index = s.clone_htod(
+            &(0..rows)
+                .map(|r| (r % entries as usize) as u32)
+                .collect::<Vec<_>>(),
+        )?;
+        let context = BlockContext {
+            s,
+            blas: &blas,
+            kernels: &kernels,
+            spec: &spec,
+            lora_scale: 0.0,
+        };
+
+        let rebind = |work: &mut BlockWork,
+                      chunk: usize,
+                      storage: FfnStorage,
+                      allocation: usize|
+         -> Result<()> {
+            let plan = FfnPlan {
+                chunk,
+                storage,
+                allocation,
+                workspace: 0,
+                tensor_cost: 0.0,
+                launches: 0,
+            };
+            work.bind_ffn::<false>((s, &blas), (&spec, &profile), plan, residual)?;
+            work.product[FF_IN] = crate::convrot::gate_up_product_order(
+                &device,
+                [work.chunk, work.rows % work.chunk],
+                (h, 2 * f),
+            )?;
+            work.plan_rotation(&device, &spec)?;
+            work.qkv_product = crate::convrot::n_fast_product(&device, work.rows, (h, width))?;
+            work.product[OUT][0] = crate::convrot::n_fast_product(&device, work.rows, (width, h))?;
+            for (i, r) in [work.chunk, work.rows % work.chunk].into_iter().enumerate() {
+                work.product[FF_OUT][i] = crate::convrot::n_fast_product(&device, r, (f, h))?;
+            }
+            Ok(())
+        };
+
+        let poison_ffn = |work: &BlockWork| -> Result<()> {
+            let byte = if work.ffn_hidden.is_some() && work.ffn_gated.is_some() {
+                0x3f
+            } else {
+                0xbf
+            };
+            unsafe {
+                crate::backend::cuda::copy::memset_bytes(
+                    work.hidden.ptr,
+                    byte,
+                    usize::try_from(work.hidden.span_bytes)?,
+                    s,
+                )?;
+                crate::backend::cuda::copy::memset_bytes(
+                    work.gated.ptr,
+                    byte,
+                    usize::try_from(work.gated.span_bytes)?,
+                    s,
+                )?;
+            }
+            s.synchronize()?;
+            Ok(())
+        };
+
+        let run_ffn =
+            |work: &mut BlockWork, weights: &BlockWeights, shifted: bool| -> Result<Vec<bf16>> {
+                s.memcpy_htod(&input, &mut work.normed)?;
+                poison_ffn(work)?;
+                let scratch = stored_ptrs(s, work);
+                if shifted {
+                    ffn_forward::<true, false>(&context, weights, work, scratch)?;
+                } else {
+                    ffn_forward::<false, false>(&context, weights, work, scratch)?;
+                }
+                let out = s.clone_dtoh(&work.normed)?;
+                ensure!(
+                    out.iter().all(|v| v.to_f32().is_finite()),
+                    "RUNNER_FAIL nonfinite HyperFlow FFN output"
+                );
+                Ok(out)
+            };
+
+        let mut run_block =
+            |work: &mut BlockWork, weights: &BlockWeights, graph: bool| -> Result<Vec<bf16>> {
+                s.memcpy_htod(&input, &mut x)?;
+                poison_ffn(work)?;
+                let mut launch = || -> Result<()> {
+                    let modulation = Modulation {
+                        table: &table,
+                        offset: 0,
+                        entries,
+                        index: &index,
+                    };
+                    block_forward::<false>(
+                        &context,
+                        &mut flash,
+                        weights,
+                        &Conditioning::Modulated {
+                            rotary: &rotary,
+                            modulation: &modulation,
+                        },
+                        &mut x,
+                        work,
+                    )
+                };
+                if graph {
+                    let captured = capture_graph(s, false, launch)?;
+                    captured.launch()?;
+                    captured.launch()?;
+                } else {
+                    launch()?;
+                    launch()?;
+                }
+                let out = s.clone_dtoh(&x)?;
+                ensure!(
+                    out.iter().all(|v| v.to_f32().is_finite()),
+                    "RUNNER_FAIL nonfinite HyperFlow block output"
+                );
+                Ok(out)
+            };
+
+        let bit_diffs = |a: &[bf16], b: &[bf16]| -> usize {
+            a.iter()
+                .zip(b)
+                .filter(|(x, y)| x.to_bits() != y.to_bits())
+                .count()
+        };
+        let float_stats = |a: &[bf16], b: &[bf16]| -> (usize, f32, f64) {
+            let mut bits = 0usize;
+            let mut max_abs = 0.0f32;
+            let mut sq_sum = 0.0f64;
+            for (x, y) in a.iter().zip(b) {
+                if x.to_bits() != y.to_bits() {
+                    bits += 1;
+                }
+                let d = (x.to_f32() - y.to_f32()).abs();
+                if d > max_abs {
+                    max_abs = d;
+                }
+                sq_sum += f64::from(d) * f64::from(d);
+            }
+            (bits, max_abs, (sq_sum / a.len().max(1) as f64).sqrt())
+        };
+
+        rebind(
+            &mut work,
+            1_509,
+            FfnStorage::Owned,
+            FfnPlan::allocation(1_509, f)?,
+        )?;
+        let prod_1509 = work.product[FF_IN][0];
+        let b0_1509 = run_ffn(&mut work, &block0, false)?;
+        let b1_1509 = run_ffn(&mut work, &block1, false)?;
+
+        rebind(
+            &mut work,
+            18_859,
+            FfnStorage::Owned,
+            FfnPlan::allocation(18_859, f)?,
+        )?;
+        let prod_18859 = work.product[FF_IN][0];
+        let b0_own_18859 = run_ffn(&mut work, &block0, false)?;
+        let b1_own_18859 = run_ffn(&mut work, &block1, false)?;
+        let b2_own_18859 = run_ffn(&mut work, &block2, false)?;
+        let blk0_own_18859 = run_block(&mut work, &block0, false)?;
+
+        rebind(&mut work, 18_859, FfnStorage::FullAlias, 0)?;
+        let b0_full_18859 = run_ffn(&mut work, &block0, false)?;
+        let b1_full_18859 = run_ffn(&mut work, &block1, false)?;
+        let b2_full_18859 = run_ffn(&mut work, &block2, false)?;
+        let blk0_full_18859_eager = run_block(&mut work, &block0, false)?;
+        let blk0_full_18859_graph = run_block(&mut work, &block0, true)?;
+        let control_shifted = run_ffn(&mut work, &block0, true)?;
+        let control_bits = bit_diffs(&b0_1509, &control_shifted);
+        ensure!(
+            control_bits > 0,
+            "RUNNER_FAIL SHIFT_INPUT control undetected on FullAlias"
+        );
+        let overlapping_gated =
+            rows_view(&work.attention_kv, s, 18_859 * 2 * f - 128, 18_859, f, f)?;
+        ensure!(
+            crate::backend::cuda::contracts::no_overlap(
+                &work.hidden,
+                &overlapping_gated,
+                "FFN hidden",
+                "FFN gated",
+            )
+            .is_err(),
+            "RUNNER_FAIL planted overlap not rejected by contracts::no_overlap"
+        );
+
+        let d_b0_18859_vs_1509 = bit_diffs(&b0_1509, &b0_full_18859);
+        let d_b0_18859_alias = bit_diffs(&b0_own_18859, &b0_full_18859);
+        let d_b1_18859_alias = bit_diffs(&b1_own_18859, &b1_full_18859);
+        let d_b2_18859_alias = bit_diffs(&b2_own_18859, &b2_full_18859);
+        let d_blk0_18859_eager = bit_diffs(&blk0_own_18859, &blk0_full_18859_eager);
+        let d_blk0_18859_graph = bit_diffs(&blk0_own_18859, &blk0_full_18859_graph);
+        let (b1_18859_cross_bits, b1_18859_max_abs, b1_18859_rmse) =
+            float_stats(&b1_1509, &b1_full_18859);
+        drop((
+            b0_own_18859,
+            b1_own_18859,
+            b2_own_18859,
+            blk0_own_18859,
+            b0_full_18859,
+            b1_full_18859,
+            b2_full_18859,
+            blk0_full_18859_eager,
+            blk0_full_18859_graph,
+            control_shifted,
+        ));
+
+        rebind(
+            &mut work,
+            rows,
+            FfnStorage::Owned,
+            FfnPlan::allocation(rows, f)?,
+        )?;
+        let prod_37717 = work.product[FF_IN][0];
+        let b0_own_37717 = run_ffn(&mut work, &block0, false)?;
+        let b1_own_37717 = run_ffn(&mut work, &block1, false)?;
+        let b2_own_37717 = run_ffn(&mut work, &block2, false)?;
+        let blk0_own_37717 = run_block(&mut work, &block0, false)?;
+
+        rebind(
+            &mut work,
+            rows,
+            FfnStorage::HalfAlias,
+            FfnPlan::gated_allocation(rows, f)?,
+        )?;
+        let b0_half_37717 = run_ffn(&mut work, &block0, false)?;
+        let b1_half_37717 = run_ffn(&mut work, &block1, false)?;
+        let b2_half_37717 = run_ffn(&mut work, &block2, false)?;
+        let blk0_half_37717_eager = run_block(&mut work, &block0, false)?;
+        let blk0_half_37717_graph = run_block(&mut work, &block0, true)?;
+
+        let d_b0_37717_vs_1509 = bit_diffs(&b0_1509, &b0_half_37717);
+        let d_b0_37717_alias = bit_diffs(&b0_own_37717, &b0_half_37717);
+        let d_b1_37717_alias = bit_diffs(&b1_own_37717, &b1_half_37717);
+        let d_b2_37717_alias = bit_diffs(&b2_own_37717, &b2_half_37717);
+        let d_blk0_37717_eager = bit_diffs(&blk0_own_37717, &blk0_half_37717_eager);
+        let d_blk0_37717_graph = bit_diffs(&blk0_own_37717, &blk0_half_37717_graph);
+        let (b1_37717_cross_bits, b1_37717_max_abs, b1_37717_rmse) =
+            float_stats(&b1_1509, &b1_half_37717);
+
+        println!(
+            "HYPERFLOW_FFN_ALIAS_GATE rows={rows} convrot_bytes={convrot_bytes} products=[{prod_1509:?},{prod_18859:?},{prod_37717:?}] \
+             b0_18859_vs_1509={d_b0_18859_vs_1509} b0_37717_vs_1509={d_b0_37717_vs_1509} \
+             alias_diffs=[{d_b0_18859_alias},{d_b1_18859_alias},{d_b2_18859_alias},{d_blk0_18859_eager},{d_blk0_18859_graph},{d_b0_37717_alias},{d_b1_37717_alias},{d_b2_37717_alias},{d_blk0_37717_eager},{d_blk0_37717_graph}] \
+             lowrank_18859_vs_1509=(bits={b1_18859_cross_bits},max_abs={b1_18859_max_abs:.6},rmse={b1_18859_rmse:.6}) \
+             lowrank_37717_vs_1509=(bits={b1_37717_cross_bits},max_abs={b1_37717_max_abs:.6},rmse={b1_37717_rmse:.6}) \
+             shift_control_bits={control_bits} overlap_control=rejected"
+        );
+        ensure!(
+            [
+                d_b0_18859_vs_1509,
+                d_b0_37717_vs_1509,
+                d_b0_18859_alias,
+                d_b1_18859_alias,
+                d_b2_18859_alias,
+                d_blk0_18859_eager,
+                d_blk0_18859_graph,
+                d_b0_37717_alias,
+                d_b1_37717_alias,
+                d_b2_37717_alias,
+                d_blk0_37717_eager,
+                d_blk0_37717_graph,
+            ]
+            .into_iter()
+            .all(|d| d == 0),
+            "DEFECT HyperFlow FFN alias or ConvRot INT8 chunk parity mismatch"
         );
         Ok(())
     }
