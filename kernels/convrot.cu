@@ -341,12 +341,6 @@ extern "C" __global__ void __maxnreg__(124) convrot_product(
     convrot_product_tile<false>(codes, scales, qweight, wscale, y, rows, k, n, blockIdx.y, blockIdx.x);
 }
 
-extern "C" __global__ void __maxnreg__(124) convrot_product_m_fast(
-    const int8_t* codes, const float* scales, const int8_t* qweight, const float* wscale,
-    __nv_bfloat16* y, int rows, int k, int n) {
-    convrot_product_tile<true, true>(codes, scales, qweight, wscale, y, rows, k, n, blockIdx.x, blockIdx.y);
-}
-
 extern "C" __global__ void __maxnreg__(124) convrot_product_n_fast_ldsm(
     const int8_t* codes, const float* scales, const int8_t* qweight, const float* wscale,
     __nv_bfloat16* y, int rows, int k, int n) {
@@ -694,6 +688,7 @@ extern "C" __global__ void __maxnreg__(124) convrot_product(
     convrot_product_tile<false>(codes, scales, qweight, wscale, y, rows, k, n, blockIdx.y, blockIdx.x);
 }
 
+#if __CUDA_ARCH__ == 1200
 extern "C" __global__ void __maxnreg__(124) convrot_product_m_fast(
     const int8_t* codes, const float* scales, const int8_t* qweight, const float* wscale,
     __nv_bfloat16* y, int rows, int k, int n) {
@@ -701,6 +696,7 @@ extern "C" __global__ void __maxnreg__(124) convrot_product_m_fast(
     if (m_tile * CONVROT_BM >= static_cast<unsigned>(rows)) return;
     convrot_product_tile<true, true>(codes, scales, qweight, wscale, y, rows, k, n, m_tile, blockIdx.y);
 }
+#endif
 
 extern "C" __global__ void __maxnreg__(124) convrot_product_n_fast_ldsm(
     const int8_t* codes, const float* scales, const int8_t* qweight, const float* wscale,
@@ -736,19 +732,28 @@ __device__ __forceinline__ void convrot_ldsm_x4_u(unsigned (&r)[4], unsigned sme
                  : "r"(smem_addr));
 }
 
+template <bool M_STRIPED = false>
 __device__ __forceinline__ void convrot_tile_origin(int& m0, int& n0) {
-    const int m_tiles = static_cast<int>(gridDim.y);
-    const int n_tiles = static_cast<int>(gridDim.x);
-    constexpr int GROUP_M = 8;
-    const int m_group_id = static_cast<int>(blockIdx.y) / GROUP_M;
-    const int m_group_start = m_group_id * GROUP_M;
-    const int group_h = min(GROUP_M, m_tiles - m_group_start);
-    const int local_id = (static_cast<int>(blockIdx.y) - m_group_start) * n_tiles + static_cast<int>(blockIdx.x);
-    const int m_tile = m_group_start + (local_id % group_h);
-    const int raw_n = local_id / group_h;
-    const int n_tile = (m_group_id & 1) ? (n_tiles - 1 - raw_n) : raw_n;
-    m0 = m_tile * CONVROT_BM;
-    n0 = n_tile * CONVROT_BN;
+    if constexpr (M_STRIPED) {
+        const int m_tile = static_cast<int>(blockIdx.x + blockIdx.z * gridDim.x);
+        const int raw_n = static_cast<int>(blockIdx.y);
+        const int n_tile = (blockIdx.z & 1u) ? (static_cast<int>(gridDim.y) - 1 - raw_n) : raw_n;
+        m0 = m_tile * CONVROT_BM;
+        n0 = n_tile * CONVROT_BN;
+    } else {
+        const int m_tiles = static_cast<int>(gridDim.y);
+        const int n_tiles = static_cast<int>(gridDim.x);
+        constexpr int GROUP_M = 8;
+        const int m_group_id = static_cast<int>(blockIdx.y) / GROUP_M;
+        const int m_group_start = m_group_id * GROUP_M;
+        const int group_h = min(GROUP_M, m_tiles - m_group_start);
+        const int local_id = (static_cast<int>(blockIdx.y) - m_group_start) * n_tiles + static_cast<int>(blockIdx.x);
+        const int m_tile = m_group_start + (local_id % group_h);
+        const int raw_n = local_id / group_h;
+        const int n_tile = (m_group_id & 1) ? (n_tiles - 1 - raw_n) : raw_n;
+        m0 = m_tile * CONVROT_BM;
+        n0 = n_tile * CONVROT_BN;
+    }
 }
 
 template <bool VEC32>
@@ -785,12 +790,88 @@ __device__ __forceinline__ void convrot_store_epilogue(__nv_bfloat16* __restrict
     }
 }
 
-template <int STAGES>
+constexpr int CONVROT_OUT_STRIDE = 264;
+
+__device__ __forceinline__ void convrot_pack_smem_mi(
+    __nv_bfloat16* __restrict__ out_smem, const int (&acc_mi)[8][4], const float (&sx_mi)[2],
+    const float (&sw)[8][2], int sr, int sc_base) {
+#pragma unroll
+    for (int ni = 0; ni < 8; ++ni) {
+        const int sc = sc_base + ni * 8;
+        const float p0 = __fmul_rn(__fmul_rn(static_cast<float>(acc_mi[ni][0]), sx_mi[0]), sw[ni][0]);
+        const float p1 = __fmul_rn(__fmul_rn(static_cast<float>(acc_mi[ni][1]), sx_mi[0]), sw[ni][1]);
+        *reinterpret_cast<__nv_bfloat162*>(out_smem + sr * CONVROT_OUT_STRIDE + sc) =
+            __floats2bfloat162_rn(p0, p1);
+        const float q0 = __fmul_rn(__fmul_rn(static_cast<float>(acc_mi[ni][2]), sx_mi[1]), sw[ni][0]);
+        const float q1 = __fmul_rn(__fmul_rn(static_cast<float>(acc_mi[ni][3]), sx_mi[1]), sw[ni][1]);
+        *reinterpret_cast<__nv_bfloat162*>(out_smem + (sr + 8) * CONVROT_OUT_STRIDE + sc) =
+            __floats2bfloat162_rn(q0, q1);
+    }
+}
+
+__device__ __forceinline__ void convrot_flush_smem_row(
+    const __nv_bfloat16* __restrict__ out_smem, __nv_bfloat16* __restrict__ y, int sr, int gr,
+    int rows, int n, int col_local, int gc, bool aligned128) {
+    if (gr >= rows) return;
+    const uint4 v = *reinterpret_cast<const uint4*>(out_smem + sr * CONVROT_OUT_STRIDE + col_local);
+    if (aligned128 && gc < n) {
+        *reinterpret_cast<uint4*>(y + static_cast<long long>(gr) * n + gc) = v;
+    } else {
+        const __nv_bfloat16* vp = reinterpret_cast<const __nv_bfloat16*>(&v);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            if (gc + e < n) y[static_cast<long long>(gr) * n + gc + e] = vp[e];
+        }
+    }
+}
+
+template <bool FULL_SMEM>
+__device__ __forceinline__ void convrot_store_epilogue_smem128(
+    int8_t* __restrict__ smem, __nv_bfloat16* __restrict__ y, const int (&acc)[2][8][4],
+    const float (&sx)[2][2], const float (&sw)[8][2], int rows, int n, int m0, int n0,
+    int warp, int warp_m, int warp_n, int group, int t2, int lane) {
+    static_assert((FULL_SMEM ? 128 : 64) * CONVROT_OUT_STRIDE * sizeof(__nv_bfloat16) <= (FULL_SMEM ? 73728 : 49152),
+                  "convrot epilogue smem extent");
+    __nv_bfloat16* out_smem = reinterpret_cast<__nv_bfloat16*>(smem);
+    const int sc_base = warp_n * 64 + t2;
+    const int col_local = lane << 3;
+    const int gc = n0 + col_local;
+    const bool aligned128 = ((n & 7) == 0) && ((reinterpret_cast<unsigned long long>(y) & 15ULL) == 0ULL);
+
+    if constexpr (FULL_SMEM) {
+        __syncthreads();
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi) {
+            convrot_pack_smem_mi(out_smem, acc[mi], sx[mi], sw, warp_m * 32 + mi * 16 + group, sc_base);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int step = 0; step < 8; ++step) {
+            const int sr = warp + step * 16;
+            convrot_flush_smem_row(out_smem, y, sr, m0 + sr, rows, n, col_local, gc, aligned128);
+        }
+    } else {
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi) {
+            __syncthreads();
+            convrot_pack_smem_mi(out_smem, acc[mi], sx[mi], sw, warp_m * 16 + group, sc_base);
+            __syncthreads();
+#pragma unroll
+            for (int step = 0; step < 4; ++step) {
+                const int sr = warp + step * 16;
+                const int gr = m0 + ((sr >> 4) << 5) + (mi << 4) + (sr & 15);
+                convrot_flush_smem_row(out_smem, y, sr, gr, rows, n, col_local, gc, aligned128);
+            }
+        }
+    }
+}
+
+template <int STAGES, bool M_STRIPED = false>
 __device__ __forceinline__ void convrot_product_tile_pipelined(
     const int8_t* __restrict__ codes, const float* __restrict__ scales,
     const int8_t* __restrict__ qweight, const float* __restrict__ wscale,
     __nv_bfloat16* __restrict__ y, int rows, int k, int n) {
-    static_assert(STAGES >= 3, "convrot pipelined stages");
+    static_assert(STAGES >= 2, "convrot pipelined stages");
     if (rows <= 0 || n <= 0 || k <= 0 || (k & (CONVROT_BK - 1))) __trap();
     extern __shared__ __align__(16) int8_t smem[];
     constexpr int STAGE_BYTES = CONVROT_STAGE<true>;
@@ -816,7 +897,10 @@ __device__ __forceinline__ void convrot_product_tile_pipelined(
 
     int init_m0 = 0;
     int init_n0 = 0;
-    convrot_tile_origin(init_m0, init_n0);
+    convrot_tile_origin<M_STRIPED>(init_m0, init_n0);
+    if constexpr (M_STRIPED) {
+        if (init_m0 >= rows) return;
+    }
 
     const int ar = t >> 2;
     const int aseg = (t & 3) * 16;
@@ -996,7 +1080,7 @@ __device__ __forceinline__ void convrot_product_tile_pipelined(
 
     int m0 = 0;
     int n0 = 0;
-    convrot_tile_origin(m0, n0);
+    convrot_tile_origin<M_STRIPED>(m0, n0);
 
     float sx[2][2];
     float sw[8][2];
@@ -1012,7 +1096,10 @@ __device__ __forceinline__ void convrot_product_tile_pipelined(
         sw[ni][0] = convrot_ldg_f32(wscale + c0, c0 < n);
         sw[ni][1] = convrot_ldg_f32(wscale + (c0 + 1), (c0 + 1) < n);
     }
-    if ((n & 1) == 0 && (reinterpret_cast<unsigned long long>(y) & 3ULL) == 0ULL) {
+    if constexpr (M_STRIPED) {
+        convrot_store_epilogue_smem128<TOTAL_BYTES >= 128 * CONVROT_OUT_STRIDE * sizeof(__nv_bfloat16)>(
+            smem, y, acc, sx, sw, rows, n, m0, n0, warp, warp_m, warp_n, group, t2, lane);
+    } else if ((n & 1) == 0 && (reinterpret_cast<unsigned long long>(y) & 3ULL) == 0ULL) {
         convrot_store_epilogue<true>(y, acc, sx, sw, rows, n, m0, n0, warp_m, warp_n, group, t2);
     } else {
         convrot_store_epilogue<false>(y, acc, sx, sw, rows, n, m0, n0, warp_m, warp_n, group, t2);
@@ -1030,6 +1117,26 @@ extern "C" __global__ void __maxnreg__(124) convrot_product_n_fast_swizzled_s4(
     __nv_bfloat16* y, int rows, int k, int n) {
     convrot_product_tile_pipelined<4>(codes, scales, qweight, wscale, y, rows, k, n);
 }
+
+#if __CUDA_ARCH__ >= 800 && __CUDA_ARCH__ < 1200
+extern "C" __global__ void __maxnreg__(124) convrot_product_m_fast_s2(
+    const int8_t* codes, const float* scales, const int8_t* qweight, const float* wscale,
+    __nv_bfloat16* y, int rows, int k, int n) {
+    convrot_product_tile_pipelined<2, true>(codes, scales, qweight, wscale, y, rows, k, n);
+}
+
+extern "C" __global__ void __maxnreg__(124) convrot_product_m_fast_s3(
+    const int8_t* codes, const float* scales, const int8_t* qweight, const float* wscale,
+    __nv_bfloat16* y, int rows, int k, int n) {
+    convrot_product_tile_pipelined<3, true>(codes, scales, qweight, wscale, y, rows, k, n);
+}
+
+extern "C" __global__ void __maxnreg__(124) convrot_product_m_fast_s4(
+    const int8_t* codes, const float* scales, const int8_t* qweight, const float* wscale,
+    __nv_bfloat16* y, int rows, int k, int n) {
+    convrot_product_tile_pipelined<4, true>(codes, scales, qweight, wscale, y, rows, k, n);
+}
+#endif
 #else
 // gfx11 wave32 v_wmma_i32_16x16x16_iu8. BK=64, 2 swizzled LDS stages.
 // 128x128x64: 256 threads, 32768 B LDS (2 WGs/WGP). 128x256x64: 512 threads, 49152 B LDS (1 WG/WGP).
