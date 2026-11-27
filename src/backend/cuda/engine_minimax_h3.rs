@@ -457,8 +457,12 @@ fn overlay_backing_path(super_opts: &str) -> Option<&str> {
     None
 }
 
-fn block_drive_count_for_dev(dev: u64, root: &Path, dir: &Path) -> Result<usize> {
-    use std::os::unix::fs::MetadataExt;
+fn block_drive_count_for_dev_with(
+    dev: u64,
+    root: &Path,
+    dir: &Path,
+    stat_dev: &dyn Fn(&Path) -> std::io::Result<u64>,
+) -> Result<(usize, &'static str)> {
     let (maj, min) = (u64::from(libc::major(dev)), u64::from(libc::minor(dev)));
     if maj == 0 {
         let mountinfo_path = root.join("proc/self/mountinfo");
@@ -494,21 +498,29 @@ fn block_drive_count_for_dev(dev: u64, root: &Path, dir: &Path) -> Result<usize>
             } else {
                 root.join(backing.trim_start_matches('/'))
             };
-            let backing_dev = std::fs::metadata(&backing_path)
-                .with_context(|| format!("stat overlay backing {}", backing_path.display()))?
-                .dev();
+            let backing_dev = match stat_dev(&backing_path) {
+                Ok(dev) => dev,
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                    return Ok((1, "overlay_backing_unresolved"));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("stat overlay backing {}", backing_path.display())
+                    });
+                }
+            };
             let bmaj = u64::from(libc::major(backing_dev));
             if bmaj == 0 {
-                return Ok(1);
+                return Ok((1, "overlay_virtual_backing"));
             }
-            return block_drive_count_for_dev(backing_dev, root, &backing_path);
+            return block_drive_count_for_dev_with(backing_dev, root, &backing_path, stat_dev);
         }
         if matches!(
             fstype,
             "tmpfs" | "ramfs" | "fuse" | "fuseblk" | "nfs" | "nfs4" | "9p" | "virtiofs"
         ) || fstype.starts_with("fuse.")
         {
-            return Ok(1);
+            return Ok((1, "virtual_fs"));
         }
         bail!(
             "unsupported virtual filesystem {fstype} on 0:{min} for {}",
@@ -523,10 +535,17 @@ fn block_drive_count_for_dev(dev: u64, root: &Path, dir: &Path) -> Result<usize>
         "no physical drives resolved for {maj}:{min} ({})",
         dir.display()
     );
-    Ok(leaves.len())
+    Ok((leaves.len(), "sysfs_block"))
 }
 
-fn block_drive_count(dir: &Path) -> Result<usize> {
+fn block_drive_count_for_dev(dev: u64, root: &Path, dir: &Path) -> Result<(usize, &'static str)> {
+    use std::os::unix::fs::MetadataExt;
+    block_drive_count_for_dev_with(dev, root, dir, &|path| {
+        std::fs::metadata(path).map(|m| m.dev())
+    })
+}
+
+fn block_drive_count(dir: &Path) -> Result<(usize, &'static str)> {
     use std::os::unix::fs::MetadataExt;
     let dev = std::fs::metadata(dir)
         .with_context(|| format!("stat {}", dir.display()))?
@@ -792,7 +811,7 @@ pub(super) fn plan_resident_ring(
     specs: &[ResidentRingSpec],
     shards: usize,
 ) -> Result<ResidentRingPlan> {
-    let drives = block_drive_count(dir)?;
+    let (drives, drives_source) = block_drive_count(dir)?;
     let raw_available = usize::try_from(crate::backend::cuda::calibrate::host_memory(Path::new(
         "/",
     ))?)?;
@@ -811,6 +830,7 @@ pub(super) fn plan_resident_ring(
                 "component": component,
                 "decision": if plan.ring { "ring" } else { "serial" },
                 "drives": plan.drives,
+                "drives_source": drives_source,
                 "requests": plan.tensors,
                 "chunks": plan.chunks,
                 "shards": plan.shards,
@@ -22254,15 +22274,95 @@ mod h3_direct_batch_tests {
             std::os::unix::fs::symlink(&nvme2, dm0.join("slaves/nvme2n1"))?;
             std::os::unix::fs::symlink(&dm0, sys_block.join("252:0"))?;
             std::fs::create_dir_all(root.join("proc/self"))?;
+            let existing_upper = root.join("existing_upper");
+            std::fs::create_dir_all(&existing_upper)?;
+            std::fs::write(root.join("not_a_dir"), b"x")?;
             std::fs::write(
                 root.join("proc/self/mountinfo"),
-                "28 24 0:25 / /run rw - tmpfs tmpfs rw\n",
+                concat!(
+                    "28 24 0:25 / /run rw - tmpfs tmpfs rw\n",
+                    "29 24 0:26 / /content rw - overlay overlay rw,upperdir=/missing/host/upper,lowerdir=/missing/host/lower\n",
+                    "30 24 0:27 / /bad rw - overlay overlay rw,upperdir=/not_a_dir/upper,lowerdir=/missing/host/lower\n",
+                    "31 24 0:28 / /resolved rw - overlay overlay rw,upperdir=/existing_upper,lowerdir=/missing/host/lower\n",
+                ),
             )?;
             let makedev = |maj: u64, min: u64| libc::makedev(maj as u32, min as u32);
-            assert_eq!(block_drive_count_for_dev(makedev(8, 1), &root, &root)?, 1);
-            assert_eq!(block_drive_count_for_dev(makedev(252, 1), &root, &root)?, 1);
-            assert_eq!(block_drive_count_for_dev(makedev(252, 0), &root, &root)?, 3);
-            assert_eq!(block_drive_count_for_dev(makedev(0, 25), &root, &root)?, 1);
+            assert_eq!(
+                block_drive_count_for_dev(makedev(8, 1), &root, &root)?,
+                (1, "sysfs_block")
+            );
+            assert_eq!(
+                block_drive_count_for_dev(makedev(252, 1), &root, &root)?,
+                (1, "sysfs_block")
+            );
+            assert_eq!(
+                block_drive_count_for_dev(makedev(252, 0), &root, &root)?,
+                (3, "sysfs_block")
+            );
+            assert_eq!(
+                block_drive_count_for_dev(makedev(0, 25), &root, &root)?,
+                (1, "virtual_fs")
+            );
+            assert_eq!(
+                block_drive_count_for_dev(makedev(0, 26), &root, &root)?,
+                (1, "overlay_backing_unresolved")
+            );
+            let non_enoent = block_drive_count_for_dev(makedev(0, 27), &root, &root)
+                .err()
+                .context("ENOTDIR overlay backing stat must error")?;
+            assert!(
+                non_enoent.to_string().contains("not_a_dir/upper"),
+                "unexpected ENOTDIR error: {non_enoent:#}"
+            );
+            assert_eq!(
+                block_drive_count_for_dev_with(makedev(0, 28), &root, &root, &|path| {
+                    assert_eq!(path, existing_upper.as_path());
+                    Ok(makedev(252, 0))
+                })?,
+                (3, "sysfs_block")
+            );
+            {
+                use std::os::unix::fs::MetadataExt;
+                let upper_dev = std::fs::metadata(&existing_upper)?.dev();
+                let (umaj, umin) = (
+                    u64::from(libc::major(upper_dev)),
+                    u64::from(libc::minor(upper_dev)),
+                );
+                if umaj != 0 {
+                    let ov_root = root.join("overlay_real_stat");
+                    let ov_sys_block = ov_root.join("sys/dev/block");
+                    let ov_devs = ov_root.join("sys/devices");
+                    let leaf_maj = if umaj == 259 { 258 } else { 259 };
+                    std::fs::create_dir_all(&ov_sys_block)?;
+                    let dm_ov = ov_devs.join("dm-ov");
+                    std::fs::create_dir_all(dm_ov.join("slaves"))?;
+                    std::fs::write(dm_ov.join("dev"), format!("{umaj}:{umin}\n"))?;
+                    for (idx, min_id) in [0u64, 1, 2].into_iter().enumerate() {
+                        let leaf = ov_devs.join(format!("disk{idx}"));
+                        std::fs::create_dir_all(&leaf)?;
+                        std::fs::write(leaf.join("dev"), format!("{leaf_maj}:{min_id}\n"))?;
+                        std::os::unix::fs::symlink(
+                            &leaf,
+                            ov_sys_block.join(format!("{leaf_maj}:{min_id}")),
+                        )?;
+                        std::os::unix::fs::symlink(&leaf, dm_ov.join(format!("slaves/disk{idx}")))?;
+                    }
+                    std::os::unix::fs::symlink(
+                        &dm_ov,
+                        ov_sys_block.join(format!("{umaj}:{umin}")),
+                    )?;
+                    std::fs::create_dir_all(ov_root.join("proc/self"))?;
+                    std::fs::create_dir_all(ov_root.join("existing_upper"))?;
+                    std::fs::write(
+                        ov_root.join("proc/self/mountinfo"),
+                        "31 24 0:28 / /resolved rw - overlay overlay rw,upperdir=/existing_upper,lowerdir=/missing/host/lower\n",
+                    )?;
+                    assert_eq!(
+                        block_drive_count_for_dev(makedev(0, 28), &ov_root, &ov_root)?,
+                        (3, "sysfs_block")
+                    );
+                }
+            }
             assert!(block_drive_count_for_dev(makedev(8, 99), &root, &root).is_err());
 
             // 2. Ring derivation for 4090 (drives=3) and T4 12.7 GiB (drives=1) across host budgets.
