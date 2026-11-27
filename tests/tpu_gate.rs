@@ -11,19 +11,20 @@ use flyingfish::{
         },
         hlo::{emit_bf16_attention, emit_bf16_matmul},
         minimax_h3::{
-            ConditionerReport, DitSampleOptions, DitSampleReport, VaeDecodeOptions,
-            VaeDecodeReport, image_decode_with_device, image_latents_with_device,
-            image_sample_with_device, run_conditioner_with_device, run_norm_out_pdd_with_device,
+            ConditionerReport, DitSampleOptions, DitSampleReport, TpuImageDit, TpuImageVae,
+            VaeDecodeOptions, VaeDecodeReport, image_sample_with_device,
+            run_conditioner_with_device, run_norm_out_pdd_with_device,
         },
         pjrt::{CompiledMemoryStats, HostSemantics},
         plan::{BlockPlacement, ModelFootprint, TpuPlacementPlan, TpuTopology},
     },
     media::write_png,
     minimax_h3::{
-        AdalnPlan, ImageRequest, ImageSchedule, ImageSpec, TEXT_TAG, image_latent_extent,
-        image_layout, image_noise_draw, image_rgb8, image_row_plan, rotary_rows,
+        AdalnPlan, ImageSchedule, ImageSpec, TEXT_TAG, image_canvas, image_latent_extent,
+        image_layout, image_noise_draw, image_rgb8, image_row_plan, image_text_rows, rotary_rows,
         unpatchify_latents,
     },
+    serve::detok::Shared as Tokenizer,
 };
 use half::bf16;
 use memmap2::MmapOptions;
@@ -1319,9 +1320,8 @@ fn run_step3_pdd_probe(
 
 fn run_step3_dit_controls(
     dev: &TpuDevice,
-    model: &Path,
+    dit: &TpuImageDit,
     spec: &ImageSpec,
-    layout: &flyingfish::minimax_h3::ImageLayout,
     fix: &Step3Fixtures,
     latent_extent: [usize; 2],
 ) -> Result<Vec<ControlReport>> {
@@ -1330,10 +1330,8 @@ fn run_step3_dit_controls(
     let min_final = STEP3_CONTROL_MIN_MULT * STEP3_DIT_FINAL_REL_L2_TOL;
 
     // Control 1: non-square 16x32 RoPE (h, w) transpose on step-0 velocity.
-    let (_, rep_rope) = image_sample_with_device(
+    let (_, rep_rope) = dit.sample(
         dev,
-        model,
-        layout,
         &fix.init_noise,
         &fix.cond_ref_bf16,
         &DitSampleOptions {
@@ -1361,10 +1359,8 @@ fn run_step3_dit_controls(
     controls.push(c_rope);
 
     // Control 2: wrong step-0 timestep index (timesteps[5] instead of timesteps[0]).
-    let (_, rep_ts) = image_sample_with_device(
+    let (_, rep_ts) = dit.sample(
         dev,
-        model,
-        layout,
         &fix.init_noise,
         &fix.cond_ref_bf16,
         &DitSampleOptions {
@@ -1392,10 +1388,8 @@ fn run_step3_dit_controls(
     controls.push(c_ts);
 
     // Control 3: negated velocity Euler sign (`latents -= dt * vel`) over all 6 steps.
-    let (bad_rows, _) = image_sample_with_device(
+    let (bad_rows, _) = dit.sample(
         dev,
-        model,
-        layout,
         &fix.init_noise,
         &fix.cond_ref_bf16,
         &DitSampleOptions {
@@ -1438,9 +1432,25 @@ fn tpu_h3_image_full_pipeline_gate() -> Result<()> {
 
     let spec = ImageSpec::read(&model)?;
     let fix = load_step3_fixtures(&fixtures_dir, &spec)?;
-    let (lh, lw) = image_latent_extent(&spec, STEP3_HEIGHT, STEP3_WIDTH)?;
+    let (canvas_h, canvas_w) = image_canvas(&spec, STEP3_HEIGHT, STEP3_WIDTH, STEP3_MIN_AREA)?;
+    ensure!(
+        canvas_h == STEP3_HEIGHT && canvas_w == STEP3_WIDTH,
+        "Step 3 canvas mismatch: got {canvas_h}x{canvas_w}"
+    );
+    let (lh, lw) = image_latent_extent(&spec, canvas_h, canvas_w)?;
+    let tokenizer = Tokenizer::load(&model.join("text_encoder"))?;
+    let raw_ids = tokenizer.encode_chat(STEP3_PROMPT)?;
+    let (prompt_token_ids, prompt_text_tags) = image_text_rows(&raw_ids)?;
+    ensure!(
+        prompt_token_ids == fix.token_ids,
+        "prompt tokenization does not match frozen fixture token_ids"
+    );
     let text_rows = fix.token_ids.len();
     let text_tags = vec![TEXT_TAG; text_rows];
+    ensure!(
+        prompt_text_tags == text_tags,
+        "prompt text_tags do not match TEXT_TAG"
+    );
     let layout = image_layout(&spec, &text_tags, &[], lh, lw)?;
     ensure!(
         layout.position_ids == fix.position_ids && layout.token_tags == fix.token_tags,
@@ -1487,11 +1497,13 @@ fn tpu_h3_image_full_pipeline_gate() -> Result<()> {
     // Stage 2a: Direct F32 norm_out + pdd_proj_out head-0/5 & HIGHEST precision probe.
     let pdd_probe = run_step3_pdd_probe(&dev, &model, text_rows, &fix)?;
 
+    // One resident DiT load serves Stage 2b, the three Stage 2d controls, and Stage 4 E2E DiT.
+    let dit_hbm_before = dev.memory_stats()?.bytes_in_use;
+    let dit = TpuImageDit::load(&dev, &model, &layout, None)?;
+
     // Stage 2b: Full 50-block 6-step DiT isolated on derived live plan.
-    let (dit_rows, dit_report) = image_sample_with_device(
+    let (dit_rows, mut dit_report) = dit.sample(
         &dev,
-        &model,
-        &layout,
         &fix.init_noise,
         &fix.cond_ref_bf16,
         &DitSampleOptions::default(),
@@ -1508,11 +1520,24 @@ fn tpu_h3_image_full_pipeline_gate() -> Result<()> {
             .per_step_stats
             .iter()
             .all(|st| st.overlapped_prefetches > 0);
-    let dit_hbm_ok =
-        dit_report.hbm_after_drop_bytes <= dit_report.hbm_before_bytes + HBM_RELEASE_SLACK_BYTES;
     let dit_step0_metrics = compute_f32_metrics(&dit_report.step0_velocity, &fix.vel0_ref_bf16)?;
     let dit_latent = unpatchify_latents(&dit_rows, (spec.in_channels, 1, lh, lw), spec.patch);
     let dit_final_metrics = compute_f32_metrics(&dit_latent, &fix.final_latent_ref)?;
+
+    // Stage 2d: Three Stage 2 discriminating controls (reusing resident DiT, each > 3.0x tol).
+    let dit_controls = run_step3_dit_controls(&dev, &dit, &spec, &fix, [lh, lw])?;
+    let dit_controls_pass =
+        dit_controls.len() == 3 && dit_controls.iter().all(|c| c.failed_as_required);
+
+    // Stage 4 (DiT leg): Composed E2E using Stage 0 CPU noise and Stage 1 TPU conditioner output.
+    let (e2e_rows, _) = dit.sample(&dev, &cpu_noise, &cond_tpu, &DitSampleOptions::default())?;
+    let e2e_latent = unpatchify_latents(&e2e_rows, (spec.in_channels, 1, lh, lw), spec.patch);
+
+    drop(dit);
+    dit_report.hbm_before_bytes = dit_hbm_before;
+    dit_report.hbm_after_drop_bytes = dev.memory_stats()?.bytes_in_use;
+    let dit_hbm_ok =
+        dit_report.hbm_after_drop_bytes <= dit_report.hbm_before_bytes + HBM_RELEASE_SLACK_BYTES;
     let dit_pass = dit_step0_metrics.all_finite
         && dit_step0_metrics.rel_l2 <= STEP3_DIT_STEP0_REL_L2_TOL
         && dit_step0_metrics.rel_max_abs <= STEP3_DIT_STEP0_REL_MAX_ABS_TOL
@@ -1535,19 +1560,15 @@ fn tpu_h3_image_full_pipeline_gate() -> Result<()> {
         dit_report.elapsed_ms
     );
 
-    // Stage 2c: Forced DiskStreamed (>= 2 blocks) bit-identical verification against derived plan.
+    // Stage 2c: Independent fresh load forcing DiskStreamed (>= 2 blocks) and bit-exact vs Stage 2b.
     let host_blocks = dit_report
         .live_plan
         .count(BlockPlacement::PinnedHostStreamed)
         + dit_report
             .live_plan
             .count(BlockPlacement::PageableHostStreamed);
-    let host_reserve = dit_report
-        .live_topology
-        .host_available_bytes
-        .saturating_sub(dit_report.live_plan.usable_host_bytes);
-    let host_cap_bytes =
-        host_reserve.saturating_add(host_blocks.saturating_sub(3) as u64 * active_block_bytes);
+    let target_host_bytes = host_blocks.saturating_sub(3) as u64 * active_block_bytes;
+    let host_cap_bytes = TpuTopology::host_cap_for_usable_bytes(target_host_bytes);
     let (forced_rows, forced_report) = image_sample_with_device(
         &dev,
         &model,
@@ -1587,19 +1608,13 @@ fn tpu_h3_image_full_pipeline_gate() -> Result<()> {
         live_plan: forced_report.live_plan,
     };
 
-    // Stage 2d: Three Stage 2 discriminating controls (each > 3.0x frozen tolerance).
-    let dit_controls = run_step3_dit_controls(&dev, &model, &spec, &layout, &fix, [lh, lw])?;
-    let dit_controls_pass =
-        dit_controls.len() == 3 && dit_controls.iter().all(|c| c.failed_as_required);
+    // One resident Image VAE load serves Stage 3, the VAE RoPE control, and Stage 4 E2E VAE.
+    let vae_hbm_before = dev.memory_stats()?.bytes_in_use;
+    let vae = TpuImageVae::load(&dev, &model, [lh, lw])?;
 
-    // Stage 3: Isolated 24-layer mixed-precision Image VAE decoder + 2D RoPE control.
-    let (vae_canvas, vae_report) = image_decode_with_device(
-        &dev,
-        &model,
-        [lh, lw],
-        &fix.final_latent_ref,
-        &VaeDecodeOptions::default(),
-    )?;
+    // Stage 3: Isolated 24-layer mixed-precision Image VAE decoder.
+    let (vae_canvas, mut vae_report) =
+        vae.decode(&dev, &fix.final_latent_ref, &VaeDecodeOptions::default())?;
     let vae_rgb8 = image_rgb8(
         &vae_canvas,
         [STEP3_HEIGHT, STEP3_WIDTH],
@@ -1607,27 +1622,10 @@ fn tpu_h3_image_full_pipeline_gate() -> Result<()> {
     )?;
     let vae_canvas_metrics = compute_f32_metrics(&vae_canvas, &fix.vae_canvas_ref)?;
     let vae_rgb8_metrics = compute_rgb8_metrics(&vae_rgb8, &fix.vae_rgb8_ref)?;
-    let vae_hbm_ok =
-        vae_report.hbm_after_drop_bytes <= vae_report.hbm_before_bytes + HBM_RELEASE_SLACK_BYTES;
-    let vae_pass = vae_canvas_metrics.all_finite
-        && vae_canvas_metrics.rel_l2 <= STEP3_VAE_CANVAS_REL_L2_TOL
-        && vae_canvas_metrics.rel_max_abs <= STEP3_VAE_CANVAS_REL_MAX_ABS_TOL
-        && vae_rgb8_metrics.mean_abs <= STEP3_VAE_RGB8_MEAN_ABS_TOL
-        && vae_hbm_ok;
-    println!(
-        "TPU_STEP3_STAGE3_VAE tiles={} batch={} rel_l2={:.6e} rel_max_abs={:.6e} rgb8_mean={:.4} hbm_ok={vae_hbm_ok} elapsed_ms={:.1} pass={vae_pass}",
-        vae_report.tile_count,
-        vae_report.tile_batch,
-        vae_canvas_metrics.rel_l2,
-        vae_canvas_metrics.rel_max_abs,
-        vae_rgb8_metrics.mean_abs,
-        vae_report.elapsed_ms
-    );
 
-    let (vae_bad_canvas, _) = image_decode_with_device(
+    // Stage 3 control: transposed 2D RoPE (h, w) on non-square 16x32 tiles (> 3.0x tol).
+    let (vae_bad_canvas, _) = vae.decode(
         &dev,
-        &model,
-        [lh, lw],
         &fix.final_latent_ref,
         &VaeDecodeOptions {
             transpose_rope_hw: true,
@@ -1651,20 +1649,37 @@ fn tpu_h3_image_full_pipeline_gate() -> Result<()> {
         vae_rope_control.failed_as_required
     );
 
-    // Stage 4: Composed E2E `image_latents_with_device` using CPU `image_noise_draw`.
-    let mut req = ImageRequest::new(STEP3_PROMPT, STEP3_WIDTH, STEP3_HEIGHT, STEP3_SEED);
-    req.min_generation_area = STEP3_MIN_AREA;
-    let e2e = image_latents_with_device(&dev, &model, &req, None)?;
-    let (e2e_canvas, _) = image_decode_with_device(
-        &dev,
-        &model,
-        [lh, lw],
-        &e2e.values,
-        &VaeDecodeOptions::default(),
+    // Stage 4 (VAE leg): Composed E2E decode of Stage 4 latents.
+    let (e2e_canvas, _) = vae.decode(&dev, &e2e_latent, &VaeDecodeOptions::default())?;
+    let e2e_rgb8 = image_rgb8(
+        &e2e_canvas,
+        [STEP3_HEIGHT, STEP3_WIDTH],
+        [STEP3_HEIGHT, STEP3_WIDTH],
     )?;
-    let e2e_latent_metrics = compute_f32_metrics(&e2e.values, &fix.final_latent_ref)?;
+
+    drop(vae);
+    vae_report.hbm_before_bytes = vae_hbm_before;
+    vae_report.hbm_after_drop_bytes = dev.memory_stats()?.bytes_in_use;
+    let vae_hbm_ok =
+        vae_report.hbm_after_drop_bytes <= vae_report.hbm_before_bytes + HBM_RELEASE_SLACK_BYTES;
+    let vae_pass = vae_canvas_metrics.all_finite
+        && vae_canvas_metrics.rel_l2 <= STEP3_VAE_CANVAS_REL_L2_TOL
+        && vae_canvas_metrics.rel_max_abs <= STEP3_VAE_CANVAS_REL_MAX_ABS_TOL
+        && vae_rgb8_metrics.mean_abs <= STEP3_VAE_RGB8_MEAN_ABS_TOL
+        && vae_hbm_ok;
+    println!(
+        "TPU_STEP3_STAGE3_VAE tiles={} batch={} rel_l2={:.6e} rel_max_abs={:.6e} rgb8_mean={:.4} hbm_ok={vae_hbm_ok} elapsed_ms={:.1} pass={vae_pass}",
+        vae_report.tile_count,
+        vae_report.tile_batch,
+        vae_canvas_metrics.rel_l2,
+        vae_canvas_metrics.rel_max_abs,
+        vae_rgb8_metrics.mean_abs,
+        vae_report.elapsed_ms
+    );
+
+    let e2e_latent_metrics = compute_f32_metrics(&e2e_latent, &fix.final_latent_ref)?;
     let e2e_canvas_metrics = compute_f32_metrics(&e2e_canvas, &fix.vae_canvas_ref)?;
-    let e2e_rgb8_metrics = compute_rgb8_metrics(&e2e.rgb, &fix.vae_rgb8_ref)?;
+    let e2e_rgb8_metrics = compute_rgb8_metrics(&e2e_rgb8, &fix.vae_rgb8_ref)?;
     let e2e_pass = e2e_latent_metrics.all_finite
         && e2e_latent_metrics.rel_l2 <= STEP3_E2E_LATENT_REL_L2_TOL
         && e2e_latent_metrics.rel_max_abs <= STEP3_E2E_LATENT_REL_MAX_ABS_TOL
@@ -1725,7 +1740,7 @@ fn tpu_h3_image_full_pipeline_gate() -> Result<()> {
             &dir.join("tpu_1024x512_e2e.png"),
             STEP3_WIDTH,
             STEP3_HEIGHT,
-            &e2e.rgb,
+            &e2e_rgb8,
         )?;
     }
     println!(

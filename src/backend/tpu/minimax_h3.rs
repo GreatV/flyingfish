@@ -1,7 +1,7 @@
 //! MiniMax-H3-Image end-to-end inference on TPU: Qwen3-VL conditioner, 50-block DiT, and 24-layer ViT VAE decoder.
 
 use super::{
-    TpuBuffer, TpuDevice,
+    TpuBuffer, TpuDevice, TpuExecutable,
     dit_block::{
         DitBlockStack, StackStepStats, TpuAdalnCache, compile_h3_dit_block,
         compute_all_adaln_tables, compute_norm_out_adaln_table, load_refiner_block_weights,
@@ -189,6 +189,374 @@ pub fn run_conditioner_with_device(
     ))
 }
 
+/// Resident TPU DiT state loaded once for a `(model, layout)` pair and reused across sampling calls.
+pub struct TpuImageDit {
+    spec: ImageSpec,
+    schedule: ImageSchedule,
+    layout: ImageLayout,
+    text_rows: usize,
+    img_rows: usize,
+    total_rows: usize,
+    patch_dim: usize,
+    head_chunk: usize,
+    ckpt: MappedCheckpoint,
+    norm_out_adaln_hbm: TpuBuffer,
+    block_exec: TpuExecutable,
+    proj_in_exec: TpuExecutable,
+    norm_out_pdd_exec: TpuExecutable,
+    proj_in_w: TpuBuffer,
+    proj_in_b: TpuBuffer,
+    norm_out_w: TpuBuffer,
+    pdd_w: Vec<TpuBuffer>,
+    pdd_b: Vec<TpuBuffer>,
+    step_row_pairs_hbm: Vec<TpuBuffer>,
+    step_row_timesteps_hbm: Vec<TpuBuffer>,
+    live_topology: TpuTopology,
+    live_plan: TpuPlacementPlan,
+    stack: DitBlockStack,
+}
+
+impl TpuImageDit {
+    /// Loads transformer weights, compiles DiT executables, and builds the placement stack once.
+    pub fn load(
+        dev: &TpuDevice,
+        model: &Path,
+        layout: &ImageLayout,
+        host_available_cap_bytes: Option<u64>,
+    ) -> Result<Self> {
+        ensure!(
+            layout.reference_rows == 0,
+            "TPU image sampling does not yet support edit reference rows ({})",
+            layout.reference_rows
+        );
+        let spec = ImageSpec::read(model)?;
+        let schedule = ImageSchedule::published()?;
+        let patch_dim = spec.row_width();
+        let text_rows = layout.text_indices.len();
+        let img_rows = layout.image_indices.len();
+        let total_rows = layout.rows();
+        ensure!(
+            text_rows > 0 && img_rows > 0 && text_rows + img_rows == total_rows,
+            "invalid image layout counts: text={text_rows} img={img_rows} total={total_rows}"
+        );
+        ensure!(
+            layout
+                .text_indices
+                .iter()
+                .enumerate()
+                .all(|(i, &idx)| idx as usize == i)
+                && layout
+                    .image_indices
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &idx)| idx as usize == text_rows + i),
+            "TPU image layout requires contiguous [text | image] row ordering"
+        );
+
+        let dir = model.join("transformer_diffusers");
+        let ckpt = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?;
+        let _manifest = ckpt.minimax_h3_image_manifest(&spec)?;
+
+        let row_plan = image_row_plan(layout, &schedule)?;
+        let adaln_plan = AdalnPlan::from_tags(&layout.token_tags, &row_plan)?;
+
+        // Schedule-keyed AdaLN tables for all 50 blocks + norm_out.
+        let mut adaln_cache = TpuAdalnCache::default();
+        adaln_cache.ensure_all_for_plan(&adaln_plan, |p| {
+            compute_all_adaln_tables(dev, &spec, &ckpt, p)
+        })?;
+        let sem = HostSemantics::ImmutableOnlyDuringCall;
+        let norm_out_adaln_hbm = dev.upload_bf16(
+            adaln_cache.norm_out(),
+            &[adaln_plan.timesteps.len() as i64, 2, spec.hidden as i64],
+            sem,
+        )?;
+
+        // Compile DiT executables and upload persistent small weights and step index tables.
+        let head_chunk = if total_rows <= 1024 { 4 } else { 2 };
+        let block_exec =
+            compile_h3_dit_block(dev, &spec, total_rows, adaln_plan.pairs.len(), head_chunk)?;
+        let proj_in_exec = dev.compile_mlir(&emit_h3_dit_proj_in_pack(
+            text_rows,
+            img_rows,
+            patch_dim,
+            spec.hidden,
+        )?)?;
+        let norm_out_pdd_exec =
+            dev.compile_mlir(&emit_h3_dit_norm_out_pdd(&DitNormOutPddSpec {
+                rows: total_rows,
+                text_rows,
+                hidden: spec.hidden,
+                patch_dim,
+                timesteps: adaln_plan.timesteps.len(),
+                final_norm_eps: spec.final_norm_eps,
+            })?)?;
+
+        let proj_in_w = dev.upload_f32(
+            &read_f32_ckpt(&ckpt, "proj_in.weight", &[spec.hidden, patch_dim])?,
+            &[spec.hidden as i64, patch_dim as i64],
+            sem,
+        )?;
+        let proj_in_b = dev.upload_f32(
+            &read_f32_ckpt(&ckpt, "proj_in.bias", &[spec.hidden])?,
+            &[spec.hidden as i64],
+            sem,
+        )?;
+        let norm_out_w = dev.upload_bf16(
+            &read_bf16_ckpt(&ckpt, "norm_out.norm.weight", &[spec.hidden])?,
+            &[spec.hidden as i64],
+            sem,
+        )?;
+        let mut pdd_w = Vec::with_capacity(spec.pdd_heads);
+        let mut pdd_b = Vec::with_capacity(spec.pdd_heads);
+        for h in 0..spec.pdd_heads {
+            pdd_w.push(dev.upload_f32(
+                &read_f32_ckpt(
+                    &ckpt,
+                    &format!("pdd_proj_out.{h}.weight"),
+                    &[patch_dim, spec.hidden],
+                )?,
+                &[patch_dim as i64, spec.hidden as i64],
+                sem,
+            )?);
+            pdd_b.push(dev.upload_f32(
+                &read_f32_ckpt(&ckpt, &format!("pdd_proj_out.{h}.bias"), &[patch_dim])?,
+                &[patch_dim as i64],
+                sem,
+            )?);
+        }
+
+        let mut step_row_pairs_hbm = Vec::with_capacity(spec.pdd_heads);
+        let mut step_row_timesteps_hbm = Vec::with_capacity(spec.pdd_heads);
+        for step in 0..spec.pdd_heads {
+            let pairs_i32: Vec<i32> = adaln_plan.row_pairs[step]
+                .iter()
+                .map(|&v| i32::try_from(v).context("row_pair overflows i32"))
+                .collect::<Result<Vec<_>>>()?;
+            let ts_i32: Vec<i32> = adaln_plan.row_timesteps[step]
+                .iter()
+                .map(|&v| i32::try_from(v).context("row_timestep overflows i32"))
+                .collect::<Result<Vec<_>>>()?;
+            step_row_pairs_hbm.push(dev.upload_i32(&pairs_i32, &[total_rows as i64], sem)?);
+            step_row_timesteps_hbm.push(dev.upload_i32(&ts_i32, &[total_rows as i64], sem)?);
+        }
+
+        // Derive live placement plan from sensed HBM, compiled block memory, and host RAM.
+        let mut live_topology = TpuTopology::detect(dev, None)?;
+        if let Some(cap) = host_available_cap_bytes {
+            live_topology.host_available_bytes = live_topology.host_available_bytes.min(cap);
+        }
+        let active_block_bytes = active_dit_block_bytes(&spec);
+        let compiled_block_peak = block_exec
+            .compiled_memory_stats
+            .as_ref()
+            .map(|s| u64::try_from(s.peak_memory_in_bytes.max(0)).unwrap_or(0))
+            .filter(|&v| v > active_block_bytes)
+            .unwrap_or(active_block_bytes + 640 * 1024 * 1024);
+        let adaln_tables_bytes =
+            (spec.layers * adaln_plan.pairs.len() * 6 * spec.hidden * 2) as u64;
+        let persistent_hbm_bytes = adaln_tables_bytes
+            + DIT_ACTIVE_BLOCK_BYTES_HEADROOM
+            + (total_rows * spec.hidden * 2 * 2) as u64;
+        let footprint = ModelFootprint {
+            persistent_hbm_bytes,
+            compiled_block_peak_bytes: compiled_block_peak,
+            compiled_block_weight_arg_bytes: active_block_bytes,
+            block_weight_bytes: vec![active_block_bytes; spec.layers],
+        };
+        let live_plan = TpuPlacementPlan::derive(&live_topology, &footprint)?;
+        let stack = DitBlockStack::load(
+            dev,
+            &spec,
+            &ckpt,
+            live_plan.clone(),
+            adaln_cache.layers(),
+            adaln_plan.pairs.len(),
+        )?;
+
+        Ok(Self {
+            spec,
+            schedule,
+            layout: layout.clone(),
+            text_rows,
+            img_rows,
+            total_rows,
+            patch_dim,
+            head_chunk,
+            ckpt,
+            norm_out_adaln_hbm,
+            block_exec,
+            proj_in_exec,
+            norm_out_pdd_exec,
+            proj_in_w,
+            proj_in_b,
+            norm_out_w,
+            pdd_w,
+            pdd_b,
+            step_row_pairs_hbm,
+            step_row_timesteps_hbm,
+            live_topology,
+            live_plan,
+            stack,
+        })
+    }
+
+    /// Runs the 6-step (or 1-step) denoising loop on resident weights. Placement is fixed at `load`.
+    pub fn sample(
+        &self,
+        dev: &TpuDevice,
+        rows: &[f32],
+        text: &[bf16],
+        opts: &DitSampleOptions,
+    ) -> Result<(Vec<f32>, DitSampleReport)> {
+        let t0 = Instant::now();
+        let hbm_before_bytes = dev.memory_stats()?.bytes_in_use;
+        ensure!(
+            rows.len() == self.img_rows * self.patch_dim
+                && text.len() == self.text_rows * self.spec.text_dim
+                && rows.iter().all(|v| v.is_finite())
+                && text.iter().all(|v| v.is_finite()),
+            "image sample input extents or finiteness invalid"
+        );
+        if let Some(head) = opts.force_pdd_head {
+            ensure!(
+                head < self.spec.pdd_heads,
+                "force_pdd_head {head} out of range"
+            );
+        }
+        if let Some(ts_step) = opts.wrong_step0_timestep_index {
+            ensure!(
+                ts_step < self.spec.pdd_heads,
+                "wrong_step0_timestep_index {ts_step} out of range"
+            );
+        }
+
+        let sem = HostSemantics::ImmutableOnlyDuringCall;
+        let refined_text_hbm =
+            run_text_refiner_hbm(dev, &self.spec, &self.ckpt, text, self.text_rows)?;
+
+        let positions: Vec<[f64; 3]> = if opts.transpose_rope_hw {
+            self.layout
+                .position_ids
+                .iter()
+                .map(|&[t, h, w]| [t, w, h])
+                .collect()
+        } else {
+            self.layout.position_ids.clone()
+        };
+        let rotary_dim = 6 * self.spec.rope_freq_dim;
+        let rotary_data = rotary_rows(self.spec.rope_freq_dim, self.spec.rope_theta, &positions);
+        let rotary_hbm = dev.upload_bf16(
+            &rotary_data,
+            &[self.total_rows as i64, rotary_dim as i64],
+            sem,
+        )?;
+
+        let mut cur_latents = rows.to_vec();
+        let mut step0_velocity = Vec::new();
+        let steps_to_run = if opts.stop_after_step0 {
+            1
+        } else {
+            self.spec.pdd_heads
+        };
+        let mut per_step_stats = Vec::with_capacity(steps_to_run);
+        let packed_bytes = self.total_rows * self.spec.hidden * 2;
+        let vel_bytes = self.img_rows * self.patch_dim * 4;
+
+        for step in 0..steps_to_run {
+            let lat_buf = dev.upload_f32(
+                &cur_latents,
+                &[self.img_rows as i64, self.patch_dim as i64],
+                sem,
+            )?;
+            let mut packed_outs = self.proj_in_exec.execute(
+                &[
+                    &refined_text_hbm,
+                    &lat_buf,
+                    &self.proj_in_w,
+                    &self.proj_in_b,
+                ],
+                &[packed_bytes],
+            )?;
+            drop(lat_buf);
+            let x = packed_outs
+                .pop()
+                .context("proj_in_pack returned zero outputs")?;
+
+            let ts_slot = if step == 0 {
+                opts.wrong_step0_timestep_index.unwrap_or(0)
+            } else {
+                step
+            };
+            let (x, stats) = self.stack.run_step(
+                dev,
+                &self.block_exec,
+                &self.ckpt,
+                x,
+                (
+                    &self.step_row_pairs_hbm[ts_slot],
+                    &rotary_hbm,
+                    self.total_rows,
+                ),
+            )?;
+            per_step_stats.push(stats);
+
+            let head = opts.force_pdd_head.unwrap_or(step);
+            let mut vel_outs = self.norm_out_pdd_exec.execute(
+                &[
+                    &x,
+                    &self.norm_out_w,
+                    &self.norm_out_adaln_hbm,
+                    &self.step_row_timesteps_hbm[ts_slot],
+                    &self.pdd_w[head],
+                    &self.pdd_b[head],
+                ],
+                &[vel_bytes],
+            )?;
+            drop(x);
+            let vel_buf = vel_outs
+                .pop()
+                .context("norm_out_pdd returned zero outputs")?;
+            let vel = vel_buf.download_f32()?;
+            drop(vel_buf);
+            ensure!(
+                vel.len() == cur_latents.len() && vel.iter().all(|v| v.is_finite()),
+                "non-finite or mismatched velocity at denoising step {step}"
+            );
+            if step == 0 {
+                step0_velocity = vel.clone();
+            }
+
+            let dt = self.schedule.sigmas[step] - self.schedule.sigmas[step + 1];
+            let signed_dt = if opts.negate_euler_velocity { -dt } else { dt };
+            for (x_i, &v_i) in cur_latents.iter_mut().zip(&vel) {
+                *x_i += signed_dt * v_i;
+                ensure!(x_i.is_finite(), "non-finite latent after Euler step {step}");
+            }
+        }
+
+        drop((rotary_hbm, refined_text_hbm));
+        let hbm_after_drop_bytes = dev.memory_stats()?.bytes_in_use;
+        Ok((
+            cur_latents,
+            DitSampleReport {
+                total_rows: self.total_rows,
+                text_rows: self.text_rows,
+                image_rows: self.img_rows,
+                head_chunk: self.head_chunk,
+                steps_run: steps_to_run,
+                live_topology: self.live_topology.clone(),
+                live_plan: self.live_plan.clone(),
+                per_step_stats,
+                step0_velocity,
+                hbm_before_bytes,
+                hbm_after_drop_bytes,
+                elapsed_ms: t0.elapsed().as_secs_f64() * 1e3,
+            },
+        ))
+    }
+}
+
 /// Six published image evaluations. `rows` is `[image rows, 96]`, matching CUDA `image_sample`.
 pub fn image_sample(
     model: &Path,
@@ -220,292 +588,13 @@ pub fn image_sample_with_device(
 ) -> Result<(Vec<f32>, DitSampleReport)> {
     let t0 = Instant::now();
     let hbm_before_bytes = dev.memory_stats()?.bytes_in_use;
-    ensure!(
-        layout.reference_rows == 0,
-        "TPU image sampling does not yet support edit reference rows ({})",
-        layout.reference_rows
-    );
-    let spec = ImageSpec::read(model)?;
-    let schedule = ImageSchedule::published()?;
-    let patch_dim = spec.row_width();
-    let text_rows = layout.text_indices.len();
-    let img_rows = layout.image_indices.len();
-    let total_rows = layout.rows();
-    ensure!(
-        text_rows > 0 && img_rows > 0 && text_rows + img_rows == total_rows,
-        "invalid image layout counts: text={text_rows} img={img_rows} total={total_rows}"
-    );
-    ensure!(
-        layout
-            .text_indices
-            .iter()
-            .enumerate()
-            .all(|(i, &idx)| idx as usize == i)
-            && layout
-                .image_indices
-                .iter()
-                .enumerate()
-                .all(|(i, &idx)| idx as usize == text_rows + i),
-        "TPU image layout requires contiguous [text | image] row ordering"
-    );
-    ensure!(
-        rows.len() == img_rows * patch_dim
-            && text.len() == text_rows * spec.text_dim
-            && rows.iter().all(|v| v.is_finite())
-            && text.iter().all(|v| v.is_finite()),
-        "image sample input extents or finiteness invalid"
-    );
-    if let Some(head) = opts.force_pdd_head {
-        ensure!(head < spec.pdd_heads, "force_pdd_head {head} out of range");
-    }
-    if let Some(ts_step) = opts.wrong_step0_timestep_index {
-        ensure!(
-            ts_step < spec.pdd_heads,
-            "wrong_step0_timestep_index {ts_step} out of range"
-        );
-    }
-
-    let dir = model.join("transformer_diffusers");
-    let ckpt = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?;
-    let _manifest = ckpt.minimax_h3_image_manifest(&spec)?;
-
-    let row_plan = image_row_plan(layout, &schedule)?;
-    let adaln_plan = AdalnPlan::from_tags(&layout.token_tags, &row_plan)?;
-
-    // 1. Run context_embedder + token_refiner once before the denoising loop.
-    let refined_text_hbm = run_text_refiner_hbm(dev, &spec, &ckpt, text, text_rows)?;
-
-    // 2. Setup-time schedule-keyed AdaLN tables for all 50 blocks + norm_out.
-    let mut adaln_cache = TpuAdalnCache::default();
-    adaln_cache.ensure_all_for_plan(&adaln_plan, |p| {
-        compute_all_adaln_tables(dev, &spec, &ckpt, p)
-    })?;
-    let sem = HostSemantics::ImmutableOnlyDuringCall;
-    let norm_out_adaln_hbm = dev.upload_bf16(
-        adaln_cache.norm_out(),
-        &[adaln_plan.timesteps.len() as i64, 2, spec.hidden as i64],
-        sem,
-    )?;
-
-    // 3. Compile DiT executables and upload small persistent weights & step index tables.
-    let head_chunk = if total_rows <= 1024 { 4 } else { 2 };
-    let block_exec =
-        compile_h3_dit_block(dev, &spec, total_rows, adaln_plan.pairs.len(), head_chunk)?;
-    let proj_in_exec = dev.compile_mlir(&emit_h3_dit_proj_in_pack(
-        text_rows,
-        img_rows,
-        patch_dim,
-        spec.hidden,
-    )?)?;
-    let norm_out_pdd_exec = dev.compile_mlir(&emit_h3_dit_norm_out_pdd(&DitNormOutPddSpec {
-        rows: total_rows,
-        text_rows,
-        hidden: spec.hidden,
-        patch_dim,
-        timesteps: adaln_plan.timesteps.len(),
-        final_norm_eps: spec.final_norm_eps,
-    })?)?;
-
-    let proj_in_w = dev.upload_f32(
-        &read_f32_ckpt(&ckpt, "proj_in.weight", &[spec.hidden, patch_dim])?,
-        &[spec.hidden as i64, patch_dim as i64],
-        sem,
-    )?;
-    let proj_in_b = dev.upload_f32(
-        &read_f32_ckpt(&ckpt, "proj_in.bias", &[spec.hidden])?,
-        &[spec.hidden as i64],
-        sem,
-    )?;
-    let norm_out_w = dev.upload_bf16(
-        &read_bf16_ckpt(&ckpt, "norm_out.norm.weight", &[spec.hidden])?,
-        &[spec.hidden as i64],
-        sem,
-    )?;
-    let mut pdd_w = Vec::with_capacity(spec.pdd_heads);
-    let mut pdd_b = Vec::with_capacity(spec.pdd_heads);
-    for h in 0..spec.pdd_heads {
-        pdd_w.push(dev.upload_f32(
-            &read_f32_ckpt(
-                &ckpt,
-                &format!("pdd_proj_out.{h}.weight"),
-                &[patch_dim, spec.hidden],
-            )?,
-            &[patch_dim as i64, spec.hidden as i64],
-            sem,
-        )?);
-        pdd_b.push(dev.upload_f32(
-            &read_f32_ckpt(&ckpt, &format!("pdd_proj_out.{h}.bias"), &[patch_dim])?,
-            &[patch_dim as i64],
-            sem,
-        )?);
-    }
-
-    let positions: Vec<[f64; 3]> = if opts.transpose_rope_hw {
-        layout
-            .position_ids
-            .iter()
-            .map(|&[t, h, w]| [t, w, h])
-            .collect()
-    } else {
-        layout.position_ids.clone()
-    };
-    let rotary_dim = 6 * spec.rope_freq_dim;
-    let rotary_data = rotary_rows(spec.rope_freq_dim, spec.rope_theta, &positions);
-    let rotary_hbm = dev.upload_bf16(&rotary_data, &[total_rows as i64, rotary_dim as i64], sem)?;
-
-    let mut step_row_pairs_hbm = Vec::with_capacity(spec.pdd_heads);
-    let mut step_row_timesteps_hbm = Vec::with_capacity(spec.pdd_heads);
-    for step in 0..spec.pdd_heads {
-        let pairs_i32: Vec<i32> = adaln_plan.row_pairs[step]
-            .iter()
-            .map(|&v| i32::try_from(v).context("row_pair overflows i32"))
-            .collect::<Result<Vec<_>>>()?;
-        let ts_i32: Vec<i32> = adaln_plan.row_timesteps[step]
-            .iter()
-            .map(|&v| i32::try_from(v).context("row_timestep overflows i32"))
-            .collect::<Result<Vec<_>>>()?;
-        step_row_pairs_hbm.push(dev.upload_i32(&pairs_i32, &[total_rows as i64], sem)?);
-        step_row_timesteps_hbm.push(dev.upload_i32(&ts_i32, &[total_rows as i64], sem)?);
-    }
-
-    // 4. Derive live placement plan from sensed HBM, compiled block memory, and host RAM.
-    let mut live_topology = TpuTopology::detect(dev, None)?;
-    if let Some(cap) = opts.host_available_cap_bytes {
-        live_topology.host_available_bytes = live_topology.host_available_bytes.min(cap);
-    }
-    let active_block_bytes = active_dit_block_bytes(&spec);
-    let compiled_block_peak = block_exec
-        .compiled_memory_stats
-        .as_ref()
-        .map(|s| u64::try_from(s.peak_memory_in_bytes.max(0)).unwrap_or(0))
-        .filter(|&v| v > active_block_bytes)
-        .unwrap_or(active_block_bytes + 640 * 1024 * 1024);
-    let adaln_tables_bytes = (spec.layers * adaln_plan.pairs.len() * 6 * spec.hidden * 2) as u64;
-    let persistent_hbm_bytes = adaln_tables_bytes
-        + DIT_ACTIVE_BLOCK_BYTES_HEADROOM
-        + (total_rows * spec.hidden * 2 * 2) as u64;
-    let footprint = ModelFootprint {
-        persistent_hbm_bytes,
-        compiled_block_peak_bytes: compiled_block_peak,
-        compiled_block_weight_arg_bytes: active_block_bytes,
-        block_weight_bytes: vec![active_block_bytes; spec.layers],
-    };
-    let live_plan = TpuPlacementPlan::derive(&live_topology, &footprint)?;
-    let stack = DitBlockStack::load(
-        dev,
-        &spec,
-        &ckpt,
-        live_plan.clone(),
-        adaln_cache.layers(),
-        adaln_plan.pairs.len(),
-    )?;
-
-    // 5. Six-step denoising loop.
-    let mut cur_latents = rows.to_vec();
-    let mut step0_velocity = Vec::new();
-    let steps_to_run = if opts.stop_after_step0 {
-        1
-    } else {
-        spec.pdd_heads
-    };
-    let mut per_step_stats = Vec::with_capacity(steps_to_run);
-    let packed_bytes = total_rows * spec.hidden * 2;
-    let vel_bytes = img_rows * patch_dim * 4;
-
-    for step in 0..steps_to_run {
-        let lat_buf = dev.upload_f32(&cur_latents, &[img_rows as i64, patch_dim as i64], sem)?;
-        let mut packed_outs = proj_in_exec.execute(
-            &[&refined_text_hbm, &lat_buf, &proj_in_w, &proj_in_b],
-            &[packed_bytes],
-        )?;
-        drop(lat_buf);
-        let x = packed_outs
-            .pop()
-            .context("proj_in_pack returned zero outputs")?;
-
-        let ts_slot = if step == 0 {
-            opts.wrong_step0_timestep_index.unwrap_or(0)
-        } else {
-            step
-        };
-        let (x, stats) = stack.run_step(
-            dev,
-            &block_exec,
-            &ckpt,
-            x,
-            (&step_row_pairs_hbm[ts_slot], &rotary_hbm, total_rows),
-        )?;
-        per_step_stats.push(stats);
-
-        let head = opts.force_pdd_head.unwrap_or(step);
-        let mut vel_outs = norm_out_pdd_exec.execute(
-            &[
-                &x,
-                &norm_out_w,
-                &norm_out_adaln_hbm,
-                &step_row_timesteps_hbm[ts_slot],
-                &pdd_w[head],
-                &pdd_b[head],
-            ],
-            &[vel_bytes],
-        )?;
-        drop(x);
-        let vel_buf = vel_outs
-            .pop()
-            .context("norm_out_pdd returned zero outputs")?;
-        let vel = vel_buf.download_f32()?;
-        drop(vel_buf);
-        ensure!(
-            vel.len() == cur_latents.len() && vel.iter().all(|v| v.is_finite()),
-            "non-finite or mismatched velocity at denoising step {step}"
-        );
-        if step == 0 {
-            step0_velocity = vel.clone();
-        }
-
-        let dt = schedule.sigmas[step] - schedule.sigmas[step + 1];
-        let signed_dt = if opts.negate_euler_velocity { -dt } else { dt };
-        for (x_i, &v_i) in cur_latents.iter_mut().zip(&vel) {
-            *x_i += signed_dt * v_i;
-            ensure!(x_i.is_finite(), "non-finite latent after Euler step {step}");
-        }
-    }
-
-    drop((
-        stack,
-        step_row_pairs_hbm,
-        step_row_timesteps_hbm,
-        rotary_hbm,
-        pdd_w,
-        pdd_b,
-        norm_out_w,
-        proj_in_w,
-        proj_in_b,
-        norm_out_adaln_hbm,
-        refined_text_hbm,
-        norm_out_pdd_exec,
-        proj_in_exec,
-        block_exec,
-        ckpt,
-    ));
-    let hbm_after_drop_bytes = dev.memory_stats()?.bytes_in_use;
-    Ok((
-        cur_latents,
-        DitSampleReport {
-            total_rows,
-            text_rows,
-            image_rows: img_rows,
-            head_chunk,
-            steps_run: steps_to_run,
-            live_topology,
-            live_plan,
-            per_step_stats,
-            step0_velocity,
-            hbm_before_bytes,
-            hbm_after_drop_bytes,
-            elapsed_ms: t0.elapsed().as_secs_f64() * 1e3,
-        },
-    ))
+    let dit = TpuImageDit::load(dev, model, layout, opts.host_available_cap_bytes)?;
+    let (cur_latents, mut report) = dit.sample(dev, rows, text, opts)?;
+    drop(dit);
+    report.hbm_before_bytes = hbm_before_bytes;
+    report.hbm_after_drop_bytes = dev.memory_stats()?.bytes_in_use;
+    report.elapsed_ms = t0.elapsed().as_secs_f64() * 1e3;
+    Ok((cur_latents, report))
 }
 
 /// Evaluates `norm_out` + F32 `pdd_proj_out.{head_index}` (`precision = [HIGHEST, HIGHEST]`) on TPU
@@ -597,6 +686,289 @@ pub fn run_norm_out_pdd_with_device(
     Ok(vel)
 }
 
+/// Resident TPU Image VAE decoder loaded once for a `(model, extent)` pair and reused across decodes.
+pub struct TpuImageVae {
+    vae_spec: ImageVaeSpec,
+    latent_extent: [usize; 2],
+    canvas_extent: [usize; 2],
+    tiles: VaeTiles,
+    tile_lh: usize,
+    tile_lw: usize,
+    patches: usize,
+    tokens: usize,
+    tile_count: usize,
+    tile_batch: usize,
+    patch_w: usize,
+    origins: Vec<(usize, usize)>,
+    weights: VaeDecoderHbmWeights,
+    pre_exec: TpuExecutable,
+    block_exec: TpuExecutable,
+    post_exec: TpuExecutable,
+}
+
+impl TpuImageVae {
+    /// Loads Image VAE decoder weights to HBM and compiles the tile executables once.
+    pub fn load(dev: &TpuDevice, model: &Path, extent: [usize; 2]) -> Result<Self> {
+        let vae_dir = model.join("vae_diffusers");
+        let config_path = vae_dir.join("config.json");
+        let vae_spec = ImageVaeSpec::parse(&serde_json::from_slice(
+            &fs::read(&config_path).with_context(|| format!("read {}", config_path.display()))?,
+        )?)?;
+        let single = vae_spec.single_frame();
+        let [latent_h, latent_w] = extent;
+        ensure!(
+            latent_h > 0 && latent_w > 0,
+            "image VAE latent extent must be positive: {extent:?}"
+        );
+        let canvas_h = latent_h * vae_spec.spatial_ratio;
+        let canvas_w = latent_w * vae_spec.spatial_ratio;
+        let tiles = VaeTiles::released(&single, canvas_h, canvas_w)?;
+        let tile_lh = tiles.height / vae_spec.spatial_ratio;
+        let tile_lw = tiles.width / vae_spec.spatial_ratio;
+        let patches = tile_lh * tile_lw;
+        let tokens = patches + vae_spec.registers + 1;
+        let tile_count = tiles.count();
+        let tile_batch = tile_count.min(VAE_MAX_TILE_BATCH);
+        let patch_w = single.patch_width();
+
+        let ckpt = MappedCheckpoint::open_component(&vae_dir, "diffusion_pytorch_model")?;
+        let _manifest = ckpt.minimax_h3_image_vae_manifest(&vae_spec)?;
+        let weights = VaeDecoderHbmWeights::load(dev, &ckpt, &vae_spec, patch_w)?;
+
+        let pre_exec = dev.compile_mlir(&emit_h3_image_vae_pre(&VaePreHloSpec {
+            batch: tile_batch,
+            patches,
+            latent_channels: vae_spec.latent_channels,
+            dim: vae_spec.dim,
+            registers: vae_spec.registers,
+        })?)?;
+        let block_exec = dev.compile_mlir(&emit_h3_image_vae_block(&VaeBlockHloSpec {
+            batch: tile_batch,
+            tokens,
+            dim: vae_spec.dim,
+            heads: vae_spec.heads,
+            head_dim: vae_spec.head_dim,
+            ffn: vae_spec.ffn,
+            rotary_dim: vae_spec.rope_dims,
+            norm_eps: vae_spec.norm_eps,
+        })?)?;
+        let post_exec = dev.compile_mlir(&emit_h3_image_vae_post(&VaePostHloSpec {
+            batch: tile_batch,
+            tokens,
+            num_patches: patches,
+            dim: vae_spec.dim,
+            patch_width: patch_w,
+            norm_eps: vae_spec.norm_eps,
+        })?)?;
+
+        let mut origins = Vec::with_capacity(tile_count);
+        for &ry in &tiles.rows.0 {
+            for &cx in &tiles.cols.0 {
+                origins.push((ry / vae_spec.spatial_ratio, cx / vae_spec.spatial_ratio));
+            }
+        }
+
+        Ok(Self {
+            vae_spec,
+            latent_extent: extent,
+            canvas_extent: [canvas_h, canvas_w],
+            tiles,
+            tile_lh,
+            tile_lw,
+            patches,
+            tokens,
+            tile_count,
+            tile_batch,
+            patch_w,
+            origins,
+            weights,
+            pre_exec,
+            block_exec,
+            post_exec,
+        })
+    }
+
+    /// Decodes normalized F32 NCHW latents `[24, latent_h, latent_w]` to F32 RGB HWC `[H, W, 3]`.
+    pub fn decode(
+        &self,
+        dev: &TpuDevice,
+        normalized: &[f32],
+        opts: &VaeDecodeOptions,
+    ) -> Result<(Vec<f32>, VaeDecodeReport)> {
+        let t0 = Instant::now();
+        let hbm_before_bytes = dev.memory_stats()?.bytes_in_use;
+        ensure!(
+            normalized.iter().all(|v| v.is_finite()),
+            "image VAE input is non-finite"
+        );
+        let [latent_h, latent_w] = self.latent_extent;
+        let [canvas_h, canvas_w] = self.canvas_extent;
+        let c_lat = self.vae_spec.latent_channels;
+        let elems = c_lat
+            .checked_mul(latent_h)
+            .and_then(|n| n.checked_mul(latent_w))
+            .context("VAE latent extent overflow")?;
+        ensure!(
+            normalized.len() == elems,
+            "image VAE latent extent mismatch: len={} expected={elems}",
+            normalized.len()
+        );
+
+        let rotary = vae_2d_rotary_table(
+            &self.vae_spec,
+            self.tile_lh,
+            self.tile_lw,
+            opts.transpose_rope_hw,
+        )?;
+        let sem = HostSemantics::ImmutableOnlyDuringCall;
+        let rotary_hbm = dev.upload_bf16(
+            &rotary,
+            &[self.tokens as i64, self.vae_spec.rope_dims as i64],
+            sem,
+        )?;
+
+        let stream_bytes = self.tile_batch * self.tokens * self.vae_spec.dim * 4;
+        let post_bytes = self.tile_batch * self.patches * self.patch_w * 2;
+        let tile_pixels = self.vae_spec.out_channels * self.tiles.height * self.tiles.width;
+        let mut raw_tiles = vec![bf16::ZERO; self.tile_count * tile_pixels];
+
+        for chunk_start in (0..self.tile_count).step_by(self.tile_batch) {
+            let active = (self.tile_count - chunk_start).min(self.tile_batch);
+            let mut z_batch = vec![bf16::ZERO; self.tile_batch * self.patches * c_lat];
+            for b in 0..active {
+                let (ly0, lx0) = self.origins[chunk_start + b];
+                let base = b * self.patches * c_lat;
+                for py in 0..self.tile_lh {
+                    for px in 0..self.tile_lw {
+                        let tok_off = base + (py * self.tile_lw + px) * c_lat;
+                        for c in 0..c_lat {
+                            let raw = normalized[(c * latent_h + ly0 + py) * latent_w + (lx0 + px)];
+                            let denorm =
+                                raw * self.vae_spec.latents_std[c] + self.vae_spec.latents_mean[c];
+                            let val = bf16::from_f32(denorm);
+                            ensure!(val.is_finite(), "VAE denormalized latent is non-finite");
+                            z_batch[tok_off + c] = val;
+                        }
+                    }
+                }
+            }
+            let z_buf = dev.upload_bf16(
+                &z_batch,
+                &[self.tile_batch as i64, self.patches as i64, c_lat as i64],
+                sem,
+            )?;
+            let mut pre_outs = self.pre_exec.execute(
+                &[
+                    &z_buf,
+                    &self.weights.post_quant_w,
+                    &self.weights.post_quant_b,
+                    &self.weights.proj_in_w,
+                    &self.weights.proj_in_b,
+                    &self.weights.register_tokens,
+                ],
+                &[stream_bytes],
+            )?;
+            drop(z_buf);
+            let mut x = pre_outs.pop().context("vae_pre returned zero outputs")?;
+
+            for layer in &self.weights.blocks {
+                let mut blk_outs = self.block_exec.execute(
+                    &[
+                        &x,
+                        &rotary_hbm,
+                        &layer.norm1,
+                        &layer.wq,
+                        &layer.bq,
+                        &layer.wk,
+                        &layer.bk,
+                        &layer.wv,
+                        &layer.bv,
+                        &layer.wout,
+                        &layer.bout,
+                        &layer.scale1,
+                        &layer.norm2,
+                        &layer.wff0,
+                        &layer.bff0,
+                        &layer.wff2,
+                        &layer.bff2,
+                        &layer.scale2,
+                    ],
+                    &[stream_bytes],
+                )?;
+                x = blk_outs.pop().context("vae_block returned zero outputs")?;
+            }
+
+            let mut post_outs = self.post_exec.execute(
+                &[
+                    &x,
+                    &self.weights.norm_out_w,
+                    &self.weights.norm_out_b,
+                    &self.weights.proj_out_w,
+                    &self.weights.proj_out_b,
+                ],
+                &[post_bytes],
+            )?;
+            drop(x);
+            let out_buf = post_outs.pop().context("vae_post returned zero outputs")?;
+            let out_bf16 = out_buf.download_bf16()?;
+            drop(out_buf);
+            ensure!(
+                out_bf16.iter().all(|v| v.is_finite()),
+                "image VAE decoder produced non-finite value"
+            );
+
+            for b in 0..active {
+                let src = &out_bf16
+                    [b * self.patches * self.patch_w..(b + 1) * self.patches * self.patch_w];
+                let dst = &mut raw_tiles
+                    [(chunk_start + b) * tile_pixels..(chunk_start + b + 1) * tile_pixels];
+                unpatchify_vae_tile_bf16(
+                    src,
+                    dst,
+                    (
+                        self.tile_lh,
+                        self.tile_lw,
+                        self.vae_spec.out_channels,
+                        self.vae_spec.spatial_ratio,
+                    ),
+                );
+            }
+        }
+
+        drop(rotary_hbm);
+        let hbm_after_drop_bytes = dev.memory_stats()?.bytes_in_use;
+
+        let stitched = stitch_tiles_bf16(
+            &raw_tiles,
+            &self.tiles,
+            self.vae_spec.out_channels,
+            [canvas_h, canvas_w],
+        )?;
+        let pixels = canvas_h * canvas_w;
+        let mut hwc = vec![0.0f32; pixels * self.vae_spec.out_channels];
+        for p in 0..pixels {
+            for c in 0..self.vae_spec.out_channels {
+                let v = stitched[c * pixels + p].to_f32() * (VAE_PIXEL_STD[c] as f32)
+                    + (VAE_PIXEL_MEAN[c] as f32);
+                ensure!(v.is_finite(), "image VAE denormalized pixel is non-finite");
+                hwc[p * self.vae_spec.out_channels + c] = v;
+            }
+        }
+        Ok((
+            hwc,
+            VaeDecodeReport {
+                latent_extent: self.latent_extent,
+                canvas_extent: self.canvas_extent,
+                tile_count: self.tile_count,
+                tile_batch: self.tile_batch,
+                hbm_before_bytes,
+                hbm_after_drop_bytes,
+                elapsed_ms: t0.elapsed().as_secs_f64() * 1e3,
+            },
+        ))
+    }
+}
+
 /// Decodes normalized F32 NCHW image latents `[24, latent_h, latent_w]` to F32 RGB HWC `[H, W, 3]`,
 /// matching CUDA `image_decode`.
 pub fn image_decode(
@@ -626,218 +998,13 @@ pub fn image_decode_with_device(
 ) -> Result<(Vec<f32>, VaeDecodeReport)> {
     let t0 = Instant::now();
     let hbm_before_bytes = dev.memory_stats()?.bytes_in_use;
-    ensure!(
-        normalized.iter().all(|v| v.is_finite()),
-        "image VAE input is non-finite"
-    );
-    let vae_dir = model.join("vae_diffusers");
-    let config_path = vae_dir.join("config.json");
-    let vae_spec = ImageVaeSpec::parse(&serde_json::from_slice(
-        &fs::read(&config_path).with_context(|| format!("read {}", config_path.display()))?,
-    )?)?;
-    let single = vae_spec.single_frame();
-    let [latent_h, latent_w] = extent;
-    let elems = vae_spec
-        .latent_channels
-        .checked_mul(latent_h)
-        .and_then(|n| n.checked_mul(latent_w))
-        .context("VAE latent extent overflow")?;
-    ensure!(
-        latent_h > 0 && latent_w > 0 && normalized.len() == elems,
-        "image VAE latent extent mismatch: len={} expected={elems}",
-        normalized.len()
-    );
-    let canvas_h = latent_h * vae_spec.spatial_ratio;
-    let canvas_w = latent_w * vae_spec.spatial_ratio;
-    let tiles = VaeTiles::released(&single, canvas_h, canvas_w)?;
-    let tile_lh = tiles.height / vae_spec.spatial_ratio;
-    let tile_lw = tiles.width / vae_spec.spatial_ratio;
-    let patches = tile_lh * tile_lw;
-    let tokens = patches + vae_spec.registers + 1;
-    let tile_count = tiles.count();
-    let tile_batch = tile_count.min(VAE_MAX_TILE_BATCH);
-
-    let ckpt = MappedCheckpoint::open_component(&vae_dir, "diffusion_pytorch_model")?;
-    let _manifest = ckpt.minimax_h3_image_vae_manifest(&vae_spec)?;
-
-    let weights = VaeDecoderHbmWeights::load(dev, &ckpt, &vae_spec, single.patch_width())?;
-    let rotary = vae_2d_rotary_table(&vae_spec, tile_lh, tile_lw, opts.transpose_rope_hw)?;
-    let sem = HostSemantics::ImmutableOnlyDuringCall;
-    let rotary_hbm = dev.upload_bf16(&rotary, &[tokens as i64, vae_spec.rope_dims as i64], sem)?;
-
-    let pre_exec = dev.compile_mlir(&emit_h3_image_vae_pre(&VaePreHloSpec {
-        batch: tile_batch,
-        patches,
-        latent_channels: vae_spec.latent_channels,
-        dim: vae_spec.dim,
-        registers: vae_spec.registers,
-    })?)?;
-    let block_exec = dev.compile_mlir(&emit_h3_image_vae_block(&VaeBlockHloSpec {
-        batch: tile_batch,
-        tokens,
-        dim: vae_spec.dim,
-        heads: vae_spec.heads,
-        head_dim: vae_spec.head_dim,
-        ffn: vae_spec.ffn,
-        rotary_dim: vae_spec.rope_dims,
-        norm_eps: vae_spec.norm_eps,
-    })?)?;
-    let post_exec = dev.compile_mlir(&emit_h3_image_vae_post(&VaePostHloSpec {
-        batch: tile_batch,
-        tokens,
-        num_patches: patches,
-        dim: vae_spec.dim,
-        patch_width: single.patch_width(),
-        norm_eps: vae_spec.norm_eps,
-    })?)?;
-
-    // Build tile origins in row-major order.
-    let mut origins = Vec::with_capacity(tile_count);
-    for &ry in &tiles.rows.0 {
-        for &cx in &tiles.cols.0 {
-            origins.push((ry / vae_spec.spatial_ratio, cx / vae_spec.spatial_ratio));
-        }
-    }
-
-    let c_lat = vae_spec.latent_channels;
-    let patch_w = single.patch_width();
-    let stream_bytes = tile_batch * tokens * vae_spec.dim * 4;
-    let post_bytes = tile_batch * patches * patch_w * 2;
-    let tile_pixels = vae_spec.out_channels * tiles.height * tiles.width;
-    let mut raw_tiles = vec![bf16::ZERO; tile_count * tile_pixels];
-
-    for chunk_start in (0..tile_count).step_by(tile_batch) {
-        let active = (tile_count - chunk_start).min(tile_batch);
-        let mut z_batch = vec![bf16::ZERO; tile_batch * patches * c_lat];
-        for b in 0..active {
-            let (ly0, lx0) = origins[chunk_start + b];
-            let base = b * patches * c_lat;
-            for py in 0..tile_lh {
-                for px in 0..tile_lw {
-                    let tok_off = base + (py * tile_lw + px) * c_lat;
-                    for c in 0..c_lat {
-                        let raw = normalized[(c * latent_h + ly0 + py) * latent_w + (lx0 + px)];
-                        let denorm = raw * vae_spec.latents_std[c] + vae_spec.latents_mean[c];
-                        let val = bf16::from_f32(denorm);
-                        ensure!(val.is_finite(), "VAE denormalized latent is non-finite");
-                        z_batch[tok_off + c] = val;
-                    }
-                }
-            }
-        }
-        let z_buf = dev.upload_bf16(
-            &z_batch,
-            &[tile_batch as i64, patches as i64, c_lat as i64],
-            sem,
-        )?;
-        let mut pre_outs = pre_exec.execute(
-            &[
-                &z_buf,
-                &weights.post_quant_w,
-                &weights.post_quant_b,
-                &weights.proj_in_w,
-                &weights.proj_in_b,
-                &weights.register_tokens,
-            ],
-            &[stream_bytes],
-        )?;
-        drop(z_buf);
-        let mut x = pre_outs.pop().context("vae_pre returned zero outputs")?;
-
-        for layer in &weights.blocks {
-            let mut blk_outs = block_exec.execute(
-                &[
-                    &x,
-                    &rotary_hbm,
-                    &layer.norm1,
-                    &layer.wq,
-                    &layer.bq,
-                    &layer.wk,
-                    &layer.bk,
-                    &layer.wv,
-                    &layer.bv,
-                    &layer.wout,
-                    &layer.bout,
-                    &layer.scale1,
-                    &layer.norm2,
-                    &layer.wff0,
-                    &layer.bff0,
-                    &layer.wff2,
-                    &layer.bff2,
-                    &layer.scale2,
-                ],
-                &[stream_bytes],
-            )?;
-            x = blk_outs.pop().context("vae_block returned zero outputs")?;
-        }
-
-        let mut post_outs = post_exec.execute(
-            &[
-                &x,
-                &weights.norm_out_w,
-                &weights.norm_out_b,
-                &weights.proj_out_w,
-                &weights.proj_out_b,
-            ],
-            &[post_bytes],
-        )?;
-        drop(x);
-        let out_buf = post_outs.pop().context("vae_post returned zero outputs")?;
-        let out_bf16 = out_buf.download_bf16()?;
-        drop(out_buf);
-        ensure!(
-            out_bf16.iter().all(|v| v.is_finite()),
-            "image VAE decoder produced non-finite value"
-        );
-
-        for b in 0..active {
-            let src = &out_bf16[b * patches * patch_w..(b + 1) * patches * patch_w];
-            let dst = &mut raw_tiles
-                [(chunk_start + b) * tile_pixels..(chunk_start + b + 1) * tile_pixels];
-            unpatchify_vae_tile_bf16(
-                src,
-                dst,
-                (
-                    tile_lh,
-                    tile_lw,
-                    vae_spec.out_channels,
-                    vae_spec.spatial_ratio,
-                ),
-            );
-        }
-    }
-
-    drop((weights, rotary_hbm, pre_exec, block_exec, post_exec, ckpt));
-    let hbm_after_drop_bytes = dev.memory_stats()?.bytes_in_use;
-
-    let stitched = stitch_tiles_bf16(
-        &raw_tiles,
-        &tiles,
-        vae_spec.out_channels,
-        [canvas_h, canvas_w],
-    )?;
-    let pixels = canvas_h * canvas_w;
-    let mut hwc = vec![0.0f32; pixels * vae_spec.out_channels];
-    for p in 0..pixels {
-        for c in 0..vae_spec.out_channels {
-            let v = stitched[c * pixels + p].to_f32() * (VAE_PIXEL_STD[c] as f32)
-                + (VAE_PIXEL_MEAN[c] as f32);
-            ensure!(v.is_finite(), "image VAE denormalized pixel is non-finite");
-            hwc[p * vae_spec.out_channels + c] = v;
-        }
-    }
-    Ok((
-        hwc,
-        VaeDecodeReport {
-            latent_extent: extent,
-            canvas_extent: [canvas_h, canvas_w],
-            tile_count,
-            tile_batch,
-            hbm_before_bytes,
-            hbm_after_drop_bytes,
-            elapsed_ms: t0.elapsed().as_secs_f64() * 1e3,
-        },
-    ))
+    let vae = TpuImageVae::load(dev, model, extent)?;
+    let (hwc, mut report) = vae.decode(dev, normalized, opts)?;
+    drop(vae);
+    report.hbm_before_bytes = hbm_before_bytes;
+    report.hbm_after_drop_bytes = dev.memory_stats()?.bytes_in_use;
+    report.elapsed_ms = t0.elapsed().as_secs_f64() * 1e3;
+    Ok((hwc, report))
 }
 
 /// End-to-end MiniMax-H3-Image generation on TPU, matching CUDA `image_latents`.

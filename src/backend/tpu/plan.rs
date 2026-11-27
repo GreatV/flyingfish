@@ -59,6 +59,28 @@ impl TpuTopology {
         let reserve = eighth.max(2 * GIB).min(quarter);
         self.host_available_bytes.saturating_sub(reserve)
     }
+
+    /// Smallest `host_available_bytes` whose `usable_host_bytes()` is at least `target_usable_bytes`.
+    pub fn host_cap_for_usable_bytes(target_usable_bytes: u64) -> u64 {
+        let usable = |h: u64| {
+            let reserve = (h / 8).max(2 * GIB).min(h / 4);
+            h.saturating_sub(reserve)
+        };
+        let mut h = if target_usable_bytes <= 6 * GIB {
+            target_usable_bytes.saturating_mul(4).div_ceil(3)
+        } else if target_usable_bytes <= 14 * GIB {
+            target_usable_bytes.saturating_add(2 * GIB)
+        } else {
+            target_usable_bytes.saturating_mul(8).div_ceil(7)
+        };
+        while usable(h) < target_usable_bytes {
+            h = h.saturating_add(1);
+        }
+        while h > 0 && usable(h - 1) >= target_usable_bytes {
+            h -= 1;
+        }
+        h
+    }
 }
 
 /// Active weight and execution workspace footprint of a transformer stack.
@@ -373,6 +395,50 @@ mod tests {
             ..topo
         };
         assert!(TpuPlacementPlan::derive(&tiny_hbm, &small).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn host_cap_for_usable_bytes_forces_exact_disk_spill_on_v5e1_and_v6e1() -> Result<()> {
+        let cases = [
+            (
+                "TPU v5 lite",
+                V5E1_RECORDED_HBM_LIMIT,
+                V5E1_RECORDED_HOST_AVAIL,
+            ),
+            ("TPU v6e", V6E1_HBM_LIMIT, 169 * GIB),
+        ];
+        for (chip_kind, hbm_limit_bytes, host_available_bytes) in cases {
+            let topo = TpuTopology {
+                chip_kind: chip_kind.into(),
+                hbm_limit_bytes,
+                hbm_baseline_used_bytes: 0,
+                host_available_bytes,
+                has_pinned_host: true,
+                h2d_bytes_per_s: Some(V5E1_RECORDED_PINNED_H2D_BPS),
+            };
+            let base = TpuPlacementPlan::derive(&topo, &h3_image_footprint())?;
+            let host_blocks = base.count(BlockPlacement::PinnedHostStreamed)
+                + base.count(BlockPlacement::PageableHostStreamed);
+            assert!(host_blocks >= 3, "{chip_kind}: host_blocks={host_blocks}");
+            let target_usable = (host_blocks - 3) as u64 * H3_IMAGE_ACTIVE_BLOCK_BYTES;
+            let cap = TpuTopology::host_cap_for_usable_bytes(target_usable);
+            let forced_topo = TpuTopology {
+                host_available_bytes: topo.host_available_bytes.min(cap),
+                ..topo
+            };
+            let forced = TpuPlacementPlan::derive(&forced_topo, &h3_image_footprint())?;
+            assert_eq!(
+                forced.count(BlockPlacement::DiskStreamed),
+                3,
+                "{chip_kind}: expected 3 DiskStreamed blocks, got {}",
+                forced.count(BlockPlacement::DiskStreamed)
+            );
+            assert_eq!(
+                forced.count(BlockPlacement::HbmResident),
+                base.count(BlockPlacement::HbmResident)
+            );
+        }
         Ok(())
     }
 }
