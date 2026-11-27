@@ -4,15 +4,15 @@ use super::{
     TpuBuffer, TpuDevice, TpuExecutable,
     dit_block::{
         DitBlockStack, StackStepStats, TpuAdalnCache, compile_h3_dit_block,
-        compute_all_adaln_tables, compute_norm_out_adaln_table, load_refiner_block_weights,
-        read_bf16_ckpt, read_f32_ckpt, read_f32_narrow_bf16_ckpt, upload_block_weights,
+        compute_all_adaln_tables, load_refiner_block_weights, read_bf16_ckpt, read_f32_ckpt,
+        read_f32_narrow_bf16_ckpt, upload_block_weights,
     },
     hlo::{
-        DitNormOutPddSpec, DitRefinerBlockHloSpec, Qwen3VlLayerHloSpec, VaeBlockHloSpec,
+        DitNormOutSpec, DitRefinerBlockHloSpec, Qwen3VlLayerHloSpec, VaeBlockHloSpec,
         VaePostHloSpec, VaePreHloSpec, emit_bf16_rms_norm, emit_h3_dit_context_embedder,
-        emit_h3_dit_norm_out_pdd, emit_h3_dit_proj_in_pack, emit_h3_dit_refiner_block,
-        emit_h3_image_vae_block, emit_h3_image_vae_post, emit_h3_image_vae_pre,
-        emit_qwen3_vl_text_layer,
+        emit_h3_dit_norm_out, emit_h3_dit_pdd_proj_out, emit_h3_dit_proj_in_pack,
+        emit_h3_dit_refiner_block, emit_h3_image_vae_block, emit_h3_image_vae_post,
+        emit_h3_image_vae_pre, emit_qwen3_vl_text_layer,
     },
     pjrt::HostSemantics,
     plan::{ModelFootprint, TpuPlacementPlan, TpuTopology},
@@ -203,7 +203,8 @@ pub struct TpuImageDit {
     norm_out_adaln_hbm: TpuBuffer,
     block_exec: TpuExecutable,
     proj_in_exec: TpuExecutable,
-    norm_out_pdd_exec: TpuExecutable,
+    norm_out_exec: TpuExecutable,
+    pdd_proj_out_exec: TpuExecutable,
     proj_in_w: TpuBuffer,
     proj_in_b: TpuBuffer,
     norm_out_w: TpuBuffer,
@@ -282,15 +283,15 @@ impl TpuImageDit {
             patch_dim,
             spec.hidden,
         )?)?;
-        let norm_out_pdd_exec =
-            dev.compile_mlir(&emit_h3_dit_norm_out_pdd(&DitNormOutPddSpec {
-                rows: total_rows,
-                text_rows,
-                hidden: spec.hidden,
-                patch_dim,
-                timesteps: adaln_plan.timesteps.len(),
-                final_norm_eps: spec.final_norm_eps,
-            })?)?;
+        let norm_out_exec = dev.compile_mlir(&emit_h3_dit_norm_out(&DitNormOutSpec {
+            rows: total_rows,
+            text_rows,
+            hidden: spec.hidden,
+            timesteps: adaln_plan.timesteps.len(),
+            final_norm_eps: spec.final_norm_eps,
+        })?)?;
+        let pdd_proj_out_exec =
+            dev.compile_mlir(&emit_h3_dit_pdd_proj_out(img_rows, spec.hidden, patch_dim)?)?;
 
         let proj_in_w = dev.upload_f32(
             &read_f32_ckpt(&ckpt, "proj_in.weight", &[spec.hidden, patch_dim])?,
@@ -387,7 +388,8 @@ impl TpuImageDit {
             norm_out_adaln_hbm,
             block_exec,
             proj_in_exec,
-            norm_out_pdd_exec,
+            norm_out_exec,
+            pdd_proj_out_exec,
             proj_in_w,
             proj_in_b,
             norm_out_w,
@@ -461,6 +463,7 @@ impl TpuImageDit {
         };
         let mut per_step_stats = Vec::with_capacity(steps_to_run);
         let packed_bytes = self.total_rows * self.spec.hidden * 2;
+        let norm_img_bytes = self.img_rows * self.spec.hidden * 2;
         let vel_bytes = self.img_rows * self.patch_dim * 4;
 
         for step in 0..steps_to_run {
@@ -501,22 +504,26 @@ impl TpuImageDit {
             )?;
             per_step_stats.push(stats);
 
-            let head = opts.force_pdd_head.unwrap_or(step);
-            let mut vel_outs = self.norm_out_pdd_exec.execute(
+            let mut norm_outs = self.norm_out_exec.execute(
                 &[
                     &x,
                     &self.norm_out_w,
                     &self.norm_out_adaln_hbm,
                     &self.step_row_timesteps_hbm[ts_slot],
-                    &self.pdd_w[head],
-                    &self.pdd_b[head],
                 ],
-                &[vel_bytes],
+                &[norm_img_bytes],
             )?;
             drop(x);
+            let norm_img = norm_outs.pop().context("norm_out returned zero outputs")?;
+            let head = opts.force_pdd_head.unwrap_or(step);
+            let mut vel_outs = self.pdd_proj_out_exec.execute(
+                &[&norm_img, &self.pdd_w[head], &self.pdd_b[head]],
+                &[vel_bytes],
+            )?;
+            drop(norm_img);
             let vel_buf = vel_outs
                 .pop()
-                .context("norm_out_pdd returned zero outputs")?;
+                .context("pdd_proj_out returned zero outputs")?;
             let vel = vel_buf.download_f32()?;
             drop(vel_buf);
             ensure!(
@@ -597,61 +604,33 @@ pub fn image_sample_with_device(
     Ok((cur_latents, report))
 }
 
-/// Evaluates `norm_out` + F32 `pdd_proj_out.{head_index}` (`precision = [HIGHEST, HIGHEST]`) on TPU
-/// from a pre-`norm_out` BF16 hidden state `[total_rows, hidden]`.
-pub fn run_norm_out_pdd_with_device(
+/// Evaluates F32 `pdd_proj_out.{head_index}` (`precision = [HIGHEST, HIGHEST]`) on TPU
+/// from a BF16 `norm_out` image-row tensor `[img_rows, hidden]` via the production executable.
+pub fn run_pdd_proj_out_with_device(
     dev: &TpuDevice,
     model: &Path,
-    text_rows: usize,
-    pre_norm_bf16: &[bf16],
-    timestep_index: usize,
+    norm_out_bf16: &[bf16],
     head_index: usize,
 ) -> Result<Vec<f32>> {
     let spec = ImageSpec::read(model)?;
-    let schedule = ImageSchedule::published()?;
     ensure!(
-        timestep_index < schedule.timesteps.len() && head_index < spec.pdd_heads,
-        "norm_out_pdd index out of range: ts={timestep_index} head={head_index}"
+        head_index < spec.pdd_heads,
+        "pdd_proj_out head index out of range: head={head_index}"
     );
     ensure!(
-        pre_norm_bf16.len().is_multiple_of(spec.hidden),
-        "pre_norm_bf16 len {} not divisible by hidden {}",
-        pre_norm_bf16.len(),
+        !norm_out_bf16.is_empty() && norm_out_bf16.len().is_multiple_of(spec.hidden),
+        "norm_out_bf16 len {} not positive multiple of hidden {}",
+        norm_out_bf16.len(),
         spec.hidden
     );
-    let total_rows = pre_norm_bf16.len() / spec.hidden;
-    ensure!(
-        text_rows > 0 && total_rows > text_rows,
-        "invalid norm_out_pdd row counts: text={text_rows} total={total_rows}"
-    );
-    let img_rows = total_rows - text_rows;
+    let img_rows = norm_out_bf16.len() / spec.hidden;
     let patch_dim = spec.row_width();
 
     let dir = model.join("transformer_diffusers");
     let ckpt = MappedCheckpoint::open_component(&dir, "diffusion_pytorch_model")?;
-    let norm_out_adaln = compute_norm_out_adaln_table(dev, &spec, &ckpt, &schedule.timesteps)?;
     let sem = HostSemantics::ImmutableOnlyDuringCall;
-    let exec = dev.compile_mlir(&emit_h3_dit_norm_out_pdd(&DitNormOutPddSpec {
-        rows: total_rows,
-        text_rows,
-        hidden: spec.hidden,
-        patch_dim,
-        timesteps: schedule.timesteps.len(),
-        final_norm_eps: spec.final_norm_eps,
-    })?)?;
-    let x_buf = dev.upload_bf16(pre_norm_bf16, &[total_rows as i64, spec.hidden as i64], sem)?;
-    let norm_w = dev.upload_bf16(
-        &read_bf16_ckpt(&ckpt, "norm_out.norm.weight", &[spec.hidden])?,
-        &[spec.hidden as i64],
-        sem,
-    )?;
-    let adaln_buf = dev.upload_bf16(
-        &norm_out_adaln,
-        &[schedule.timesteps.len() as i64, 2, spec.hidden as i64],
-        sem,
-    )?;
-    let ts_i32 = vec![i32::try_from(timestep_index).context("ts_index overflows i32")?; total_rows];
-    let ts_buf = dev.upload_i32(&ts_i32, &[total_rows as i64], sem)?;
+    let exec = dev.compile_mlir(&emit_h3_dit_pdd_proj_out(img_rows, spec.hidden, patch_dim)?)?;
+    let x_buf = dev.upload_bf16(norm_out_bf16, &[img_rows as i64, spec.hidden as i64], sem)?;
     let w_out = dev.upload_f32(
         &read_f32_ckpt(
             &ckpt,
@@ -670,18 +649,13 @@ pub fn run_norm_out_pdd_with_device(
         &[patch_dim as i64],
         sem,
     )?;
-    let mut outs = exec.execute(
-        &[&x_buf, &norm_w, &adaln_buf, &ts_buf, &w_out, &b_out],
-        &[img_rows * patch_dim * 4],
-    )?;
-    let vel_buf = outs.pop().context("norm_out_pdd returned zero outputs")?;
+    let mut outs = exec.execute(&[&x_buf, &w_out, &b_out], &[img_rows * patch_dim * 4])?;
+    let vel_buf = outs.pop().context("pdd_proj_out returned zero outputs")?;
     let vel = vel_buf.download_f32()?;
-    drop((
-        vel_buf, outs, x_buf, norm_w, adaln_buf, ts_buf, w_out, b_out, exec, ckpt,
-    ));
+    drop((vel_buf, outs, x_buf, w_out, b_out, exec, ckpt));
     ensure!(
         vel.len() == img_rows * patch_dim && vel.iter().all(|v| v.is_finite()),
-        "norm_out_pdd probe produced non-finite or mismatched output"
+        "pdd_proj_out probe produced non-finite or mismatched output"
     );
     Ok(vel)
 }

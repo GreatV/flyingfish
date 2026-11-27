@@ -400,27 +400,6 @@ pub fn compute_all_adaln_tables(
     Ok((layer_tables, norm_out_table))
 }
 
-/// Computes only the `[timesteps.len(), 2, hidden]` BF16 `norm_out` AdaLN table from `ckpt`.
-pub fn compute_norm_out_adaln_table(
-    dev: &TpuDevice,
-    spec: &ImageSpec,
-    ckpt: &MappedCheckpoint,
-    timesteps: &[f32],
-) -> Result<Vec<bf16>> {
-    ensure!(!timesteps.is_empty(), "norm_out timesteps is empty");
-    let time_embedder = load_time_embedder(ckpt, spec)?;
-    let x_bf16 = adaln_input(&image_to_h3_spec(spec), &time_embedder, timesteps);
-    let t = timesteps.len();
-    let x_buf = dev.upload_bf16(
-        &x_bf16,
-        &[t as i64, spec.time_dim as i64],
-        HostSemantics::ImmutableOnlyDuringCall,
-    )?;
-    let table = project_norm_out_adaln(dev, spec, ckpt, &x_buf, t)?;
-    drop(x_buf);
-    Ok(table)
-}
-
 fn project_norm_out_adaln(
     dev: &TpuDevice,
     spec: &ImageSpec,

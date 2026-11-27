@@ -13,7 +13,7 @@ use flyingfish::{
         minimax_h3::{
             ConditionerReport, DitSampleOptions, DitSampleReport, TpuImageDit, TpuImageVae,
             VaeDecodeOptions, VaeDecodeReport, image_sample_with_device,
-            run_conditioner_with_device, run_norm_out_pdd_with_device,
+            run_conditioner_with_device, run_pdd_proj_out_with_device,
         },
         pjrt::{CompiledMemoryStats, HostSemantics},
         plan::{BlockPlacement, ModelFootprint, TpuPlacementPlan, TpuTopology},
@@ -85,8 +85,15 @@ const STEP3_COND_REL_L2_TOL: f64 = 3.389282e-2;
 const STEP3_COND_REL_MAX_ABS_TOL: f64 = 3.182686e-2;
 const STEP3_DIT_STEP0_REL_L2_TOL: f64 = 4.530854e-2;
 const STEP3_DIT_STEP0_REL_MAX_ABS_TOL: f64 = 4.858644e-2;
-const STEP3_PDD_F32_REL_L2_TOL: f64 = 1.0e-3;
-const STEP3_PDD_F32_REL_MAX_ABS_TOL: f64 = 2.0e-3;
+// 2026-11-27: Prior 1.0e-3 / 2.0e-3 PDD probe tolerance against eager-BF16 pdd_head{0,5}_vel_f32
+// was mis-specified (fused-F32 norm_out floor is 2.416e-3 / 2.345e-3, while 3x would admit a
+// DEFAULT BF16 dot at 1.074e-3..2.853e-3). Gated probe feeds frozen BF16 norm_out rows into
+// production emit_h3_dit_pdd_proj_out and compares against exact F32 CPU pdd_fused_f32_ref.safetensors
+// at 1.0e-5 (F32 reduction bound sqrt(5376)*2^-24 = 4.37e-6 with margin). A DEFAULT BF16 dot fails by
+// 107x/98x (head 0) and 103x/92x (head 5) on TPU MXU (285x full BF16 linear); eager-BF16 comparison
+// is reported, not gated; head5_vs_head0 > 5.0e-2 unchanged.
+const STEP3_PDD_F32_REL_L2_TOL: f64 = 1.0e-5;
+const STEP3_PDD_F32_REL_MAX_ABS_TOL: f64 = 1.0e-5;
 const STEP3_PDD_HEAD5_VS_HEAD0_MIN_REL_L2: f64 = 5.0e-2;
 const STEP3_DIT_FINAL_REL_L2_TOL: f64 = 5.715719e-1;
 const STEP3_DIT_FINAL_REL_MAX_ABS_TOL: f64 = 1.508231;
@@ -1026,6 +1033,8 @@ struct PddProbeReport {
     head0: BlockMetrics,
     head5: BlockMetrics,
     head5_vs_head0: BlockMetrics,
+    head0_vs_eager_bf16: BlockMetrics,
+    head5_vs_eager_bf16: BlockMetrics,
     passed: bool,
 }
 
@@ -1071,7 +1080,9 @@ struct Step3Fixtures {
     position_ids: Vec<[f64; 3]>,
     token_tags: Vec<u8>,
     vel0_ref_bf16: Vec<f32>,
-    step0_pre_norm_out_bf16: Vec<bf16>,
+    pdd_norm_out_bf16: Vec<bf16>,
+    pdd_head0_fused_f32: Vec<f32>,
+    pdd_head5_fused_f32: Vec<f32>,
     pdd_head0_vel_f32: Vec<f32>,
     pdd_head5_vel_f32: Vec<f32>,
     final_latent_ref: Vec<f32>,
@@ -1243,13 +1254,17 @@ fn load_step3_fixtures(dir: &Path, spec: &ImageSpec) -> Result<Step3Fixtures> {
     let pdd_mm = open_st_file(&dir.join("dit_step0_and_pdd_ref.safetensors"))?;
     let pdd_st = SafeTensors::deserialize(&pdd_mm)?;
     let vel0_ref_bf16 = st_read_f32(&pdd_st, "vel0_ref_bf16", &[img_rows, patch_dim])?;
-    let step0_pre_norm_out_bf16 = st_read_bf16(
-        &pdd_st,
-        "step0_pre_norm_out_bf16",
-        &[total_rows, spec.hidden],
-    )?;
     let pdd_head0_vel_f32 = st_read_f32(&pdd_st, "pdd_head0_vel_f32", &[img_rows, patch_dim])?;
     let pdd_head5_vel_f32 = st_read_f32(&pdd_st, "pdd_head5_vel_f32", &[img_rows, patch_dim])?;
+
+    let pdd_fused_mm = open_st_file(&dir.join("pdd_fused_f32_ref.safetensors"))?;
+    let pdd_fused_st = SafeTensors::deserialize(&pdd_fused_mm)?;
+    let pdd_norm_out_bf16 =
+        st_read_bf16(&pdd_fused_st, "pdd_norm_out_bf16", &[img_rows, spec.hidden])?;
+    let pdd_head0_fused_f32 =
+        st_read_f32(&pdd_fused_st, "pdd_head0_fused_f32", &[img_rows, patch_dim])?;
+    let pdd_head5_fused_f32 =
+        st_read_f32(&pdd_fused_st, "pdd_head5_fused_f32", &[img_rows, patch_dim])?;
 
     let dit_mm = open_st_file(&dir.join("dit_final_latent_ref_bf16.safetensors"))?;
     let dit_st = SafeTensors::deserialize(&dit_mm)?;
@@ -1272,7 +1287,9 @@ fn load_step3_fixtures(dir: &Path, spec: &ImageSpec) -> Result<Step3Fixtures> {
         position_ids,
         token_tags,
         vel0_ref_bf16,
-        step0_pre_norm_out_bf16,
+        pdd_norm_out_bf16,
+        pdd_head0_fused_f32,
+        pdd_head5_fused_f32,
         pdd_head0_vel_f32,
         pdd_head5_vel_f32,
         final_latent_ref,
@@ -1289,16 +1306,15 @@ fn write_rgb_png(path: &Path, width: usize, height: usize, rgb: &[u8]) -> Result
 fn run_step3_pdd_probe(
     dev: &TpuDevice,
     model: &Path,
-    text_rows: usize,
     fix: &Step3Fixtures,
 ) -> Result<PddProbeReport> {
-    let got_h0 =
-        run_norm_out_pdd_with_device(dev, model, text_rows, &fix.step0_pre_norm_out_bf16, 0, 0)?;
-    let got_h5 =
-        run_norm_out_pdd_with_device(dev, model, text_rows, &fix.step0_pre_norm_out_bf16, 0, 5)?;
-    let head0 = compute_f32_metrics(&got_h0, &fix.pdd_head0_vel_f32)?;
-    let head5 = compute_f32_metrics(&got_h5, &fix.pdd_head5_vel_f32)?;
-    let head5_vs_head0 = compute_f32_metrics(&got_h5, &fix.pdd_head0_vel_f32)?;
+    let got_h0 = run_pdd_proj_out_with_device(dev, model, &fix.pdd_norm_out_bf16, 0)?;
+    let got_h5 = run_pdd_proj_out_with_device(dev, model, &fix.pdd_norm_out_bf16, 5)?;
+    let head0 = compute_f32_metrics(&got_h0, &fix.pdd_head0_fused_f32)?;
+    let head5 = compute_f32_metrics(&got_h5, &fix.pdd_head5_fused_f32)?;
+    let head5_vs_head0 = compute_f32_metrics(&got_h5, &fix.pdd_head0_fused_f32)?;
+    let head0_vs_eager_bf16 = compute_f32_metrics(&got_h0, &fix.pdd_head0_vel_f32)?;
+    let head5_vs_eager_bf16 = compute_f32_metrics(&got_h5, &fix.pdd_head5_vel_f32)?;
     let passed = head0.all_finite
         && head5.all_finite
         && head0.rel_l2 <= STEP3_PDD_F32_REL_L2_TOL
@@ -1307,13 +1323,21 @@ fn run_step3_pdd_probe(
         && head5.rel_max_abs <= STEP3_PDD_F32_REL_MAX_ABS_TOL
         && head5_vs_head0.rel_l2 > STEP3_PDD_HEAD5_VS_HEAD0_MIN_REL_L2;
     println!(
-        "TPU_STEP3_PDD_F32_PROBE head0_rel_l2={:.6e} head5_rel_l2={:.6e} head5_vs_head0_rel_l2={:.6e} pass={passed}",
-        head0.rel_l2, head5.rel_l2, head5_vs_head0.rel_l2
+        "TPU_STEP3_PDD_F32_PROBE head0_rel_l2={:.6e} head0_rel_max_abs={:.6e} head5_rel_l2={:.6e} head5_rel_max_abs={:.6e} head5_vs_head0_rel_l2={:.6e} eager_h0_rel_l2={:.6e} eager_h5_rel_l2={:.6e} pass={passed}",
+        head0.rel_l2,
+        head0.rel_max_abs,
+        head5.rel_l2,
+        head5.rel_max_abs,
+        head5_vs_head0.rel_l2,
+        head0_vs_eager_bf16.rel_l2,
+        head5_vs_eager_bf16.rel_l2
     );
     Ok(PddProbeReport {
         head0,
         head5,
         head5_vs_head0,
+        head0_vs_eager_bf16,
+        head5_vs_eager_bf16,
         passed,
     })
 }
@@ -1494,8 +1518,8 @@ fn tpu_h3_image_full_pipeline_gate() -> Result<()> {
         cond_report.elapsed_ms
     );
 
-    // Stage 2a: Direct F32 norm_out + pdd_proj_out head-0/5 & HIGHEST precision probe.
-    let pdd_probe = run_step3_pdd_probe(&dev, &model, text_rows, &fix)?;
+    // Stage 2a: Direct F32 pdd_proj_out head-0/5 & HIGHEST precision probe on frozen BF16 norm_out rows.
+    let pdd_probe = run_step3_pdd_probe(&dev, &model, &fix)?;
 
     // One resident DiT load serves Stage 2b, the three Stage 2d controls, and Stage 4 E2E DiT.
     let dit_hbm_before = dev.memory_stats()?.bytes_in_use;

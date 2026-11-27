@@ -57,13 +57,12 @@ pub struct Qwen3VlLayerHloSpec {
     pub rms_norm_eps: f32,
 }
 
-/// Geometry of `norm_out` (BF16) + per-step `pdd_proj_out` (F32 `HIGHEST`).
+/// Geometry of BF16 `norm_out` (RMSNorm + AdaLN shift/scale + image-row slice).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct DitNormOutPddSpec {
+pub struct DitNormOutSpec {
     pub rows: usize,
     pub text_rows: usize,
     pub hidden: usize,
-    pub patch_dim: usize,
     pub timesteps: usize,
     pub final_norm_eps: f32,
 }
@@ -1020,16 +1019,15 @@ pub fn emit_h3_dit_refiner_block(spec: &DitRefinerBlockHloSpec) -> Result<String
     Ok(out)
 }
 
-/// Emits BF16 `norm_out` (AdaLN shift/scale per row timestep) -> image-row slice -> F32 `pdd_proj_out` (`precision = [HIGHEST, HIGHEST]`).
-pub fn emit_h3_dit_norm_out_pdd(spec: &DitNormOutPddSpec) -> Result<String> {
+/// Emits BF16 `norm_out` (RMSNorm + per-row-timestep AdaLN shift/scale) and slices image rows `[text_rows..rows]`.
+pub fn emit_h3_dit_norm_out(spec: &DitNormOutSpec) -> Result<String> {
     let r = spec.rows;
     let t = spec.text_rows;
     let d = spec.hidden;
-    let p = spec.patch_dim;
     let ts = spec.timesteps;
     ensure!(
-        t > 0 && r > t && d > 0 && p > 0 && ts > 0,
-        "norm_out_pdd dims invalid: {spec:?}"
+        t > 0 && r > t && d > 0 && ts > 0,
+        "norm_out dims invalid: {spec:?}"
     );
     ensure!(
         spec.final_norm_eps.is_finite() && spec.final_norm_eps > 0.0,
@@ -1040,15 +1038,13 @@ pub fn emit_h3_dit_norm_out_pdd(spec: &DitNormOutPddSpec) -> Result<String> {
     let mut out = String::with_capacity(4096);
     writeln!(
         out,
-        "module @ff_h3_dit_norm_out_pdd {{
+        "module @ff_h3_dit_norm_out {{
   func.func public @main(
     %x: tensor<{r}x{d}xbf16>,
     %norm_w: tensor<{d}xbf16>,
     %norm_adaln: tensor<{ts}x2x{d}xbf16>,
-    %row_timesteps: tensor<{r}xi32>,
-    %w_out: tensor<{p}x{d}xf32>,
-    %b_out: tensor<{p}xf32>
-  ) -> tensor<{img}x{p}xf32> {{
+    %row_timesteps: tensor<{r}xi32>
+  ) -> tensor<{img}x{d}xbf16> {{
     %f32_zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
     %f32_one = stablehlo.constant dense<1.000000e+00> : tensor<f32>
     %bf16_one_s = stablehlo.convert %f32_one : (tensor<f32>) -> tensor<bf16>
@@ -1067,15 +1063,40 @@ pub fn emit_h3_dit_norm_out_pdd(spec: &DitNormOutPddSpec) -> Result<String> {
     %mod_mul = stablehlo.multiply %n, %scale1 : tensor<{r}x{d}xbf16>
     %mod = stablehlo.add %mod_mul, %shift : tensor<{r}x{d}xbf16>
     %img_bf16 = \"stablehlo.slice\"(%mod) {{start_indices = array<i64: {t}, 0>, limit_indices = array<i64: {r}, {d}>, strides = array<i64: 1, 1>}} : (tensor<{r}x{d}xbf16>) -> tensor<{img}x{d}xbf16>
-    %img_f32 = stablehlo.convert %img_bf16 : (tensor<{img}x{d}xbf16>) -> tensor<{img}x{d}xf32>
-    %vel_dot = stablehlo.dot_general %img_f32, %w_out, contracting_dims = [1] x [1], precision = [HIGHEST, HIGHEST] : (tensor<{img}x{d}xf32>, tensor<{p}x{d}xf32>) -> tensor<{img}x{p}xf32>
-    %b_b = stablehlo.broadcast_in_dim %b_out, dims = [1] : (tensor<{p}xf32>) -> tensor<{img}x{p}xf32>
-    %vel = stablehlo.add %vel_dot, %b_b : tensor<{img}x{p}xf32>
-    func.return %vel : tensor<{img}x{p}xf32>
+    func.return %img_bf16 : tensor<{img}x{d}xbf16>
   }}
 }}"
     )?;
     Ok(out)
+}
+
+/// Emits F32 `pdd_proj_out` (`precision = [HIGHEST, HIGHEST]`) from BF16 `norm_out` image rows.
+pub fn emit_h3_dit_pdd_proj_out(
+    img_rows: usize,
+    hidden: usize,
+    patch_dim: usize,
+) -> Result<String> {
+    ensure!(
+        img_rows > 0 && hidden > 0 && patch_dim > 0,
+        "pdd_proj_out dims invalid: img_rows={img_rows} hidden={hidden} patch_dim={patch_dim}"
+    );
+    Ok(format!(
+        "\
+module @ff_h3_dit_pdd_proj_out {{
+  func.func public @main(
+    %img_bf16: tensor<{img_rows}x{hidden}xbf16>,
+    %w_out: tensor<{patch_dim}x{hidden}xf32>,
+    %b_out: tensor<{patch_dim}xf32>
+  ) -> tensor<{img_rows}x{patch_dim}xf32> {{
+    %img_f32 = stablehlo.convert %img_bf16 : (tensor<{img_rows}x{hidden}xbf16>) -> tensor<{img_rows}x{hidden}xf32>
+    %vel_dot = stablehlo.dot_general %img_f32, %w_out, contracting_dims = [1] x [1], precision = [HIGHEST, HIGHEST] : (tensor<{img_rows}x{hidden}xf32>, tensor<{patch_dim}x{hidden}xf32>) -> tensor<{img_rows}x{patch_dim}xf32>
+    %b_b = stablehlo.broadcast_in_dim %b_out, dims = [1] : (tensor<{patch_dim}xf32>) -> tensor<{img_rows}x{patch_dim}xf32>
+    %vel = stablehlo.add %vel_dot, %b_b : tensor<{img_rows}x{patch_dim}xf32>
+    func.return %vel : tensor<{img_rows}x{patch_dim}xf32>
+  }}
+}}
+"
+    ))
 }
 
 /// Emits Image VAE pre-projection: BF16 `post_quant_conv` -> BF16 `proj_in` -> append `register_tokens` + zero cls -> F32 stream.
@@ -1854,15 +1875,19 @@ mod tests {
         })?;
         assert_dot_precisions(&refiner, 0, 8);
 
-        let norm_out = emit_h3_dit_norm_out_pdd(&DitNormOutPddSpec {
+        let norm_out = emit_h3_dit_norm_out(&DitNormOutSpec {
             rows: 519,
             text_rows: 7,
             hidden: 5376,
-            patch_dim: 96,
             timesteps: 6,
             final_norm_eps: 1e-5,
         })?;
-        assert_dot_precisions(&norm_out, 1, 0);
+        assert_dot_precisions(&norm_out, 0, 0);
+        assert!(norm_out.contains("-> tensor<512x5376xbf16>"));
+
+        let pdd = emit_h3_dit_pdd_proj_out(512, 5376, 96)?;
+        assert_dot_precisions(&pdd, 1, 0);
+        assert!(pdd.contains("-> tensor<512x96xf32>"));
 
         let vae_pre = emit_h3_image_vae_pre(&VaePreHloSpec {
             batch: 15,
