@@ -119,18 +119,18 @@ impl Blas {
         Ok(algo)
     }
 
-    fn dense_algorithms(&self, plan: &Plan, alignment: [u32; 4]) -> Result<Vec<Algo>> {
+    fn dense_algorithms(&self, plan: &Plan, desc: &Descriptor) -> Result<Vec<Algo>> {
         let budget = self.workspace_bytes();
         let incumbent = plan.algo.context("dense Lt incumbent missing")?;
         let mut search = Search {
             blas: self,
             plan,
             budget,
-            alignment,
+            alignment: desc.alignment,
             seen: BTreeSet::new(),
             legal: Vec::new(),
         };
-        search.consider(incumbent)?;
+        search.consider(incumbent, false)?;
         ensure!(
             !search.legal.is_empty(),
             "dense Lt incumbent fails its numerical or resource contract"
@@ -150,13 +150,16 @@ impl Blas {
             super::lt::destroy_matmul_pref(pref)?;
         }
         for heuristic in result? {
-            search.consider(heuristic.algo)?;
+            search.consider(heuristic.algo, false)?;
             if search.legal.len() == 8 {
                 break;
             }
         }
         if search.legal.len() == 1 {
             search.enumerate()?;
+        }
+        if desc.ffn_tail.is_some() {
+            search.rectangular(incumbent)?;
         }
         Ok(search.legal)
     }
@@ -172,7 +175,7 @@ struct Search<'a> {
 }
 
 impl Search<'_> {
-    fn consider(&mut self, algo: Algo) -> Result<()> {
+    fn consider(&mut self, algo: Algo, trial_tile: bool) -> Result<()> {
         let id = algo_config(&algo)?;
         if !self.seen.insert(id) {
             return Ok(());
@@ -216,24 +219,68 @@ impl Search<'_> {
                 check.as_mut_ptr(),
             )
         };
-        use sys::cublasStatus_t::{CUBLAS_STATUS_ARCH_MISMATCH, CUBLAS_STATUS_NOT_SUPPORTED};
-        if matches!(
-            status,
-            CUBLAS_STATUS_NOT_SUPPORTED | CUBLAS_STATUS_ARCH_MISMATCH
-        ) {
+        use sys::cublasStatus_t::{
+            CUBLAS_STATUS_ARCH_MISMATCH, CUBLAS_STATUS_INVALID_VALUE, CUBLAS_STATUS_NOT_SUPPORTED,
+        };
+        let rejects = |s| {
+            matches!(s, CUBLAS_STATUS_NOT_SUPPORTED | CUBLAS_STATUS_ARCH_MISMATCH)
+                || (trial_tile && s == CUBLAS_STATUS_INVALID_VALUE)
+        };
+        if rejects(status) {
             return Ok(());
         }
         status.result()?;
         let check = unsafe { check.assume_init() };
-        if matches!(
-            check.state,
-            CUBLAS_STATUS_NOT_SUPPORTED | CUBLAS_STATUS_ARCH_MISMATCH
-        ) {
+        if rejects(check.state) {
             return Ok(());
         }
         check.state.result()?;
         if check.workspaceSize <= self.budget {
             self.legal.push(algo);
+        }
+        Ok(())
+    }
+
+    fn rectangular(&mut self, incumbent: Algo) -> Result<()> {
+        use sys::cublasLtMatmulTile_t::{CUBLASLT_MATMUL_TILE_64x128, CUBLASLT_MATMUL_TILE_128x64};
+        let mut tiles = options(&incumbent, Cap::CUBLASLT_ALGO_CAP_TILE_IDS)?;
+        tiles.retain(|&t| {
+            t == CUBLASLT_MATMUL_TILE_64x128 as u32 || t == CUBLASLT_MATMUL_TILE_128x64 as u32
+        });
+        tiles.sort_unstable();
+        let current = u32::try_from(algo_config(&incumbent)?.stages)?;
+        let mut stages = options(&incumbent, Cap::CUBLASLT_ALGO_CAP_STAGES_IDS)?;
+        stages.sort_unstable_by_key(|&stage| (stage.abs_diff(current), stage));
+        let limit = self.legal.len() + 4;
+        for stage in stages {
+            for &tile in &tiles {
+                let mut algo = incumbent;
+                let config = configure(&mut algo, Attr::CUBLASLT_ALGO_CONFIG_TILE_ID, tile)
+                    .and_then(|()| {
+                        configure(&mut algo, Attr::CUBLASLT_ALGO_CONFIG_STAGES_ID, stage)
+                    });
+                if let Err(error) = config {
+                    use sys::cublasStatus_t::{
+                        CUBLAS_STATUS_INVALID_VALUE, CUBLAS_STATUS_NOT_SUPPORTED,
+                    };
+                    if error
+                        .downcast_ref::<cudarc::cublaslt::result::CublasError>()
+                        .is_some_and(|e| {
+                            matches!(
+                                e.0,
+                                CUBLAS_STATUS_INVALID_VALUE | CUBLAS_STATUS_NOT_SUPPORTED
+                            )
+                        })
+                    {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                self.consider(algo, true)?;
+                if self.legal.len() == limit {
+                    return Ok(());
+                }
+            }
         }
         Ok(())
     }
@@ -290,7 +337,7 @@ impl Search<'_> {
                 if self.seen.contains(&algo_config(&algo)?) {
                     continue;
                 }
-                self.consider(algo)?;
+                self.consider(algo, false)?;
                 tried += 1;
                 if tried == 128 || self.legal.len() == 8 {
                     return Ok(());
@@ -377,7 +424,7 @@ impl Operands {
 
 fn measured_winner(medians: &[(LtAlgorithm, f32)]) -> Result<(usize, Option<f64>)> {
     ensure!(
-        (1..=8).contains(&medians.len()) && medians.iter().all(|(_, t)| t.is_finite() && *t > 0.0),
+        !medians.is_empty() && medians.iter().all(|(_, t)| t.is_finite() && *t > 0.0),
         "dense Lt invalid medians"
     );
     let Some((i, &(_, fastest))) = medians
@@ -584,7 +631,7 @@ impl Blas {
         copies: [u64; 2],
     ) -> Result<Selection> {
         let start = std::time::Instant::now();
-        let candidates = self.dense_algorithms(plan, desc.alignment)?;
+        let candidates = self.dense_algorithms(plan, &desc)?;
         let mut legal = Vec::new();
         let len = desc
             .shape
@@ -705,6 +752,11 @@ impl Selection {
         ensure!(
             &self.descriptor == desc,
             "dense Lt cache descriptor differs"
+        );
+        let limit = if desc.ffn_tail.is_some() { 12 } else { 8 };
+        ensure!(
+            self.medians_ms.len() <= limit,
+            "dense Lt candidate count exceeds {limit}"
         );
         let (winner, margin) = measured_winner(&self.medians_ms)?;
         ensure!(
@@ -1038,6 +1090,19 @@ mod tests {
         assert_eq!(warm.incumbent, first.incumbent);
         assert_eq!(warm.algorithm, first.algorithm);
         assert_ne!(warm.algorithm, reordered[0]);
+        let mut expanded = warm;
+        for id in 3..=12 {
+            expanded
+                .medians_ms
+                .push((LtAlgorithm { id, ..parent }, 100.0));
+        }
+        assert!(expanded.validate(&descriptor).is_err());
+        expanded.descriptor.ffn_tail = Some(0);
+        expanded.validate(&expanded.descriptor)?;
+        expanded
+            .medians_ms
+            .push((LtAlgorithm { id: 13, ..parent }, 100.0));
+        assert!(expanded.validate(&expanded.descriptor).is_err());
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
