@@ -1107,233 +1107,36 @@ impl<'a> DecoderWeightLoad<'a> {
             return Ok(());
         }
         let dir = self.reader.dir.clone();
-        let requests: Vec<super::OwnedRead> = names
-            .iter()
-            .map(|(name, bytes)| {
-                let entry = &self.manifest.entries[name.as_str()];
-                let cast = decoder_cast(&self.arch, name);
-                // The device buffer is allocated now; the ring fills it below.
-                super::OwnedRead::new(name, entry, std::ptr::null_mut(), *bytes, cast)
-            })
-            .collect();
-        let largest = names.iter().map(|(_, bytes)| *bytes).max().unwrap_or(0);
-        let shards = requests
-            .iter()
-            .map(|request| request.entry().shard.as_str())
-            .collect::<std::collections::BTreeSet<_>>()
-            .len();
-        let in_flight = super::fill_in_flight(shards, requests.len());
-        let ring_bytes = in_flight
-            .checked_mul(largest)
-            .context("resident ring extent overflow")?;
-        let available = usize::try_from(crate::backend::cuda::calibrate::host_memory(Path::new(
-            "/",
-        ))?)?;
-        let reserve = 4 << 30;
-        let ring = available >= ring_bytes + reserve;
-        if crate::backend::diagnostics_enabled() {
-            eprintln!(
-                "{}",
-                serde_json::json!({"h3_fill_schedule": {
-                    "component": component, "decision": if ring { "ring" } else { "serial" },
-                    "requests": requests.len(), "shards": shards, "in_flight": in_flight,
-                    "ring_bytes": ring_bytes, "slot_bytes": largest,
-                    "host_available_bytes": available, "host_reserve_bytes": reserve}})
-            );
+        let mut specs = Vec::with_capacity(names.len());
+        let mut shards = std::collections::BTreeSet::new();
+        for (name, _) in &names {
+            let entry = &self.manifest.entries[name.as_str()];
+            shards.insert(entry.shard.as_str());
+            specs.push(super::ResidentRingSpec {
+                src_bytes: entry.bytes,
+                cast: decoder_cast(&self.arch, name),
+            });
         }
-        if !ring {
+        let plan = super::plan_resident_ring(component, &dir, &specs, shards.len())?;
+        if !plan.ring {
             return Ok(());
         }
-        let mut pin = unsafe { d.ctx.alloc_pinned_with_flags::<u8>(ring_bytes, 0)? };
-        /// The ring base, Send by the free-slot discipline: a worker writes only its claimed slot.
-        struct RingBase(*mut u8);
-        unsafe impl Send for RingBase {}
-        unsafe impl Sync for RingBase {}
-        let base = RingBase(pin.as_mut_ptr()?);
-        let events = (0..in_flight)
-            .map(|_| d.ctx.new_event(None))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut destinations = Vec::with_capacity(requests.len());
+        let mut requests = Vec::with_capacity(names.len());
         for (name, bytes) in &names {
+            let entry = &self.manifest.entries[name.as_str()];
             let buffer = unsafe { d.upload.alloc::<u8>(*bytes)? };
             let ptr = buffer.device_ptr(&d.upload).0;
             self.resident.insert(name.clone(), ptr);
-            destinations.push(ptr);
             self.storage.push(buffer);
+            requests.push(super::ResidentRingRequest {
+                name: name.clone(),
+                entry: entry.clone(),
+                destination: ptr,
+                dest_len: *bytes,
+                cast: decoder_cast(&self.arch, name),
+            });
         }
-        let free = std::sync::Arc::new((
-            std::sync::Mutex::new((0..in_flight).collect::<Vec<_>>()),
-            std::sync::Condvar::new(),
-        ));
-        let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(usize, usize)>>();
-        let slot_bytes = largest;
-        let producer_base = base;
-        let consumer_base = pin.as_mut_ptr()?;
-        let producer_dir = dir.clone();
-        let producer_requests = requests.clone();
-        let producer_free = std::sync::Arc::clone(&free);
-        let producer_abort = std::sync::Arc::clone(&abort);
-        let producer = std::thread::Builder::new()
-            .name("vae-ring".to_owned())
-            .spawn(move || -> Result<()> {
-                let base = &producer_base;
-                let mut reader = EntryReader::new(&producer_dir);
-                let readers = reader.open_shards(
-                    producer_requests
-                        .iter()
-                        .map(|request| request.entry().shard.as_str()),
-                )?;
-                let order = super::claim_order(&producer_requests, |request| {
-                    request.entry().shard.as_str()
-                });
-                let next = std::sync::atomic::AtomicUsize::new(0);
-                std::thread::scope(|scope| -> Result<()> {
-                    let handles: Vec<_> = (0..in_flight)
-                        .map(|_| {
-                            let readers = &readers;
-                            let requests = &producer_requests;
-                            let order = &order;
-                            let next = &next;
-                            let free = &producer_free;
-                            let abort = &producer_abort;
-                            let done = &done_tx;
-                            scope.spawn(move || -> Result<()> {
-                                let mut bounce =
-                                    crate::experts::disk::AlignedBytes::new(4096, 4096)?;
-                                loop {
-                                    let claimed =
-                                        next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                    let Some(&index) = order.get(claimed) else {
-                                        return Ok(());
-                                    };
-                                    if abort.load(std::sync::atomic::Ordering::SeqCst) {
-                                        return Ok(());
-                                    }
-                                    let slot = {
-                                        let mut guard = free.0.lock().unwrap();
-                                        loop {
-                                            if let Some(slot) = guard.pop() {
-                                                break slot;
-                                            }
-                                            if abort.load(std::sync::atomic::Ordering::SeqCst) {
-                                                return Ok(());
-                                            }
-                                            guard = free
-                                                .1
-                                                .wait_timeout(
-                                                    guard,
-                                                    std::time::Duration::from_millis(100),
-                                                )
-                                                .unwrap()
-                                                .0;
-                                        }
-                                    };
-                                    let request = &requests[index];
-                                    let window = unsafe {
-                                        std::slice::from_raw_parts_mut(
-                                            base.0.add(slot * slot_bytes),
-                                            request.dest_len(),
-                                        )
-                                    };
-                                    let result = EntryReader::read_bounced(
-                                        readers,
-                                        request.name(),
-                                        request.entry(),
-                                        request.cast(),
-                                        window,
-                                        &mut bounce,
-                                    )
-                                    .and_then(|()| {
-                                        super::resident_raw_finite(
-                                            request.name(),
-                                            request.entry(),
-                                            request.cast(),
-                                            window,
-                                        )
-                                    });
-                                    if let Err(error) = result {
-                                        abort.store(true, std::sync::atomic::Ordering::SeqCst);
-                                        let _ = done.send(Err(error));
-                                        return Ok(());
-                                    }
-                                    done.send(Ok((index, slot)))?;
-                                }
-                            })
-                        })
-                        .collect();
-                    for handle in handles {
-                        handle
-                            .join()
-                            .map_err(|_| anyhow::anyhow!("vae-ring worker panicked"))??;
-                    }
-                    Ok(())
-                })
-            })?;
-        let mut received = 0usize;
-        let mut inflight: Vec<usize> = Vec::new();
-        let error = loop {
-            // Return slots whose upload completed.
-            let mut still = Vec::new();
-            let mut polled: Result<()> = Ok(());
-            for &slot in &inflight {
-                match events[slot].try_is_complete() {
-                    Ok(true) => {
-                        free.0.lock().unwrap().push(slot);
-                        free.1.notify_all();
-                    }
-                    Ok(false) => still.push(slot),
-                    Err(error) => {
-                        polled = Err::<(), _>(error).context("vae-ring slot event query");
-                        still.push(slot);
-                    }
-                }
-            }
-            inflight = still;
-            if let Err(error) = polled {
-                break Err(error);
-            }
-            match done_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(Ok((index, slot))) => {
-                    let window = unsafe {
-                        std::slice::from_raw_parts(
-                            consumer_base.add(slot * slot_bytes),
-                            names[index].1,
-                        )
-                    };
-                    let recorded: Result<()> = (|| {
-                        unsafe {
-                            super::super::copy::htod_async(destinations[index], window, &d.upload)?;
-                        }
-                        events[slot].record(&d.upload)?;
-                        Ok(())
-                    })();
-                    if let Err(error) = recorded {
-                        break Err(error.context("vae-ring slot upload"));
-                    }
-                    inflight.push(slot);
-                    received += 1;
-                    if received == names.len() {
-                        break Ok(());
-                    }
-                }
-                Ok(Err(error)) => break Err(error),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    break Err(anyhow::anyhow!("vae-ring producer ended early"));
-                }
-            }
-        };
-        abort.store(true, std::sync::atomic::Ordering::SeqCst);
-        free.1.notify_all();
-        let joined = producer
-            .join()
-            .map_err(|_| anyhow::anyhow!("vae-ring producer panicked"));
-        d.upload.synchronize()?;
-        drop(pin);
-        joined??;
-        error?;
-        Ok(())
+        super::run_resident_ring(d, &dir, &requests, &plan)
     }
 
     fn with_plan(
