@@ -49,6 +49,7 @@ const SLOT_LOADED_EXECUTABLE_DESTROY: usize = 53;
 const SLOT_LOADED_EXECUTABLE_GET_EXECUTABLE: usize = 54;
 const SLOT_LOADED_EXECUTABLE_EXECUTE: usize = 58;
 const SLOT_BUFFER_DESTROY: usize = 61;
+const SLOT_BUFFER_DIMENSIONS: usize = 63;
 const SLOT_BUFFER_ON_DEVICE_SIZE_IN_BYTES: usize = 67;
 const SLOT_BUFFER_TO_HOST_BUFFER: usize = 73;
 const SLOT_BUFFER_READY_EVENT: usize = 75;
@@ -56,6 +57,7 @@ const SLOT_BUFFER_COPY_TO_MEMORY: usize = 95;
 const SLOT_EXECUTABLE_GET_COMPILED_MEMORY_STATS: usize = 99;
 const SLOT_CLIENT_DMA_MAP: usize = 113;
 const SLOT_CLIENT_DMA_UNMAP: usize = 114;
+const PJRT_BUFFER_MEMORY_LAYOUT_TYPE_TILED: c_int = 0;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -434,11 +436,41 @@ struct PjrtBufferOnDeviceSizeArgs {
 }
 
 #[repr(C)]
+struct PjrtBufferDimensionsArgs {
+    struct_size: usize,
+    extension_start: *mut c_void,
+    buffer: *mut c_void,
+    dims: *const i64,
+    num_dims: usize,
+}
+
+#[repr(C)]
+struct PjrtBufferMemoryLayoutTiled {
+    struct_size: usize,
+    extension_start: *mut c_void,
+    minor_to_major: *const i64,
+    minor_to_major_size: usize,
+    tile_dims: *const i64,
+    tile_dim_sizes: *const usize,
+    num_tiles: usize,
+}
+
+// `PJRT_Buffer_MemoryLayout` holds a C union of `tiled` (56 B, align 8) and `strides` (32 B, align 8),
+// so embedding `tiled` directly has identical size, alignment, and `layout_type` offset (72).
+#[repr(C)]
+struct PjrtBufferMemoryLayout {
+    struct_size: usize,
+    extension_start: *mut c_void,
+    tiled: PjrtBufferMemoryLayoutTiled,
+    layout_type: c_int,
+}
+
+#[repr(C)]
 struct PjrtBufferToHostArgs {
     struct_size: usize,
     extension_start: *mut c_void,
     src: *mut c_void,
-    host_layout: *mut c_void,
+    host_layout: *mut PjrtBufferMemoryLayout,
     dst: *mut c_void,
     dst_size: usize,
     event: *mut c_void,
@@ -1429,12 +1461,57 @@ impl PjrtApi {
         Ok(args.on_device_size_in_bytes)
     }
 
+    pub(crate) fn buffer_dimensions(&self, buffer: *mut c_void) -> Result<Vec<i64>> {
+        let mut args = PjrtBufferDimensionsArgs {
+            struct_size: offset_of!(PjrtBufferDimensionsArgs, num_dims) + size_of::<usize>(),
+            extension_start: ptr::null_mut(),
+            buffer,
+            dims: ptr::null(),
+            num_dims: 0,
+        };
+        unsafe { self.call_status(SLOT_BUFFER_DIMENSIONS, "PJRT_Buffer_Dimensions", &mut args)? };
+        if args.num_dims == 0 {
+            return Ok(Vec::new());
+        }
+        ensure!(
+            !args.dims.is_null(),
+            "PJRT_Buffer_Dimensions returned null dims with num_dims={}",
+            args.num_dims
+        );
+        // SAFETY: `args.dims` points to `args.num_dims` `i64` elements valid for `buffer`'s lifetime.
+        let slice = unsafe { std::slice::from_raw_parts(args.dims, args.num_dims) };
+        Ok(slice.to_vec())
+    }
+
+    /// Copies a device buffer to `dst` in explicit C row-major (`[rank-1, ..., 0]`) host layout.
     pub(crate) fn buffer_to_host(&self, buffer: *mut c_void, dst: &mut [u8]) -> Result<()> {
+        let dims = self.buffer_dimensions(buffer)?;
+        let minor_to_major = row_major_minor_to_major(dims.len());
+        let mut host_layout = PjrtBufferMemoryLayout {
+            struct_size: offset_of!(PjrtBufferMemoryLayout, layout_type) + size_of::<c_int>(),
+            extension_start: ptr::null_mut(),
+            tiled: PjrtBufferMemoryLayoutTiled {
+                struct_size: offset_of!(PjrtBufferMemoryLayoutTiled, num_tiles)
+                    + size_of::<usize>(),
+                extension_start: ptr::null_mut(),
+                minor_to_major: minor_to_major.as_ptr(),
+                minor_to_major_size: minor_to_major.len(),
+                tile_dims: ptr::null(),
+                tile_dim_sizes: ptr::null(),
+                num_tiles: 0,
+            },
+            layout_type: PJRT_BUFFER_MEMORY_LAYOUT_TYPE_TILED,
+        };
+        let host_layout_ptr = if minor_to_major.is_empty() {
+            ptr::null_mut()
+        } else {
+            &mut host_layout as *mut PjrtBufferMemoryLayout
+        };
         let mut args = PjrtBufferToHostArgs {
             struct_size: offset_of!(PjrtBufferToHostArgs, event) + size_of::<*mut c_void>(),
             extension_start: ptr::null_mut(),
             src: buffer,
-            host_layout: ptr::null_mut(),
+            host_layout: host_layout_ptr,
             dst: dst.as_mut_ptr() as *mut c_void,
             dst_size: dst.len(),
             event: ptr::null_mut(),
@@ -1446,7 +1523,9 @@ impl PjrtApi {
                 &mut args,
             )?
         };
-        self.await_and_destroy_event(args.event, "PJRT_Buffer_ToHostBuffer")
+        let res = self.await_and_destroy_event(args.event, "PJRT_Buffer_ToHostBuffer");
+        drop((host_layout, minor_to_major));
+        res
     }
 
     pub(crate) fn buffer_copy_to_memory(
@@ -1580,6 +1659,11 @@ fn decode_named_values(ptr: *const PjrtNamedValue, count: usize) -> BTreeMap<Str
     out
 }
 
+/// Minor-to-major physical dimension order for C row-major storage (`[rank-1, ..., 0]`).
+fn row_major_minor_to_major(rank: usize) -> Vec<i64> {
+    (0..rank as i64).rev().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1597,6 +1681,7 @@ mod tests {
         );
         assert_eq!(PjrtApi::slot_offset(SLOT_DEVICE_MEMORY_STATS), 312);
         assert_eq!(PjrtApi::slot_offset(SLOT_LOADED_EXECUTABLE_EXECUTE), 480);
+        assert_eq!(PjrtApi::slot_offset(SLOT_BUFFER_DIMENSIONS), 520);
         assert_eq!(PjrtApi::slot_offset(SLOT_BUFFER_COPY_TO_MEMORY), 776);
         assert_eq!(
             PjrtApi::slot_offset(SLOT_EXECUTABLE_GET_COMPILED_MEMORY_STATS),
@@ -1622,6 +1707,24 @@ mod tests {
             offset_of!(PjrtErrorGetCodeArgs, code) + size_of::<c_int>(),
             28
         );
+        assert_eq!(
+            offset_of!(PjrtBufferDimensionsArgs, num_dims) + size_of::<usize>(),
+            40
+        );
+        assert_eq!(
+            offset_of!(PjrtBufferMemoryLayoutTiled, num_tiles) + size_of::<usize>(),
+            56
+        );
+        assert_eq!(
+            offset_of!(PjrtBufferMemoryLayout, layout_type) + size_of::<c_int>(),
+            76
+        );
+        assert_eq!(size_of::<PjrtBufferMemoryLayout>(), 80);
+        assert_eq!(row_major_minor_to_major(0), Vec::<i64>::new());
+        assert_eq!(row_major_minor_to_major(1), vec![0]);
+        assert_eq!(row_major_minor_to_major(2), vec![1, 0]);
+        assert_eq!(row_major_minor_to_major(3), vec![2, 1, 0]);
+        assert_eq!(row_major_minor_to_major(4), vec![3, 2, 1, 0]);
         assert_eq!(BufferType::U8 as i32, 6);
         assert_eq!(BufferType::F32 as i32, 11);
         assert_eq!(BufferType::Bf16 as i32, 13);
