@@ -5,6 +5,24 @@
 #include "ff_sm75_f16.cuh"
 #endif
 #include <math.h>
+#if !defined(__HIP__)
+// Flags: bit 0 differs, bit 1 nonfinite, bit 2 nonzero reference magnitude.
+extern "C" __global__ void bf16_repeat_flags(const uint16_t* reference, const uint16_t* trial,
+                                             uint64_t count, unsigned* result) {
+    unsigned flags = 0;
+    for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * blockDim.x) {
+        const unsigned a = reference[i], b = trial[i];
+        flags |= unsigned(a != b);
+        flags |= unsigned((a & 0x7f80) == 0x7f80 || (b & 0x7f80) == 0x7f80) << 1;
+        flags |= unsigned((a & 0x7fff) != 0) << 2;
+    }
+    for (int offset = 16; offset; offset /= 2)
+        flags |= __shfl_down_sync(0xffffffff, flags, offset);
+    if ((threadIdx.x & 31) == 0) atomicOr(result, flags);
+}
+#endif
+
 template<typename T>
 __device__ __forceinline__ void copy_finite(const T* source, T* destination, uint64_t count) {
     for (uint64_t i=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x;
