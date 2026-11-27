@@ -457,12 +457,68 @@ fn overlay_backing_path(super_opts: &str) -> Option<&str> {
     None
 }
 
+#[derive(Clone, Copy)]
+struct PathStat {
+    dev: u64,
+    rdev: u64,
+    is_block: bool,
+}
+
+fn stat_path(path: &Path) -> std::io::Result<PathStat> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let meta = std::fs::metadata(path)?;
+    Ok(PathStat {
+        dev: meta.dev(),
+        rdev: meta.rdev(),
+        is_block: meta.file_type().is_block_device(),
+    })
+}
+
+fn btrfs_fsid_devices(root: &Path, target: (u64, u64)) -> Result<Option<Vec<(u64, u64)>>> {
+    let btrfs_root = root.join("sys/fs/btrfs");
+    let entries = match std::fs::read_dir(&btrfs_root) {
+        Ok(entries) => entries,
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", btrfs_root.display())),
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read {}", btrfs_root.display()))?;
+        let fsid_path = entry.path();
+        let ftype = entry
+            .file_type()
+            .with_context(|| format!("stat {}", fsid_path.display()))?;
+        if !ftype.is_dir() && !ftype.is_symlink() {
+            continue;
+        }
+        let devices_dir = fsid_path.join("devices");
+        let dev_entries = match std::fs::read_dir(&devices_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", devices_dir.display()));
+            }
+        };
+        let mut devs = Vec::new();
+        for dev_entry in dev_entries {
+            let dev_entry = dev_entry.with_context(|| format!("read {}", devices_dir.display()))?;
+            let dev_path = dev_entry.path().join("dev");
+            let text = std::fs::read_to_string(&dev_path)
+                .with_context(|| format!("read {}", dev_path.display()))?;
+            devs.push(parse_dev_pair(&text, &dev_path.display().to_string())?);
+        }
+        if devs.contains(&target) {
+            return Ok(Some(devs));
+        }
+    }
+    Ok(None)
+}
+
 fn block_drive_count_for_dev_with(
     dev: u64,
     root: &Path,
     dir: &Path,
-    stat_dev: &dyn Fn(&Path) -> std::io::Result<u64>,
-) -> Result<(usize, &'static str)> {
+    stat_fn: &dyn Fn(&Path) -> std::io::Result<PathStat>,
+) -> Result<(usize, String)> {
     let (maj, min) = (u64::from(libc::major(dev)), u64::from(libc::minor(dev)));
     if maj == 0 {
         let mountinfo_path = root.join("proc/self/mountinfo");
@@ -484,8 +540,15 @@ fn block_drive_count_for_dev_with(
             .with_context(|| format!("mountinfo line missing separator: {line}"))?;
         let mut fields = tail.split_whitespace();
         let fstype = fields.next().context("mountinfo missing fstype")?;
-        let _source = fields.next();
+        let source = fields.next().unwrap_or("");
         let super_opts = fields.next().unwrap_or("");
+        let resolve_under_root = |path: &str| {
+            if root == Path::new("/") {
+                PathBuf::from(path)
+            } else {
+                root.join(path.trim_start_matches('/'))
+            }
+        };
         if fstype == "overlay" {
             let backing = overlay_backing_path(super_opts).with_context(|| {
                 format!(
@@ -493,15 +556,11 @@ fn block_drive_count_for_dev_with(
                     dir.display()
                 )
             })?;
-            let backing_path = if root == Path::new("/") {
-                PathBuf::from(backing)
-            } else {
-                root.join(backing.trim_start_matches('/'))
-            };
-            let backing_dev = match stat_dev(&backing_path) {
-                Ok(dev) => dev,
+            let backing_path = resolve_under_root(backing);
+            let backing_dev = match stat_fn(&backing_path) {
+                Ok(st) => st.dev,
                 Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
-                    return Ok((1, "overlay_backing_unresolved"));
+                    return Ok((1, "overlay_backing_unresolved".into()));
                 }
                 Err(error) => {
                     return Err(error).with_context(|| {
@@ -511,21 +570,60 @@ fn block_drive_count_for_dev_with(
             };
             let bmaj = u64::from(libc::major(backing_dev));
             if bmaj == 0 {
-                return Ok((1, "overlay_virtual_backing"));
+                return Ok((1, "overlay_virtual_backing".into()));
             }
-            return block_drive_count_for_dev_with(backing_dev, root, &backing_path, stat_dev);
+            return block_drive_count_for_dev_with(backing_dev, root, &backing_path, stat_fn);
         }
         if matches!(
             fstype,
             "tmpfs" | "ramfs" | "fuse" | "fuseblk" | "nfs" | "nfs4" | "9p" | "virtiofs"
         ) || fstype.starts_with("fuse.")
         {
-            return Ok((1, "virtual_fs"));
+            return Ok((1, "virtual_fs".into()));
         }
-        bail!(
-            "unsupported virtual filesystem {fstype} on 0:{min} for {}",
-            dir.display()
-        );
+        let source_paths: Vec<&str> = source.split(':').collect();
+        if !source.is_empty() && source_paths.iter().all(|p| p.starts_with('/')) {
+            let mut visited = std::collections::BTreeSet::new();
+            let mut leaves = std::collections::BTreeSet::new();
+            let mut used_btrfs_sysfs = false;
+            for src in source_paths {
+                let src_path = resolve_under_root(src);
+                let st = match stat_fn(&src_path) {
+                    Ok(st) => st,
+                    Err(error) if error.raw_os_error() == Some(libc::ENOENT) => continue,
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("stat mount source {}", src_path.display()));
+                    }
+                };
+                if !st.is_block {
+                    continue;
+                }
+                let rpair = (
+                    u64::from(libc::major(st.rdev)),
+                    u64::from(libc::minor(st.rdev)),
+                );
+                if fstype == "btrfs"
+                    && let Some(devs) = btrfs_fsid_devices(root, rpair)?
+                {
+                    used_btrfs_sysfs = true;
+                    for (dmaj, dmin) in devs {
+                        collect_leaf_drives(root, dmaj, dmin, &mut visited, &mut leaves)?;
+                    }
+                    continue;
+                }
+                collect_leaf_drives(root, rpair.0, rpair.1, &mut visited, &mut leaves)?;
+            }
+            if !leaves.is_empty() {
+                let reason = if used_btrfs_sysfs {
+                    "btrfs_devices"
+                } else {
+                    "mount_source"
+                };
+                return Ok((leaves.len(), reason.into()));
+            }
+        }
+        return Ok((1, format!("unresolved_fs:{fstype}")));
     }
     let mut visited = std::collections::BTreeSet::new();
     let mut leaves = std::collections::BTreeSet::new();
@@ -535,17 +633,14 @@ fn block_drive_count_for_dev_with(
         "no physical drives resolved for {maj}:{min} ({})",
         dir.display()
     );
-    Ok((leaves.len(), "sysfs_block"))
+    Ok((leaves.len(), "sysfs_block".into()))
 }
 
-fn block_drive_count_for_dev(dev: u64, root: &Path, dir: &Path) -> Result<(usize, &'static str)> {
-    use std::os::unix::fs::MetadataExt;
-    block_drive_count_for_dev_with(dev, root, dir, &|path| {
-        std::fs::metadata(path).map(|m| m.dev())
-    })
+fn block_drive_count_for_dev(dev: u64, root: &Path, dir: &Path) -> Result<(usize, String)> {
+    block_drive_count_for_dev_with(dev, root, dir, &stat_path)
 }
 
-fn block_drive_count(dir: &Path) -> Result<(usize, &'static str)> {
+fn block_drive_count(dir: &Path) -> Result<(usize, String)> {
     use std::os::unix::fs::MetadataExt;
     let dev = std::fs::metadata(dir)
         .with_context(|| format!("stat {}", dir.display()))?
@@ -22284,28 +22379,40 @@ mod h3_direct_batch_tests {
                     "29 24 0:26 / /content rw - overlay overlay rw,upperdir=/missing/host/upper,lowerdir=/missing/host/lower\n",
                     "30 24 0:27 / /bad rw - overlay overlay rw,upperdir=/not_a_dir/upper,lowerdir=/missing/host/lower\n",
                     "31 24 0:28 / /resolved rw - overlay overlay rw,upperdir=/existing_upper,lowerdir=/missing/host/lower\n",
+                    "32 24 0:29 /@ /btrfs_single rw - btrfs /dev/dm-0 rw,subvol=/@\n",
+                    "33 24 0:30 /@ /btrfs_multi rw - btrfs /dev/nvme0n1 rw,subvol=/@\n",
+                    "34 24 0:31 / /zfs_models rw - zfs rpool/models rw\n",
+                    "35 24 0:32 / /btrfs_bad rw - btrfs /not_a_dir/dev rw\n",
+                    "36 24 0:33 / /btrfs_missing rw - btrfs /dev/missing_btrfs_dev rw\n",
                 ),
             )?;
+            let btrfs_features = root.join("sys/fs/btrfs/features");
+            std::fs::create_dir_all(&btrfs_features)?;
+            std::fs::write(root.join("sys/fs/btrfs/attr"), b"1\n")?;
+            let btrfs_devs = root.join("sys/fs/btrfs/11111111-2222-3333-4444-555555555555/devices");
+            std::fs::create_dir_all(&btrfs_devs)?;
+            std::os::unix::fs::symlink(&nvme0, btrfs_devs.join("nvme0n1"))?;
+            std::os::unix::fs::symlink(&nvme2, btrfs_devs.join("nvme2n1"))?;
             let makedev = |maj: u64, min: u64| libc::makedev(maj as u32, min as u32);
             assert_eq!(
                 block_drive_count_for_dev(makedev(8, 1), &root, &root)?,
-                (1, "sysfs_block")
+                (1, "sysfs_block".into())
             );
             assert_eq!(
                 block_drive_count_for_dev(makedev(252, 1), &root, &root)?,
-                (1, "sysfs_block")
+                (1, "sysfs_block".into())
             );
             assert_eq!(
                 block_drive_count_for_dev(makedev(252, 0), &root, &root)?,
-                (3, "sysfs_block")
+                (3, "sysfs_block".into())
             );
             assert_eq!(
                 block_drive_count_for_dev(makedev(0, 25), &root, &root)?,
-                (1, "virtual_fs")
+                (1, "virtual_fs".into())
             );
             assert_eq!(
                 block_drive_count_for_dev(makedev(0, 26), &root, &root)?,
-                (1, "overlay_backing_unresolved")
+                (1, "overlay_backing_unresolved".into())
             );
             let non_enoent = block_drive_count_for_dev(makedev(0, 27), &root, &root)
                 .err()
@@ -22317,9 +22424,50 @@ mod h3_direct_batch_tests {
             assert_eq!(
                 block_drive_count_for_dev_with(makedev(0, 28), &root, &root, &|path| {
                     assert_eq!(path, existing_upper.as_path());
-                    Ok(makedev(252, 0))
+                    Ok(PathStat {
+                        dev: makedev(252, 0),
+                        rdev: 0,
+                        is_block: false,
+                    })
                 })?,
-                (3, "sysfs_block")
+                (3, "sysfs_block".into())
+            );
+            assert_eq!(
+                block_drive_count_for_dev_with(makedev(0, 29), &root, &root, &|path| {
+                    assert_eq!(path, root.join("dev/dm-0").as_path());
+                    Ok(PathStat {
+                        dev: makedev(0, 5),
+                        rdev: makedev(252, 0),
+                        is_block: true,
+                    })
+                })?,
+                (3, "mount_source".into())
+            );
+            assert_eq!(
+                block_drive_count_for_dev_with(makedev(0, 30), &root, &root, &|path| {
+                    assert_eq!(path, root.join("dev/nvme0n1").as_path());
+                    Ok(PathStat {
+                        dev: makedev(0, 5),
+                        rdev: makedev(259, 0),
+                        is_block: true,
+                    })
+                })?,
+                (2, "btrfs_devices".into())
+            );
+            assert_eq!(
+                block_drive_count_for_dev(makedev(0, 31), &root, &root)?,
+                (1, "unresolved_fs:zfs".into())
+            );
+            let bad_src = block_drive_count_for_dev(makedev(0, 32), &root, &root)
+                .err()
+                .context("ENOTDIR mount source stat must error")?;
+            assert!(
+                bad_src.to_string().contains("not_a_dir/dev"),
+                "unexpected ENOTDIR mount source error: {bad_src:#}"
+            );
+            assert_eq!(
+                block_drive_count_for_dev(makedev(0, 33), &root, &root)?,
+                (1, "unresolved_fs:btrfs".into())
             );
             {
                 use std::os::unix::fs::MetadataExt;
@@ -22359,7 +22507,7 @@ mod h3_direct_batch_tests {
                     )?;
                     assert_eq!(
                         block_drive_count_for_dev(makedev(0, 28), &ov_root, &ov_root)?,
-                        (3, "sysfs_block")
+                        (3, "sysfs_block".into())
                     );
                 }
             }
