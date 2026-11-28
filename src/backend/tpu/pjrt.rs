@@ -12,11 +12,6 @@ use std::{
 
 pub(crate) const PJRT_API_MAJOR_EXPECTED: c_int = 0;
 
-/// Proto3 wire encoding of `xla::CompileOptionsProto` with
-/// `executable_build_options { num_replicas: 1, num_partitions: 1 }`
-/// (`xla/pjrt/proto/compile_options.proto`).
-pub(crate) const SINGLE_DEVICE_COMPILE_OPTIONS: [u8; 6] = [0x1a, 0x04, 0x20, 0x01, 0x28, 0x01];
-
 const SLOT_ERROR_DESTROY: usize = 3;
 const SLOT_ERROR_MESSAGE: usize = 4;
 const SLOT_ERROR_GET_CODE: usize = 5;
@@ -1149,9 +1144,15 @@ impl PjrtApi {
         Ok(decode_named_values(args.attributes, args.num_attributes))
     }
 
-    pub(crate) fn compile_mlir(&self, client: *mut c_void, mlir: &str) -> Result<*mut c_void> {
+    pub(crate) fn compile_mlir(
+        &self,
+        client: *mut c_void,
+        device_id: i32,
+        mlir: &str,
+    ) -> Result<*mut c_void> {
         let mut code = mlir.as_bytes().to_vec();
         let format = b"mlir";
+        let compile_options = single_device_compile_options(device_id)?;
         let program = PjrtProgram {
             struct_size: offset_of!(PjrtProgram, format_size) + size_of::<usize>(),
             extension_start: ptr::null_mut(),
@@ -1160,15 +1161,7 @@ impl PjrtApi {
             format: format.as_ptr() as *const c_char,
             format_size: format.len(),
         };
-        let mut args = PjrtClientCompileArgs {
-            struct_size: offset_of!(PjrtClientCompileArgs, executable) + size_of::<*mut c_void>(),
-            extension_start: ptr::null_mut(),
-            client,
-            program: &program,
-            compile_options: SINGLE_DEVICE_COMPILE_OPTIONS.as_ptr() as *const c_char,
-            compile_options_size: SINGLE_DEVICE_COMPILE_OPTIONS.len(),
-            executable: ptr::null_mut(),
-        };
+        let mut args = client_compile_args(client, &program, &compile_options);
         unsafe { self.call_status(SLOT_CLIENT_COMPILE, "PJRT_Client_Compile", &mut args)? };
         ensure!(
             !args.executable.is_null(),
@@ -1317,6 +1310,7 @@ impl PjrtApi {
     pub(crate) fn execute_single_device_async(
         &self,
         executable: *mut c_void,
+        execute_device: *mut c_void,
         inputs: &[*mut c_void],
         num_outputs: usize,
     ) -> Result<(Vec<*mut c_void>, *mut c_void)> {
@@ -1348,19 +1342,13 @@ impl PjrtApi {
         let out_lists = [out_storage.as_mut_ptr()];
         let mut complete_event: *mut c_void = ptr::null_mut();
 
-        let mut args = PjrtLoadedExecutableExecuteArgs {
-            struct_size: offset_of!(PjrtLoadedExecutableExecuteArgs, execute_device)
-                + size_of::<*mut c_void>(),
-            extension_start: ptr::null_mut(),
-            executable,
-            options: &mut options,
-            argument_lists: arg_lists.as_ptr(),
-            num_devices: 1,
-            num_args: inputs.len(),
-            output_lists: out_lists.as_ptr(),
-            device_complete_events: &mut complete_event,
-            execute_device: ptr::null_mut(),
-        };
+        let mut args = single_device_execute_args(
+            (executable, execute_device),
+            &mut options,
+            (arg_lists.as_ptr(), inputs.len()),
+            out_lists.as_ptr(),
+            &mut complete_event,
+        )?;
         unsafe {
             self.call_status(
                 SLOT_LOADED_EXECUTABLE_EXECUTE,
@@ -1664,9 +1652,106 @@ fn row_major_minor_to_major(rank: usize) -> Vec<i64> {
     (0..rank as i64).rev().collect()
 }
 
+fn push_varint_u64(buf: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            buf.push(byte);
+            break;
+        }
+        buf.push(byte | 0x80);
+    }
+}
+
+/// Proto3 wire encoding of `xla::CompileOptionsProto` for a 1-replica, 1-partition
+/// executable assigned to `device_id` (`xla/pjrt/proto/compile_options.proto`, `xla/xla_data.proto`).
+pub(crate) fn single_device_compile_options(device_id: i32) -> Result<Vec<u8>> {
+    ensure!(
+        device_id >= 0,
+        "TPU compile device_id must be non-negative, got {device_id}"
+    );
+    let mut id_varint = Vec::with_capacity(5);
+    push_varint_u64(&mut id_varint, device_id as u64);
+
+    let mut comp_dev = Vec::with_capacity(2 + id_varint.len());
+    comp_dev.push(0x0a);
+    push_varint_u64(&mut comp_dev, id_varint.len() as u64);
+    comp_dev.extend_from_slice(&id_varint);
+
+    let mut dev_assign = Vec::with_capacity(6 + comp_dev.len());
+    dev_assign.extend_from_slice(&[0x08, 0x01, 0x10, 0x01, 0x1a]);
+    push_varint_u64(&mut dev_assign, comp_dev.len() as u64);
+    dev_assign.extend_from_slice(&comp_dev);
+
+    // `device_ordinal = -1` leaves StreamExecutor ordinal unset in ExecutableBuildOptionsFromProto.
+    let mut build_opts = Vec::with_capacity(17 + dev_assign.len());
+    build_opts.push(0x08);
+    push_varint_u64(&mut build_opts, (-1i64) as u64);
+    build_opts.extend_from_slice(&[0x20, 0x01, 0x28, 0x01, 0x4a]);
+    push_varint_u64(&mut build_opts, dev_assign.len() as u64);
+    build_opts.extend_from_slice(&dev_assign);
+
+    let mut out = Vec::with_capacity(2 + build_opts.len());
+    out.push(0x1a);
+    push_varint_u64(&mut out, build_opts.len() as u64);
+    out.extend_from_slice(&build_opts);
+    Ok(out)
+}
+
+fn client_compile_args(
+    client: *mut c_void,
+    program: *const PjrtProgram,
+    compile_options: &[u8],
+) -> PjrtClientCompileArgs {
+    PjrtClientCompileArgs {
+        struct_size: offset_of!(PjrtClientCompileArgs, executable) + size_of::<*mut c_void>(),
+        extension_start: ptr::null_mut(),
+        client,
+        program,
+        compile_options: compile_options.as_ptr() as *const c_char,
+        compile_options_size: compile_options.len(),
+        executable: ptr::null_mut(),
+    }
+}
+
+fn single_device_execute_args(
+    (executable, execute_device): (*mut c_void, *mut c_void),
+    options: *mut PjrtExecuteOptions,
+    (argument_lists, num_args): (*const *const *mut c_void, usize),
+    output_lists: *const *mut *mut c_void,
+    device_complete_events: *mut *mut c_void,
+) -> Result<PjrtLoadedExecutableExecuteArgs> {
+    ensure!(
+        !execute_device.is_null(),
+        "PJRT_LoadedExecutable_Execute execute_device is null"
+    );
+    Ok(PjrtLoadedExecutableExecuteArgs {
+        struct_size: offset_of!(PjrtLoadedExecutableExecuteArgs, execute_device)
+            + size_of::<*mut c_void>(),
+        extension_start: ptr::null_mut(),
+        executable,
+        options,
+        argument_lists,
+        num_devices: 1,
+        num_args,
+        output_lists,
+        device_complete_events,
+        execute_device,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read_usize_at<T>(val: &T, offset: usize) -> usize {
+        let bytes =
+            unsafe { slice::from_raw_parts(ptr::from_ref(val).cast::<u8>(), size_of::<T>()) };
+        let mut raw = [0u8; size_of::<usize>()];
+        raw.copy_from_slice(&bytes[offset..offset + size_of::<usize>()]);
+        usize::from_ne_bytes(raw)
+    }
 
     #[test]
     fn pjrt_abi_struct_sizes_and_slot_offsets_match_header() {
@@ -1730,5 +1815,139 @@ mod tests {
         assert_eq!(BufferType::Bf16 as i32, 13);
         assert_eq!(HostSemantics::ImmutableOnlyDuringCall as i32, 0);
         assert_eq!(HostSemantics::ImmutableUntilTransferCompletes as i32, 1);
+    }
+
+    #[test]
+    fn single_device_compile_options_and_execute_args_carry_selected_device() -> Result<()> {
+        let opts_dev0 = single_device_compile_options(0)?;
+        let opts_dev3 = single_device_compile_options(3)?;
+        let opts_dev130 = single_device_compile_options(130)?;
+
+        // CompileOptionsProto(3) -> ExecutableBuildOptionsProto(1=-1, 4=1, 5=1, 9=DeviceAssignmentProto(1=1, 2=1, 3=[3])).
+        let expected_dev3: [u8; 28] = [
+            0x1a, 0x1a, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x20,
+            0x01, 0x28, 0x01, 0x4a, 0x09, 0x08, 0x01, 0x10, 0x01, 0x1a, 0x03, 0x0a, 0x01, 0x03,
+        ];
+        assert_eq!(opts_dev3, expected_dev3);
+        assert_eq!(opts_dev0[..27], expected_dev3[..27]);
+        assert_eq!(opts_dev0[27], 0x00);
+        assert_ne!(opts_dev3, opts_dev0);
+        assert_eq!(opts_dev130.len(), 29);
+        assert_eq!(&opts_dev130[25..], &[0x0a, 0x02, 0x82, 0x01]);
+        assert!(single_device_compile_options(-1).is_err());
+
+        // Inspect raw C struct bytes for PJRT_Client_Compile_Args.
+        let mut fake_client = 0x1111usize;
+        let program = PjrtProgram {
+            struct_size: offset_of!(PjrtProgram, format_size) + size_of::<usize>(),
+            extension_start: ptr::null_mut(),
+            code: ptr::null_mut(),
+            code_size: 0,
+            format: ptr::null(),
+            format_size: 0,
+        };
+        let compile_args = client_compile_args(
+            ptr::from_mut(&mut fake_client).cast::<c_void>(),
+            &program,
+            &opts_dev3,
+        );
+        assert_eq!(
+            read_usize_at(
+                &compile_args,
+                offset_of!(PjrtClientCompileArgs, struct_size)
+            ),
+            offset_of!(PjrtClientCompileArgs, executable) + size_of::<*mut c_void>()
+        );
+        let raw_opts_ptr = read_usize_at(
+            &compile_args,
+            offset_of!(PjrtClientCompileArgs, compile_options),
+        );
+        let raw_opts_len = read_usize_at(
+            &compile_args,
+            offset_of!(PjrtClientCompileArgs, compile_options_size),
+        );
+        assert_eq!(raw_opts_ptr, opts_dev3.as_ptr() as usize);
+        assert_eq!(raw_opts_len, opts_dev3.len());
+        let raw_opts_slice =
+            unsafe { slice::from_raw_parts(raw_opts_ptr as *const u8, raw_opts_len) };
+        assert_eq!(raw_opts_slice, expected_dev3);
+
+        // Inspect raw C struct bytes for PJRT_LoadedExecutable_Execute_Args.
+        let mut fake_exec = 0x2222usize;
+        let mut fake_dev0 = 0x3000usize;
+        let mut fake_dev3 = 0x3003usize;
+        let addressable = [
+            ptr::from_mut(&mut fake_dev0).cast::<c_void>(),
+            ptr::from_mut(&mut fake_dev3).cast::<c_void>(),
+        ];
+        let mut options = PjrtExecuteOptions {
+            struct_size: offset_of!(PjrtExecuteOptions, num_custom_options) + size_of::<usize>(),
+            extension_start: ptr::null_mut(),
+            send_callbacks: ptr::null_mut(),
+            recv_callbacks: ptr::null_mut(),
+            num_send_ops: 0,
+            num_recv_ops: 0,
+            launch_id: 0,
+            non_donatable_input_indices: ptr::null(),
+            num_non_donatable_input_indices: 0,
+            context: ptr::null_mut(),
+            call_location: ptr::null(),
+            num_tasks: 0,
+            task_ids: ptr::null_mut(),
+            incarnation_ids: ptr::null_mut(),
+            multi_slice_config: ptr::null_mut(),
+            use_major_to_minor_data_layout_for_callbacks: false,
+            hlo_output_callbacks: ptr::null_mut(),
+            num_hlo_output_callbacks: 0,
+            custom_options: ptr::null(),
+            num_custom_options: 0,
+        };
+        let mut event: *mut c_void = ptr::null_mut();
+        let exec_args = single_device_execute_args(
+            (
+                ptr::from_mut(&mut fake_exec).cast::<c_void>(),
+                addressable[1],
+            ),
+            &mut options,
+            (ptr::null(), 0),
+            ptr::null(),
+            &mut event,
+        )?;
+        assert_eq!(
+            read_usize_at(
+                &exec_args,
+                offset_of!(PjrtLoadedExecutableExecuteArgs, struct_size)
+            ),
+            offset_of!(PjrtLoadedExecutableExecuteArgs, execute_device) + size_of::<*mut c_void>()
+        );
+        assert_eq!(
+            read_usize_at(
+                &exec_args,
+                offset_of!(PjrtLoadedExecutableExecuteArgs, num_devices)
+            ),
+            1
+        );
+        let raw_exec_device = read_usize_at(
+            &exec_args,
+            offset_of!(PjrtLoadedExecutableExecuteArgs, execute_device),
+        );
+        assert_eq!(raw_exec_device, addressable[1] as usize);
+        assert_ne!(raw_exec_device, 0);
+        assert_ne!(raw_exec_device, addressable[0] as usize);
+
+        assert!(
+            single_device_execute_args(
+                (
+                    ptr::from_mut(&mut fake_exec).cast::<c_void>(),
+                    ptr::null_mut()
+                ),
+                &mut options,
+                (ptr::null(), 0),
+                ptr::null(),
+                &mut event,
+            )
+            .is_err()
+        );
+        Ok(())
     }
 }

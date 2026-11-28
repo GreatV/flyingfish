@@ -81,6 +81,10 @@ impl TpuDevice {
             addressable.len()
         );
         let device = addressable[device_index];
+        ensure!(
+            !device.is_null(),
+            "TPU addressable device {device_index} handle is null"
+        );
         let desc = api.device_description(device)?;
         let device_id = api.description_id(desc)?;
         let local_hardware_id = api.device_local_hardware_id(device)?;
@@ -127,11 +131,15 @@ impl TpuDevice {
     }
 
     pub fn compile_mlir(&self, mlir: &str) -> Result<TpuExecutable> {
-        let handle = self.inner.api.compile_mlir(self.inner.client, mlir)?;
+        let handle =
+            self.inner
+                .api
+                .compile_mlir(self.inner.client, self.attributes.device_id, mlir)?;
         let (num_outputs, compiled_memory_stats) =
             self.inner.api.loaded_executable_metadata(handle)?;
         Ok(TpuExecutable {
             inner: Rc::clone(&self.inner),
+            device: self.device,
             handle,
             num_outputs,
             compiled_memory_stats: compiled_memory_stats.ok(),
@@ -471,6 +479,7 @@ impl Drop for TpuEvent {
 
 pub struct TpuExecutable {
     inner: Rc<ClientInner>,
+    device: *mut c_void,
     handle: *mut c_void,
     pub num_outputs: usize,
     pub compiled_memory_stats: Option<CompiledMemoryStats>,
@@ -499,10 +508,12 @@ impl TpuExecutable {
             output_byte_lens.len()
         );
         let handles: Vec<*mut c_void> = inputs.iter().map(|b| b.handle).collect();
-        let (raw_outs, event_handle) =
-            self.inner
-                .api
-                .execute_single_device_async(self.handle, &handles, self.num_outputs)?;
+        let (raw_outs, event_handle) = self.inner.api.execute_single_device_async(
+            self.handle,
+            self.device,
+            &handles,
+            self.num_outputs,
+        )?;
         let outputs = raw_outs
             .into_iter()
             .zip(output_byte_lens.iter().copied())
