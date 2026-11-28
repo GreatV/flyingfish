@@ -3092,3 +3092,144 @@ fn diffusion_trajectory_gpu() -> Result<()> {
     #[cfg(not(feature = "cuda"))]
     anyhow::bail!("CUDA feature required");
 }
+
+#[test]
+#[ignore = "GPU; proves CPU Philox words/uniforms bit-match CUDA and Box-Muller normals match libdevice ULP bounds"]
+fn philox_image_noise_cpu_matches_cuda_kernel_gpu() -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        use crate::backend::cuda::{Device, cubin, ops};
+        use crate::minimax_h3::{STREAM_IMAGE_NOISE, image_noise_draw, philox_uniform_f32};
+
+        // 2026-11-26 correction: `philox_words` / `philox_uniform_f32` matches CUDA `philox_uniform_f32` at 0 differing bits;
+        // Box-Muller normals use documented CUDA libdevice f32 bounds (`logf <= 1 ULP`, `sqrtf = 0`, `sinf`/`cosf <= 2 ULP`,
+        // plus multiply rounding <= 0.5 ULP -> <= 4 ULP total) against host libm.
+        const MAX_NORMAL_ULP: u32 = 4;
+        const MAX_NORMAL_ABS: f64 = 2.0e-6;
+        const MAX_NORMAL_REL_L2: f64 = 2.0e-7;
+
+        let ulp_diff = |a: f32, b: f32| -> u32 {
+            let ord = |x: f32| -> u32 {
+                let u = x.to_bits();
+                if (u & 0x8000_0000) != 0 {
+                    !u
+                } else {
+                    u | 0x8000_0000
+                }
+            };
+            ord(a).abs_diff(ord(b))
+        };
+
+        let dev = Device::new(0)?;
+        let s = &dev.stream;
+        let sample = cubin::module(&dev.ctx, "sample")?;
+        let uniform_f32 = sample.load_function("philox_uniform_f32")?;
+        let normal_f32 = sample.load_function("philox_normal_f32")?;
+
+        // Production 2048x2048 H3-Image latent extent: 24 * 128 * 128 = 393,216 floats.
+        let count = 24usize * 128 * 128;
+        let seed = 42u64;
+        let grid = ops::grid(count.div_ceil(4).div_ceil(256).max(1), 256);
+
+        // 1. Exact 0-bit check on Philox words & [0, 1) uniforms.
+        let cpu_u = philox_uniform_f32(seed, STREAM_IMAGE_NOISE, count);
+        ensure!(cpu_u.len() == count, "CPU Philox uniform length mismatch");
+        let gpu_u_buf = s.alloc_zeros::<f32>(count)?;
+        unsafe {
+            s.launch_builder(&uniform_f32)
+                .arg(&seed)
+                .arg(&STREAM_IMAGE_NOISE)
+                .arg(&gpu_u_buf)
+                .arg(&(count as i64))
+                .launch(grid)?;
+        }
+        let gpu_u = s.clone_dtoh(&gpu_u_buf)?;
+        let mut uniform_bit_diffs = 0usize;
+        let mut first_u_diff = None;
+        for (i, (&c, &g)) in cpu_u.iter().zip(&gpu_u).enumerate() {
+            if c.to_bits() != g.to_bits() {
+                uniform_bit_diffs += 1;
+                if first_u_diff.is_none() {
+                    first_u_diff = Some((i, c.to_bits(), g.to_bits()));
+                }
+            }
+        }
+        let neg_u = philox_uniform_f32(seed + 1, STREAM_IMAGE_NOISE, count);
+        let neg_u_diffs = neg_u
+            .iter()
+            .zip(&gpu_u)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+
+        // 2. Box-Muller standard normals against documented CUDA libdevice ULP bounds.
+        let cpu_n = image_noise_draw(seed, count);
+        ensure!(cpu_n.len() == count, "CPU Philox normal length mismatch");
+        let gpu_n_buf = s.alloc_zeros::<f32>(count)?;
+        unsafe {
+            s.launch_builder(&normal_f32)
+                .arg(&seed)
+                .arg(&STREAM_IMAGE_NOISE)
+                .arg(&gpu_n_buf)
+                .arg(&(count as i64))
+                .launch(grid)?;
+        }
+        let gpu_n = s.clone_dtoh(&gpu_n_buf)?;
+
+        let mut normal_bit_diffs = 0usize;
+        let mut max_ulp = 0u32;
+        let mut max_abs = 0.0f64;
+        let mut sq_err = 0.0f64;
+        let mut sq_ref = 0.0f64;
+        let mut first_n_diff = None;
+        for (i, (&c, &g)) in cpu_n.iter().zip(&gpu_n).enumerate() {
+            ensure!(
+                c.is_finite() && g.is_finite(),
+                "non-finite Philox normal at {i}"
+            );
+            let d = (f64::from(c) - f64::from(g)).abs();
+            max_abs = max_abs.max(d);
+            sq_err += d * d;
+            sq_ref += f64::from(g) * f64::from(g);
+            if c.to_bits() != g.to_bits() {
+                normal_bit_diffs += 1;
+                let ulp = ulp_diff(c, g);
+                if ulp > max_ulp {
+                    max_ulp = ulp;
+                }
+                if first_n_diff.is_none() {
+                    first_n_diff = Some((i, c, g, c.to_bits(), g.to_bits()));
+                }
+            }
+        }
+        let rel_l2 = (sq_err / sq_ref).sqrt();
+        let neg_n = image_noise_draw(seed + 1, count);
+        let neg_n_diffs = neg_n
+            .iter()
+            .zip(&gpu_n)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+
+        println!(
+            "PHILOX_IMAGE_CPU_VS_CUDA count={count} seed={seed} stream={STREAM_IMAGE_NOISE} uniform_bit_diffs={uniform_bit_diffs} uniform_neg_diffs={neg_u_diffs} normal_bit_diffs={normal_bit_diffs} max_ulp={max_ulp} max_abs={max_abs:.6e} rel_l2={rel_l2:.6e} first_normal_diff={first_n_diff:?} neg_seed_diffs={neg_n_diffs}"
+        );
+        ensure!(
+            uniform_bit_diffs == 0,
+            "CPU philox_uniform_f32 differed from CUDA on {uniform_bit_diffs}/{count} entries (first={first_u_diff:?})"
+        );
+        ensure!(
+            neg_u_diffs > count - 64,
+            "uniform negative control seed+1 only differed on {neg_u_diffs}/{count} entries"
+        );
+        ensure!(
+            max_ulp <= MAX_NORMAL_ULP && max_abs <= MAX_NORMAL_ABS && rel_l2 <= MAX_NORMAL_REL_L2,
+            "CPU image_noise_draw exceeded libdevice ULP bound vs CUDA philox_normal_f32: max_ulp={max_ulp} (limit {MAX_NORMAL_ULP}), max_abs={max_abs:.6e}, rel_l2={rel_l2:.6e}"
+        );
+        ensure!(
+            neg_n_diffs == count,
+            "normal negative control seed+1 differed on {neg_n_diffs}/{count} entries (expected {count})"
+        );
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    anyhow::bail!("CUDA feature required");
+}

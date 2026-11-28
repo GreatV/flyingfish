@@ -571,17 +571,19 @@ fn main() {
     fs::write(out.join("gdn_cw_p2_shared.rs"), cw).expect("write chunkwise P2 constants");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CUDA");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_ROCM");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_TPU");
     let cuda = env::var_os("CARGO_FEATURE_CUDA").is_some();
     let rocm = env::var_os("CARGO_FEATURE_ROCM").is_some();
+    let tpu = env::var_os("CARGO_FEATURE_TPU").is_some();
     assert!(
-        !(cuda && rocm),
-        "features `cuda` and `rocm` are mutually exclusive"
+        usize::from(cuda) + usize::from(rocm) + usize::from(tpu) <= 1,
+        "features `cuda`, `rocm`, and `tpu` are mutually exclusive"
     );
     if rocm {
         build_rocm(&out);
         return;
     }
-    if env::var_os("CARGO_FEATURE_CUDA").is_none() {
+    if tpu || !cuda {
         return;
     }
     println!("cargo:rerun-if-changed=src/build_arch.rs");

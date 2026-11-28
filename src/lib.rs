@@ -1,5 +1,9 @@
-#[cfg(all(feature = "cuda", feature = "rocm"))]
-compile_error!("features `cuda` and `rocm` are mutually exclusive");
+#[cfg(any(
+    all(feature = "cuda", feature = "rocm"),
+    all(feature = "cuda", feature = "tpu"),
+    all(feature = "rocm", feature = "tpu"),
+))]
+compile_error!("features `cuda`, `rocm`, and `tpu` are mutually exclusive");
 
 #[derive(Clone, Debug)]
 pub struct RunOptions {
