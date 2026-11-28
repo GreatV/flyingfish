@@ -381,6 +381,9 @@ pub(crate) struct DenseStage<'a> {
     pub visits: usize,
     pub load_scratch: usize,
     pub device_staging: usize,
+    pub fill_largest: &'a [usize],
+    pub fill_workers: usize,
+    pub resident_preload_bytes: usize,
 }
 
 /// Host bytes a disk supply holds while `disk_layers` of a plan stay on disk: one slot of
@@ -513,6 +516,10 @@ impl DenseStage<'_> {
         rates: (f64, f64),
         ring_workers: usize,
     ) -> Result<HostOptions> {
+        ensure!(
+            self.fill_largest.is_empty() || self.fill_largest.len() == self.source.len(),
+            "dense stage fill tensor count differs from layer count"
+        );
         let disk_layers = plan.slots.iter().flatten().count();
         let ring_slot = plan.slot_bytes.max(self.device_staging);
         let reserve = |pinned: usize| {
@@ -528,14 +535,22 @@ impl DenseStage<'_> {
         let mut choices = vec![HostChoice {
             held: full,
             reserve: full,
+            fill_bounce: 0,
             layers: 0,
             seconds: self.price(&plan, rates),
         }];
         let mut layers = 0;
+        let mut max_fill_tensor = 0usize;
         for layer in 0..plan.slots.len() {
             if plan.slots[layer].is_some() {
                 self.pin(&mut plan, layer);
                 layers += 1;
+                max_fill_tensor =
+                    max_fill_tensor.max(self.fill_largest.get(layer).copied().unwrap_or(0));
+                let fill_bounce = self
+                    .fill_workers
+                    .checked_mul(max_fill_tensor)
+                    .context("resident fill bounce overflow")?;
                 let reserve = reserve(layers)?;
                 choices.push(HostChoice {
                     held: plan
@@ -543,22 +558,26 @@ impl DenseStage<'_> {
                         .checked_add(reserve)
                         .context("resident host tier extent overflow")?,
                     reserve,
+                    fill_bounce,
                     layers,
                     seconds: self.price(&plan, rates),
                 });
             }
         }
-        // A choice that another matches on seconds, held bytes and pinned layers, with one of
-        // them lower, leaves the set; the pinned layers are the device mapping pages it needs.
+        // A choice that another matches on seconds, held bytes, fill bounce and pinned layers,
+        // with one of them lower, leaves the set; the pinned layers are the device mapping pages
+        // it needs.
         let dominated = |index: usize| {
             let choice = &choices[index];
             choices.iter().enumerate().any(|(other, rival)| {
                 other != index
                     && rival.seconds <= choice.seconds
                     && rival.held <= choice.held
+                    && rival.fill_bounce <= choice.fill_bounce
                     && rival.layers <= choice.layers
                     && (rival.seconds < choice.seconds
                         || rival.held < choice.held
+                        || rival.fill_bounce < choice.fill_bounce
                         || rival.layers < choice.layers)
             })
         };
@@ -593,6 +612,7 @@ struct HostChoice {
     /// Host bytes the choice holds: its pinned tiers and its supply.
     held: usize,
     reserve: usize,
+    fill_bounce: usize,
     layers: usize,
     seconds: f64,
 }
@@ -639,6 +659,66 @@ pub(crate) struct PricedDense {
     pub device_bytes: [usize; 3],
     pub decoder_resident_seconds: Option<f64>,
     pub decoder_streamed_seconds: Option<f64>,
+    pub keeps_preload_ring: bool,
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[derive(Default)]
+struct BestDense {
+    best: Option<(f64, [DensePlacement; 3], [usize; 3])>,
+    decoder_resident_seconds: Option<f64>,
+    decoder_streamed_seconds: Option<f64>,
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+impl BestDense {
+    fn record(
+        &mut self,
+        stages: [DenseStage<'_>; 3],
+        base: [&DensePlacement; 3],
+        device_base: [usize; 3],
+        chosen: [&HostChoice; 3],
+        (decoder_dispatch, device_page): (f64, usize),
+    ) {
+        let seconds = chosen[0].seconds + chosen[1].seconds + chosen[2].seconds + decoder_dispatch;
+        let alternative = if base[2].slot_bytes == 0 {
+            &mut self.decoder_resident_seconds
+        } else {
+            &mut self.decoder_streamed_seconds
+        };
+        if alternative.is_none_or(|other| seconds < other) {
+            *alternative = Some(seconds);
+        }
+        if self
+            .best
+            .as_ref()
+            .is_none_or(|(previous, _, _)| seconds < *previous)
+        {
+            self.best = Some((
+                seconds,
+                [
+                    stages[0].pin_layers(base[0], chosen[0].layers),
+                    stages[1].pin_layers(base[1], chosen[1].layers),
+                    stages[2].pin_layers(base[2], chosen[2].layers),
+                ],
+                [
+                    device_base[0] + chosen[0].layers * device_page,
+                    device_base[1] + chosen[1].layers * device_page,
+                    device_base[2] + chosen[2].layers * device_page,
+                ],
+            ));
+        }
+    }
+
+    fn finish(self, keeps_preload_ring: bool) -> Option<PricedDense> {
+        self.best.map(|(_, plans, device_bytes)| PricedDense {
+            plans,
+            device_bytes,
+            decoder_resident_seconds: self.decoder_resident_seconds,
+            decoder_streamed_seconds: self.decoder_streamed_seconds,
+            keeps_preload_ring,
+        })
+    }
 }
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -704,9 +784,8 @@ pub(crate) fn try_price_dense_stages(
             .map(|(_, plan)| stages[2].host_options(plan, rates, ring_workers))
             .collect::<Result<Vec<_>>>()?,
     ];
-    let mut best = None;
-    let mut decoder_resident_seconds: Option<f64> = None;
-    let mut decoder_streamed_seconds: Option<f64> = None;
+    let mut with_ring = BestDense::default();
+    let mut fallback = BestDense::default();
     for (i, (d0, c0)) in choices[0].iter().enumerate() {
         for (j, (d1, c1)) in choices[1].iter().enumerate() {
             for (k, (d2, c2)) in choices[2].iter().enumerate() {
@@ -725,6 +804,11 @@ pub(crate) fn try_price_dense_stages(
                 else {
                     continue;
                 };
+                let preload_bytes = if c2.resident_bytes > 0 {
+                    stages[2].resident_preload_bytes
+                } else {
+                    0
+                };
                 for first in firsts.fitting(room) {
                     let Some(mappings) = mapping_capacity.checked_sub(first.layers) else {
                         continue;
@@ -735,48 +819,43 @@ pub(crate) fn try_price_dense_stages(
                             continue;
                         };
                         let room = host_limit - first.held - second.held;
-                        let Some(last) = decoder.last_fitting(room, mappings) else {
-                            continue;
-                        };
-                        let seconds =
-                            first.seconds + second.seconds + last.seconds + decoder_dispatch[k];
-                        let alternative = if c2.slot_bytes == 0 {
-                            &mut decoder_resident_seconds
-                        } else {
-                            &mut decoder_streamed_seconds
-                        };
-                        if alternative.is_none_or(|other| seconds < other) {
-                            *alternative = Some(seconds);
-                        }
-                        if best
-                            .as_ref()
-                            .is_none_or(|(previous, _, _)| seconds < *previous)
+                        let coexisting = first
+                            .fill_bounce
+                            .checked_add(second.fill_bounce)
+                            .and_then(|n| n.checked_add(preload_bytes))
+                            .context("resident preload coexisting host bytes overflow")?;
+                        if let Some(ring_room) = room.checked_sub(coexisting)
+                            && let Some(last) = decoder.last_fitting(ring_room, mappings)
                         {
-                            best = Some((
-                                seconds,
-                                [
-                                    stages[0].pin_layers(c0, first.layers),
-                                    stages[1].pin_layers(c1, second.layers),
-                                    stages[2].pin_layers(c2, last.layers),
-                                ],
-                                [
-                                    d0 + first.layers * device_page,
-                                    d1 + second.layers * device_page,
-                                    d2 + last.layers * device_page,
-                                ],
-                            ));
+                            with_ring.record(
+                                stages,
+                                [c0, c1, c2],
+                                [*d0, *d1, *d2],
+                                [first, second, last],
+                                (decoder_dispatch[k], device_page),
+                            );
+                        }
+                        if with_ring.best.is_none()
+                            && let Some(last) = decoder.last_fitting(room, mappings)
+                        {
+                            fallback.record(
+                                stages,
+                                [c0, c1, c2],
+                                [*d0, *d1, *d2],
+                                [first, second, last],
+                                (decoder_dispatch[k], device_page),
+                            );
                         }
                     }
                 }
             }
         }
     }
-    Ok(best.map(|(_, plans, device_bytes)| PricedDense {
-        plans,
-        device_bytes,
-        decoder_resident_seconds,
-        decoder_streamed_seconds,
-    }))
+    if with_ring.best.is_some() {
+        Ok(with_ring.finish(true))
+    } else {
+        Ok(fallback.finish(false))
+    }
 }
 
 #[cfg(test)]
@@ -795,6 +874,9 @@ mod tests {
                 visits: 1,
                 load_scratch: 1000,
                 device_staging: 0,
+                fill_largest: &[],
+                fill_workers: 0,
+                resident_preload_bytes: 0,
             },
             DenseStage {
                 device: &dit,
@@ -802,6 +884,9 @@ mod tests {
                 visits: 6,
                 load_scratch: 600,
                 device_staging: 0,
+                fill_largest: &[],
+                fill_workers: 0,
+                resident_preload_bytes: 0,
             },
             DenseStage {
                 device: &decoder,
@@ -809,6 +894,9 @@ mod tests {
                 visits: 1,
                 load_scratch: 400,
                 device_staging: 0,
+                fill_largest: &[],
+                fill_workers: 0,
+                resident_preload_bytes: 0,
             },
         ];
         let slow_pcie = price_dense_stages(stages, (6032, 9000, 1), (1.0, 100.0), 2)?;
@@ -825,6 +913,9 @@ mod tests {
             visits: 1,
             load_scratch: 0,
             device_staging: 0,
+            fill_largest: &[],
+            fill_workers: 0,
+            resident_preload_bytes: 0,
         };
         let full = price_dense_stages([streamed; 3], (72, 150, 4), (100.0, 1.0), 2)?;
         assert_eq!(full.device_bytes, [24; 3]);
@@ -864,6 +955,9 @@ mod tests {
             visits: 1,
             load_scratch: 100,
             device_staging: 0,
+            fill_largest: &[],
+            fill_workers: 0,
+            resident_preload_bytes: 0,
         };
         let stages = [three, small, small];
         let equal = price_dense_stages(stages, (2021, 3000, 1), (1.0, 100.0), 4)?;
@@ -881,6 +975,9 @@ mod tests {
             visits: 1,
             load_scratch: 0,
             device_staging: 0,
+            fill_largest: &[],
+            fill_workers: 0,
+            resident_preload_bytes: 0,
         };
         let stages = [three, tiny, tiny];
         let tied = price_dense_stages(stages, (2021, 3300, 1), (1.0, 100.0), 4)?;
@@ -923,6 +1020,9 @@ mod tests {
                     visits: 1,
                     load_scratch: 262_144_000,
                     device_staging: 0,
+                    fill_largest: &[],
+                    fill_workers: 0,
+                    resident_preload_bytes: 0,
                 },
                 DenseStage {
                     device: &dit,
@@ -930,6 +1030,9 @@ mod tests {
                     visits: dit_visits,
                     load_scratch: 262_144_000,
                     device_staging: 0,
+                    fill_largest: &[],
+                    fill_workers: 0,
+                    resident_preload_bytes: 0,
                 },
                 DenseStage {
                     device: &decoder,
@@ -937,6 +1040,9 @@ mod tests {
                     visits: 1,
                     load_scratch: 16_777_216,
                     device_staging: 1_615_562_080,
+                    fill_largest: &[],
+                    fill_workers: 0,
+                    resident_preload_bytes: 0,
                 },
             ]
         };
@@ -1072,6 +1178,9 @@ mod tests {
                     visits: 1,
                     load_scratch: 100,
                     device_staging: 0,
+                    fill_largest: &[],
+                    fill_workers: 0,
+                    resident_preload_bytes: 0,
                 },
                 DenseStage {
                     device: &tiny,
@@ -1079,6 +1188,9 @@ mod tests {
                     visits: 1,
                     load_scratch: 1,
                     device_staging: 0,
+                    fill_largest: &[],
+                    fill_workers: 0,
+                    resident_preload_bytes: 0,
                 },
                 DenseStage {
                     device: &tiny,
@@ -1086,6 +1198,9 @@ mod tests {
                     visits: 1,
                     load_scratch: 1,
                     device_staging: 0,
+                    fill_largest: &[],
+                    fill_workers: 0,
+                    resident_preload_bytes: 0,
                 },
             ];
             price_dense_stages(stages, (2004 + layers, host, 1), (100.0, 1.0), 4)

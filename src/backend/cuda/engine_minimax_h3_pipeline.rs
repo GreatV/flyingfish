@@ -5,8 +5,8 @@ use super::super::vision_runtime::LayerNormTower;
 use super::audio::AudioDecoder;
 use super::vae::{
     EncodeWork, ImageDecodeStage, ImageEncodeSetup, ImageEncodeStage, KeyframeEncoder, LatentVideo,
-    TileWork, VideoDecoder, decode_bytes, decoder_layer_sizes, decoder_weight_bytes,
-    image_vae_manifest,
+    TileWork, VideoDecoder, decode_bytes, decoder_layer_sizes, decoder_preload_ring_bytes,
+    decoder_weight_bytes, image_vae_manifest,
 };
 use super::{
     AdalnTable, BlockContext, BlockKernels, Conditioner, ConditionerInput, ConditionerPrompt, Dit,
@@ -1675,16 +1675,25 @@ impl DecoderVisitCost {
                 "source_bytes": demand(false), "disk_bytes": demand(true),
                 "decoder_weight_bytes": visits * self.weight_bytes,
                 "decoder_launches": visits * (self.launches + 12 * streamed),
-                "decoder_stream_handoffs": visits * 2 * streamed, "seconds": seconds,
+                "decoder_stream_handoffs": visits * 2 * streamed,
+                "keeps_preload_ring": priced.keeps_preload_ring, "seconds": seconds,
             }));
-            if best
-                .as_ref()
-                .is_none_or(|(previous, ..): &(f64, usize, usize, PricedDense)| seconds < *previous)
-            {
-                best = Some((seconds, batch, stage_limit, priced));
+            if best.as_ref().is_none_or(
+                |(prev_ring, previous, ..): &(bool, f64, usize, usize, PricedDense)| {
+                    (priced.keeps_preload_ring && !*prev_ring)
+                        || (priced.keeps_preload_ring == *prev_ring && seconds < *previous)
+                },
+            ) {
+                best = Some((
+                    priced.keeps_preload_ring,
+                    seconds,
+                    batch,
+                    stage_limit,
+                    priced,
+                ));
             }
         }
-        let (_, batch, device_budget, priced) = best.with_context(|| format!(
+        let (_, _, batch, device_budget, priced) = best.with_context(|| format!(
             "resident video has no decoder group and dense placement within device={stage_and_work} host={host} bytes"
         ))?;
         Ok((batch, device_budget, priced, alternatives))
@@ -2070,6 +2079,8 @@ impl VideoSession {
             Conditioner::resident_fixed_bytes(&device, &text_spec, (TEXT_ENCODER_LAYER, count))?;
         let ([decoder_layers, decoder_source], decoder_fixed, decoder_largest) =
             decoder_layer_sizes(&vae_manifest, vae.layers);
+        let decoder_preload_ring =
+            decoder_preload_ring_bytes(&device.info.arch, &vae_dir, &vae_manifest)?;
         let decoder_staging = *decoder_source
             .iter()
             .max()
@@ -2100,6 +2111,13 @@ impl VideoSession {
                     .zip(sizing.source_layers.iter().copied())
                     .filter(|&(_, source)| source != 0)
                     .unzip();
+                let dit_fill_largest: Vec<_> = sizing
+                    .fill_largest
+                    .iter()
+                    .copied()
+                    .zip(sizing.source_layers.iter().copied())
+                    .filter_map(|(largest, source)| (source != 0).then_some(largest))
+                    .collect();
                 let fixed = fixed + stored_allocation_bytes(owned, page)?;
                 let stages = [
                     DenseStage {
@@ -2108,6 +2126,9 @@ impl VideoSession {
                         visits: 1,
                         load_scratch: text_largest,
                         device_staging: 0,
+                        fill_largest: &[],
+                        fill_workers: 0,
+                        resident_preload_bytes: 0,
                     },
                     DenseStage {
                         device: &dit_layers,
@@ -2115,6 +2136,9 @@ impl VideoSession {
                         visits: evaluations,
                         load_scratch: sizing.largest,
                         device_staging: 0,
+                        fill_largest: &dit_fill_largest,
+                        fill_workers: sizing.fill_workers,
+                        resident_preload_bytes: 0,
                     },
                     DenseStage {
                         device: &decoder_layers,
@@ -2122,6 +2146,9 @@ impl VideoSession {
                         visits: decode_geometry.chunks,
                         load_scratch: decoder_largest,
                         device_staging: decoder_staging,
+                        fill_largest: &[],
+                        fill_workers: 0,
+                        resident_preload_bytes: decoder_preload_ring,
                     },
                 ];
                 let floors = stages.iter().try_fold(fixed + transient, |sum, stage| {
@@ -2180,7 +2207,16 @@ impl VideoSession {
                     device_bytes,
                     decoder_resident_seconds,
                     decoder_streamed_seconds,
+                    keeps_preload_ring,
                 } = priced;
+                let dit_fill_bounce = sizing.fill_workers
+                    * dit
+                        .host
+                        .iter()
+                        .zip(&dit_fill_largest)
+                        .filter_map(|(&pinned, &largest)| pinned.then_some(largest))
+                        .max()
+                        .unwrap_or(0);
                 let demand = |plan: &DensePlacement, visits: usize| {
                     serde_json::json!({
                         "source_bytes": visits * (plan.host_bytes + plan.disk_bytes),
@@ -2192,6 +2228,9 @@ impl VideoSession {
                     serde_json::json!({"h3_video_resident_plan": {
                         "device_budget": device_budget, "host_budget": host, "transient_bytes": transient,
                         "shared_ffn_rgb_bytes": decode_geometry.rgb_bytes, "rgb_d2h_staging_bytes": rgb_staging_bytes,
+                        "dit_fill_bounce_bytes": dit_fill_bounce,
+                        "decoder_preload_ring_bytes": if decoder.resident_bytes > 0 { decoder_preload_ring } else { 0 },
+                        "keeps_decoder_preload_ring": keeps_preload_ring,
                         "decoder_group_prices": alternatives,
                         "decoder_launch_seconds": visit.launch_seconds, "decoder_handoff_seconds": visit.handoff_seconds,
                         "device_memory_bytes_per_second": device.info.memory_bytes_per_second,
@@ -2509,6 +2548,8 @@ impl ImageSession {
         let vae = vae_spec.single_frame();
         let ([decoder_layers, decoder_source], decoder_fixed, decoder_largest) =
             decoder_layer_sizes(&vae_manifest, vae.layers);
+        let decoder_preload_ring =
+            decoder_preload_ring_bytes(&d.info.arch, &vae_dir, &vae_manifest)?;
         let decoder_staging = *decoder_source
             .iter()
             .max()
@@ -2546,6 +2587,9 @@ impl ImageSession {
                         visits: 1,
                         load_scratch: conditioner_largest,
                         device_staging: 0,
+                        fill_largest: &[],
+                        fill_workers: 0,
+                        resident_preload_bytes: 0,
                     },
                     DenseStage {
                         device: &sizing.layers,
@@ -2553,6 +2597,9 @@ impl ImageSession {
                         visits: schedule.timesteps.len(),
                         load_scratch: sizing.largest,
                         device_staging: 0,
+                        fill_largest: &sizing.fill_largest,
+                        fill_workers: sizing.fill_workers,
+                        resident_preload_bytes: 0,
                     },
                     DenseStage {
                         device: &decoder_layers,
@@ -2560,6 +2607,9 @@ impl ImageSession {
                         visits: 1,
                         load_scratch: decoder_largest,
                         device_staging: decoder_staging,
+                        fill_largest: &[],
+                        fill_workers: 0,
+                        resident_preload_bytes: decoder_preload_ring,
                     },
                 ];
                 let encoder = shape
@@ -2618,18 +2668,30 @@ impl ImageSession {
                     device_bytes,
                     decoder_resident_seconds,
                     decoder_streamed_seconds,
+                    keeps_preload_ring,
                 } = price_dense_stages(
                     stages,
                     (device, host, device_page),
                     (pcie, disk),
                     ring_workers,
                 )?;
+                let dit_fill_bounce = sizing.fill_workers
+                    * dit
+                        .host
+                        .iter()
+                        .zip(&sizing.fill_largest)
+                        .filter_map(|(&pinned, &largest)| pinned.then_some(largest))
+                        .max()
+                        .unwrap_or(0);
                 let device_after = device_fixed + temporary + device_bytes[0] + device_bytes[2];
                 eprintln!(
                     "{}",
                     serde_json::json!({"h3_image_resident_plan": {
                         "canvas": shape.canvas, "packed_rows": layout.rows(),
                         "device_free_before_placement": free, "device_budget": device, "host_available_bytes": host_available, "host_budget": host,
+                        "dit_fill_bounce_bytes": dit_fill_bounce,
+                        "decoder_preload_ring_bytes": if decode.resident_bytes > 0 { decoder_preload_ring } else { 0 },
+                        "keeps_decoder_preload_ring": keeps_preload_ring,
                         "transient_device_bytes": temporary, "decoder_fixed_gpu_bytes": decoder_fixed,
                         "pcie_bytes_per_second": pcie, "disk_bytes_per_second": disk, "disk_probe_bytes": disk_probe_bytes, "disk_ring_workers": ring_workers,
                         "device_allocation_granularity": device_page,
@@ -5197,6 +5259,9 @@ fn video_placement_sizes_decoder_groups_from_remaining_memory() -> Result<()> {
         visits: 1,
         load_scratch: 0,
         device_staging: 0,
+        fill_largest: &[],
+        fill_workers: 0,
+        resident_preload_bytes: 0,
     };
     let stages = [
         small,

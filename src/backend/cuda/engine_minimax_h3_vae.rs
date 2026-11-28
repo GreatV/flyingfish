@@ -409,6 +409,25 @@ pub(super) fn decoder_layer_sizes(
     ([device, source], fixed, largest)
 }
 
+/// Minimum host ring and bounce bytes required to preload resident decoder weights via the
+/// full-worker chunked pinned ring.
+pub(super) fn decoder_preload_ring_bytes(
+    arch: &crate::backend::setup::DeviceArchitecture,
+    dir: &Path,
+    manifest: &TensorManifest,
+) -> Result<usize> {
+    let specs: Vec<super::ResidentRingSpec> = manifest
+        .entries
+        .iter()
+        .filter(|(name, _)| name.starts_with("decoder.") || name.starts_with("post_quant_conv."))
+        .map(|(name, entry)| super::ResidentRingSpec {
+            src_bytes: entry.bytes,
+            cast: decoder_cast(arch, name),
+        })
+        .collect();
+    super::resident_ring_floor_bytes(dir, &specs)
+}
+
 pub(super) struct ImageDecodeStage {
     decoder: ImageDecoder,
     work: ImageWork,

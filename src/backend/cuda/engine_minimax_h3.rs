@@ -824,6 +824,39 @@ fn derive_resident_ring(
     Ok(serial)
 }
 
+/// Host ring and bounce bytes required for `derive_resident_ring` to admit the full-worker ring
+/// at its floor chunk size. Returns `0` when the batch is empty or has fewer than 2 chunks.
+fn resident_ring_floor_bytes_for(
+    specs: &[ResidentRingSpec],
+    drives: usize,
+    alignment: usize,
+) -> Result<usize> {
+    ensure!(
+        drives > 0 && alignment > 0 && alignment.is_power_of_two(),
+        "invalid resident ring drives={drives} alignment={alignment}"
+    );
+    let max_src = specs.iter().map(|s| s.src_bytes).max().unwrap_or(0);
+    if specs.is_empty() || max_src == 0 {
+        return Ok(0);
+    }
+    let candidates = ring_chunk_candidates(max_src);
+    let floor = *candidates.last().context("ring chunk candidates empty")?;
+    let (chunks, slot_bytes, bounce_per_worker) = ring_geometry(specs, floor, alignment)?;
+    let in_flight = (2 * drives).clamp(4, 8).min(chunks);
+    if in_flight < 2 {
+        return Ok(0);
+    }
+    slot_bytes
+        .checked_add(bounce_per_worker)
+        .and_then(|per_worker| in_flight.checked_mul(per_worker))
+        .context("resident ring floor host bytes overflow")
+}
+
+pub(super) fn resident_ring_floor_bytes(dir: &Path, specs: &[ResidentRingSpec]) -> Result<usize> {
+    let (drives, _) = block_drive_count(dir)?;
+    resident_ring_floor_bytes_for(specs, drives, align_min())
+}
+
 #[derive(Clone)]
 pub(super) struct ResidentRingRequest {
     pub(super) name: String,
@@ -5983,6 +6016,8 @@ fn disk_reader_calibration(
 struct DenseSizing {
     layers: Vec<usize>,
     source_layers: Vec<usize>,
+    fill_largest: Vec<usize>,
+    fill_workers: usize,
     largest: usize,
     staging: usize,
     transient: usize,
@@ -5993,7 +6028,10 @@ struct DenseSizing {
 fn dense_sizing(manifest: &TensorManifest, layers: usize) -> Result<DenseSizing> {
     let mut device_layers = vec![0usize; layers];
     let mut source_layers = vec![0usize; layers];
+    let mut fill_largest = vec![0usize; layers];
     let mut dequant_layer = vec![false; layers];
+    let mut shards = std::collections::BTreeSet::new();
+    let mut tensors = 0usize;
     let mut largest = 0usize;
     for (name, entry) in &manifest.entries {
         if let Some(layer) = entry.layer
@@ -6001,14 +6039,23 @@ fn dense_sizing(manifest: &TensorManifest, layers: usize) -> Result<DenseSizing>
             && entry.shape.len() == 2
         {
             let device_bytes = device_slot_bytes(name, entry)?;
-            device_layers[layer as usize] += device_bytes;
-            source_layers[layer as usize] += entry.bytes;
+            let index = layer as usize;
+            device_layers[index] += device_bytes;
+            source_layers[index] += entry.bytes;
+            fill_largest[index] = fill_largest[index].max(entry.bytes);
+            shards.insert(entry.shard.as_str());
+            tensors += 1;
             largest = largest.max(device_bytes);
             if dequantizes(entry.quant) {
-                dequant_layer[layer as usize] = true;
+                dequant_layer[index] = true;
             }
         }
     }
+    let fill_workers = if tensors > 0 {
+        fill_in_flight(shards.len(), tensors)
+    } else {
+        0
+    };
     let staging = dequant_layer
         .iter()
         .zip(&source_layers)
@@ -6025,6 +6072,8 @@ fn dense_sizing(manifest: &TensorManifest, layers: usize) -> Result<DenseSizing>
     Ok(DenseSizing {
         layers: device_layers,
         source_layers,
+        fill_largest,
+        fill_workers,
         largest,
         staging,
         transient,
@@ -23856,6 +23905,345 @@ mod h3_direct_batch_tests {
         })();
         std::fs::remove_dir_all(&root).ok();
         result
+    }
+
+    #[test]
+    fn resident_planner_keeps_vae_preload_ring_on_4090_and_tight_budgets() -> Result<()> {
+        use crate::prefill::{DenseStage, try_price_dense_stages};
+        const MIB: usize = 1 << 20;
+        const PAGE: usize = 2 << 20;
+
+        // Recorded 4090 HyperFlow (#360 q3-B1) host/device budgets and stage geometries.
+        let avail_4090 = 46_762_835_968usize;
+        let rgb_staging = 33_554_432usize;
+        let host_budget_4090 = avail_4090 - RESIDENT_RING_HOST_RESERVE - rgb_staging;
+        let device_budget_4090 = 12_679_979_008usize;
+        let rates_4090 = (19_185_568_991.886_97, 5_278_244_568.499_23);
+        let cond_layer = 975_175_680usize;
+        let cond_scratch = 262_144_000usize;
+        let cond_layers = [cond_layer; 50];
+        let dit_source = [
+            385_351_680,
+            308_252_672,
+            462_414_848,
+            385_351_680,
+            77_059_584,
+            385_351_680,
+            77_070_336,
+            77_052_416,
+            77_063_168,
+            115_551_744,
+            77_056_000,
+            77_052_416,
+            115_540_992,
+            115_576_832,
+            115_591_168,
+            192_665_088,
+            115_540_992,
+            115_562_496,
+            385_351_680,
+            308_224_000,
+            77_052_416,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            385_351_680,
+            423_872_512,
+        ];
+        let dit_device: Vec<usize> = dit_source.iter().map(|&b| b + 6_815_744).collect();
+        let dit_fill_largest = [
+            154_140_672,
+            94_158_848,
+            179_888_128,
+            154_140_672,
+            23_367_680,
+            154_140_672,
+            24_170_496,
+            32_112_640,
+            32_141_312,
+            42_377_216,
+            20_701_184,
+            31_023_104,
+            42_090_496,
+            44_900_352,
+            44_126_208,
+            65_572_864,
+            42_692_608,
+            40_628_224,
+            154_140_672,
+            87_764_992,
+            32_141_312,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+            154_140_672,
+        ];
+        let dec_device = [134_295_552usize; 36];
+        let dec_source = [268_591_104usize; 36];
+        let vae_specs = vec![
+            ResidentRingSpec {
+                src_bytes: 128 * MIB,
+                cast: FillCast::F32ToBf16,
+            };
+            72
+        ];
+        let vae_ring_floor = resident_ring_floor_bytes_for(&vae_specs, 3, 4096)?;
+        assert_eq!(vae_ring_floor, 6 * (2 * MIB + 4 * MIB + 4096));
+
+        let build_stages = |fill_workers: usize, preload_bytes: usize| {
+            [
+                DenseStage {
+                    device: &cond_layers,
+                    source: &cond_layers,
+                    visits: 1,
+                    load_scratch: cond_scratch,
+                    device_staging: 0,
+                    fill_largest: &[],
+                    fill_workers: 0,
+                    resident_preload_bytes: 0,
+                },
+                DenseStage {
+                    device: &dit_device,
+                    source: &dit_source,
+                    visits: 6,
+                    load_scratch: 154_140_672,
+                    device_staging: 0,
+                    fill_largest: &dit_fill_largest,
+                    fill_workers,
+                    resident_preload_bytes: 0,
+                },
+                DenseStage {
+                    device: &dec_device,
+                    source: &dec_source,
+                    visits: 35,
+                    load_scratch: 134_217_728,
+                    device_staging: 268_591_104,
+                    fill_largest: &[],
+                    fill_workers: 0,
+                    resident_preload_bytes: preload_bytes,
+                },
+            ]
+        };
+
+        // Control: omitting live DiT fill bounce and VAE preload ring pins 31 conditioner layers,
+        // leaving VideoDecoder::with_plan below the 4 GiB reserve so derive_resident_ring falls to serial.
+        let uncounted = try_price_dense_stages(
+            build_stages(0, 0),
+            (device_budget_4090, host_budget_4090, PAGE),
+            rates_4090,
+            0.0,
+            2,
+        )?
+        .context("uncounted 4090 plan")?;
+        let uncounted_cond_host = uncounted.plans[0].host.iter().filter(|&&h| h).count();
+        assert_eq!(uncounted_cond_host, 31);
+        let uncounted_dit_bounce = 6 * uncounted.plans[1]
+            .host
+            .iter()
+            .zip(&dit_fill_largest)
+            .filter_map(|(&h, &b)| h.then_some(b))
+            .max()
+            .unwrap_or(0);
+        assert_eq!(uncounted_dit_bounce, 924_844_032);
+        let uncounted_vae_avail = avail_4090
+            .saturating_sub(uncounted.plans[1].host_bytes)
+            .saturating_sub(uncounted.plans[0].host_bytes)
+            .saturating_sub(2 * cond_layer)
+            .saturating_sub(uncounted_dit_bounce);
+        let uncounted_ring = derive_resident_ring(
+            &vae_specs,
+            (3, 3),
+            (uncounted_vae_avail, RESIDENT_RING_HOST_RESERVE),
+            4096,
+        )?;
+        assert!(!uncounted_ring.ring);
+
+        // Fixed planner: counts live DiT fill bounce (924.8 MB) and VAE preload ring (37.8 MB),
+        // declines the 31st conditioner layer (pins 30), keeps 12 resident DiT blocks and full 6-worker ring.
+        let fixed = try_price_dense_stages(
+            build_stages(6, vae_ring_floor),
+            (device_budget_4090, host_budget_4090, PAGE),
+            rates_4090,
+            0.0,
+            2,
+        )?
+        .context("fixed 4090 plan")?;
+        assert!(fixed.keeps_preload_ring);
+        let fixed_cond_host = fixed.plans[0].host.iter().filter(|&&h| h).count();
+        let fixed_dit_res = fixed.plans[1].slots.iter().filter(|s| s.is_none()).count();
+        assert_eq!(fixed_dit_res, 12);
+        assert_eq!(fixed.plans[1].host_bytes, 9_363_594_240);
+        assert_eq!(fixed.plans[2].slot_bytes, 0);
+        assert_eq!(fixed_cond_host, 30);
+        // Even subtracting 160 MiB of pinned-page-table/CUDA overhead observed on 4090, the ring holds.
+        let fixed_vae_avail = avail_4090
+            - fixed.plans[1].host_bytes
+            - fixed.plans[0].host_bytes
+            - 2 * cond_layer
+            - 160 * MIB
+            - uncounted_dit_bounce;
+        let fixed_ring = derive_resident_ring(
+            &vae_specs,
+            (3, 3),
+            (fixed_vae_avail, RESIDENT_RING_HOST_RESERVE),
+            4096,
+        )?;
+        assert!(fixed_ring.ring);
+        assert_eq!(fixed_ring.in_flight, 6);
+
+        // Planted tight-budget boundary: 1 B below the ring-preserving threshold for 2 conditioner
+        // layers declines the 2nd layer to keep the ring; +1 B admits it and still keeps the ring.
+        let tight_cond = [100 * MIB; 6];
+        let tight_dit = [80 * MIB; 4];
+        let tight_dit_largest = [20 * MIB; 4];
+        let tight_dec = [40 * MIB; 2];
+        let tight_stages = [
+            DenseStage {
+                device: &tight_cond,
+                source: &tight_cond,
+                visits: 1,
+                load_scratch: 10 * MIB,
+                device_staging: 0,
+                fill_largest: &[],
+                fill_workers: 0,
+                resident_preload_bytes: 0,
+            },
+            DenseStage {
+                device: &tight_dit,
+                source: &tight_dit,
+                visits: 6,
+                load_scratch: 20 * MIB,
+                device_staging: 0,
+                fill_largest: &tight_dit_largest,
+                fill_workers: 4,
+                resident_preload_bytes: 0,
+            },
+            DenseStage {
+                device: &tight_dec,
+                source: &tight_dec,
+                visits: 1,
+                load_scratch: 10 * MIB,
+                device_staging: 0,
+                fill_largest: &[],
+                fill_workers: 0,
+                resident_preload_bytes: vae_ring_floor,
+            },
+        ];
+        // Device fits decoder resident (80 MiB) + dit 2 slots (164 MiB) + cond 2 slots (204 MiB)
+        // + 10 mapping pages (20 MiB), leaving no room for any resident dit or cond layer.
+        let tight_dev = 448 * MIB + 10 * PAGE;
+        // 2 cond pinned (200 MiB) + 2 cond supply (220 MiB) + 4 dit pinned (320 MiB)
+        // + dit bounce (4 * 20 MiB = 80 MiB) + vae_ring_floor.
+        let exact_for_two =
+            2 * 100 * MIB + 2 * 110 * MIB + 4 * 80 * MIB + 4 * 20 * MIB + vae_ring_floor;
+        let one_short = try_price_dense_stages(
+            tight_stages,
+            (tight_dev, exact_for_two - 1, PAGE),
+            (19.0e9, 4.0e9),
+            0.0,
+            2,
+        )?
+        .context("tight one-short plan")?;
+        assert!(one_short.keeps_preload_ring);
+        assert_eq!(one_short.plans[0].host.iter().filter(|&&h| h).count(), 1);
+        assert_eq!(one_short.plans[1].host.iter().filter(|&&h| h).count(), 4);
+        let one_short_avail = RESIDENT_RING_HOST_RESERVE + (exact_for_two - 1)
+            - one_short.plans[0].host_bytes
+            - 2 * 110 * MIB
+            - one_short.plans[1].host_bytes
+            - 4 * 20 * MIB;
+        let one_short_ring = derive_resident_ring(
+            &vae_specs,
+            (3, 3),
+            (one_short_avail, RESIDENT_RING_HOST_RESERVE),
+            4096,
+        )?;
+        assert!(one_short_ring.ring);
+        assert_eq!(one_short_ring.in_flight, 6);
+
+        let exact = try_price_dense_stages(
+            tight_stages,
+            (tight_dev, exact_for_two, PAGE),
+            (19.0e9, 4.0e9),
+            0.0,
+            2,
+        )?
+        .context("tight exact plan")?;
+        assert!(exact.keeps_preload_ring);
+        assert_eq!(exact.plans[0].host.iter().filter(|&&h| h).count(), 2);
+        assert_eq!(exact.plans[1].host.iter().filter(|&&h| h).count(), 4);
+        let exact_avail = RESIDENT_RING_HOST_RESERVE + exact_for_two
+            - exact.plans[0].host_bytes
+            - 2 * 110 * MIB
+            - exact.plans[1].host_bytes
+            - 4 * 20 * MIB;
+        let exact_ring = derive_resident_ring(
+            &vae_specs,
+            (3, 3),
+            (exact_avail, RESIDENT_RING_HOST_RESERVE),
+            4096,
+        )?;
+        assert!(exact_ring.ring);
+        assert_eq!(exact_ring.in_flight, 6);
+
+        // Extreme tight budget: fits disk-only supplies (2*110 + 2*100 = 420 MiB) but not vae_ring_floor.
+        let disk_only_budget = 2 * 110 * MIB + 2 * 100 * MIB;
+        let extreme = try_price_dense_stages(
+            tight_stages,
+            (tight_dev, disk_only_budget, PAGE),
+            (19.0e9, 4.0e9),
+            0.0,
+            2,
+        )?
+        .context("extreme tight budget must fall back instead of failing init")?;
+        assert!(!extreme.keeps_preload_ring);
+        assert_eq!(extreme.plans[0].host_bytes, 0);
+        assert_eq!(extreme.plans[1].host_bytes, 0);
+        assert_eq!(extreme.plans[2].slot_bytes, 0);
+        Ok(())
     }
 
     #[test]
