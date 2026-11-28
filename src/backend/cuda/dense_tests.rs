@@ -2705,6 +2705,7 @@ fn dense_cells_exclude_unsupported_wmma() {
         sm_shared_bytes: 65536,
         cooperative: true,
         optin_shared_bytes: 65536,
+        clock_khz: 2_500_000,
         memory_bytes_per_second: 1.0,
     };
     assert!(wmma_cells(&info));

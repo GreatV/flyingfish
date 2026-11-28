@@ -513,6 +513,7 @@ mod tests {
             sm_shared_bytes: 102_400,
             cooperative: true,
             optin_shared_bytes,
+            clock_khz: 2_520_000,
             memory_bytes_per_second: 1.0e12,
         }
     }
@@ -534,6 +535,7 @@ mod tests {
             sm_shared_bytes: 65_536,
             cooperative: true,
             optin_shared_bytes,
+            clock_khz: 2_500_000,
             memory_bytes_per_second: 8.64e11,
         }
     }
@@ -1001,7 +1003,7 @@ impl ProductKernel {
         }
     }
 
-    fn tile_dims(self, arch: &crate::backend::setup::DeviceArchitecture) -> (u32, u32) {
+    pub(crate) fn tile_dims(self, arch: &crate::backend::setup::DeviceArchitecture) -> (u32, u32) {
         match arch {
             crate::backend::setup::DeviceArchitecture::Cuda(_) => (128, 256),
             crate::backend::setup::DeviceArchitecture::Hip(_) => match self {

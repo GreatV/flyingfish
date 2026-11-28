@@ -62,6 +62,7 @@ pub struct DeviceInfo {
     pub sm_shared_bytes: usize,
     pub cooperative: bool,
     pub optin_shared_bytes: usize,
+    pub clock_khz: i32,
     pub memory_bytes_per_second: f64,
 }
 
@@ -74,6 +75,40 @@ impl DeviceInfo {
             self.warp
         );
         Ok(())
+    }
+
+    /// Peak dense BF16/FP16-input FP32-accumulate (`int8 == false`) or INT8 (`int8 == true`)
+    /// tensor-core operations per second from sensed SM/CU count and clock rate.
+    pub fn peak_tensor_ops_per_second(&self, int8: bool) -> Result<f64> {
+        ensure!(
+            self.sms > 0 && self.clock_khz > 0,
+            "invalid device topology for tensor peak: sms={} clock_khz={}",
+            self.sms,
+            self.clock_khz
+        );
+        let ops_per_sm_clock: u32 = match (&self.arch, int8) {
+            (DeviceArchitecture::Cuda(75 | 86 | 87 | 89 | 120), false) => 512,
+            (DeviceArchitecture::Cuda(75 | 86 | 87 | 89 | 120), true) => 2048,
+            (DeviceArchitecture::Cuda(80), false) => 2048,
+            (DeviceArchitecture::Cuda(80), true) => 4096,
+            (DeviceArchitecture::Cuda(90 | 100), false) => 4096,
+            (DeviceArchitecture::Cuda(90 | 100), true) => 8192,
+            (DeviceArchitecture::Hip(arch), false) if arch.starts_with("gfx11") => 512,
+            (DeviceArchitecture::Hip(arch), true) if arch.starts_with("gfx11") => 512,
+            (DeviceArchitecture::Hip(arch), false) if arch.starts_with("gfx12") => 1024,
+            (DeviceArchitecture::Hip(arch), true) if arch.starts_with("gfx12") => 2048,
+            (other, _) => anyhow::bail!(
+                "no tensor-core rate defined for device architecture {other} (int8={int8})"
+            ),
+        };
+        let peak =
+            (self.sms as f64) * f64::from(ops_per_sm_clock) * (f64::from(self.clock_khz) * 1000.0);
+        ensure!(
+            peak.is_finite() && peak > 0.0,
+            "non-finite tensor peak {peak} for {}",
+            self.arch
+        );
+        Ok(peak)
     }
 }
 
@@ -486,6 +521,7 @@ mod long_tests {
             sm_shared_bytes: 100 << 10,
             cooperative: true,
             optin_shared_bytes: 99 << 10,
+            clock_khz: 2_520_000,
             memory_bytes_per_second: 1_008_096_000_000.0,
         };
         info.require_cuda_tensor_ops("gemm_skinny")?;
@@ -550,6 +586,7 @@ mod long_tests {
             sm_shared_bytes: 100 << 10,
             cooperative: true,
             optin_shared_bytes: 99 << 10,
+            clock_khz: 2_520_000,
             memory_bytes_per_second: 1_008_096_000_000.0,
         };
         let mut info75 = info89.clone();
@@ -679,9 +716,78 @@ mod long_tests {
             sm_shared_bytes: 0,
             cooperative: false,
             optin_shared_bytes: 0,
+            clock_khz: 0,
             memory_bytes_per_second: 0.0,
         };
         assert!(tpu_info.require_cuda_tensor_ops("convrot").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn peak_tensor_ops_matches_supported_tables_and_rejects_unknown() -> Result<()> {
+        let make = |arch: DeviceArchitecture, sms: usize, clock_khz: i32| DeviceInfo {
+            name: String::new(),
+            arch,
+            sms,
+            l2_bytes: 0,
+            warp: 32,
+            max_threads: 1024,
+            shared_bytes: 49_152,
+            sm_shared_bytes: 65_536,
+            cooperative: true,
+            optin_shared_bytes: 65_536,
+            clock_khz,
+            memory_bytes_per_second: 1.0e12,
+        };
+        let cases = [
+            (DeviceArchitecture::Cuda(75), 40, 1_590_000, 512.0, 2048.0),
+            (DeviceArchitecture::Cuda(80), 108, 1_410_000, 2048.0, 4096.0),
+            (DeviceArchitecture::Cuda(86), 48, 1_560_000, 512.0, 2048.0),
+            (DeviceArchitecture::Cuda(89), 128, 2_520_000, 512.0, 2048.0),
+            (DeviceArchitecture::Cuda(90), 132, 1_830_000, 4096.0, 8192.0),
+            (DeviceArchitecture::Cuda(120), 170, 2_410_000, 512.0, 2048.0),
+            (
+                DeviceArchitecture::Hip("gfx1100".into()),
+                96,
+                2_500_000,
+                512.0,
+                512.0,
+            ),
+            (
+                DeviceArchitecture::Hip("gfx1201".into()),
+                64,
+                2_970_000,
+                1024.0,
+                2048.0,
+            ),
+        ];
+        for (arch, sms, clock_khz, bf16_rate, int8_rate) in cases {
+            let info = make(arch, sms, clock_khz);
+            let hz = f64::from(clock_khz) * 1000.0;
+            assert!(
+                (info.peak_tensor_ops_per_second(false)? - (sms as f64) * bf16_rate * hz).abs()
+                    < 1.0
+            );
+            assert!(
+                (info.peak_tensor_ops_per_second(true)? - (sms as f64) * int8_rate * hz).abs()
+                    < 1.0
+            );
+        }
+        assert!(
+            make(DeviceArchitecture::Cuda(70), 80, 1_530_000)
+                .peak_tensor_ops_per_second(false)
+                .is_err()
+        );
+        assert!(
+            make(DeviceArchitecture::Hip("gfx90a".into()), 104, 1_700_000)
+                .peak_tensor_ops_per_second(false)
+                .is_err()
+        );
+        assert!(
+            make(DeviceArchitecture::Cuda(89), 128, 0)
+                .peak_tensor_ops_per_second(false)
+                .is_err()
+        );
         Ok(())
     }
 }

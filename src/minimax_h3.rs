@@ -616,26 +616,50 @@ pub fn stored_scratch_extents(spec: &H3Spec) -> Result<Option<(usize, usize)>> {
     Ok(Some((k, low_rank)))
 }
 
-/// Bytes of one HyperFlow stored scratch for `rows`: when `k > 0`, one f32 buffer of `rows * k` (upcast input below
-/// 17 rows, aliased as int8 codes at 17+ rows) and one f32 scale per row; plus `rows * stored_low_rank_pitch(low_rank)`
-/// bf16 elements. Zero when the spec is not HyperFlow.
+/// Bytes of one ConvRot activation/codes scratch for `rows` and `k`: `max(rows * k, min(rows, 16) * k * 4)`
+/// rounded up to 4 bytes (`i8` codes at `TENSOR_CORE_ROWS` and above, `f32` upcast below), or 0 when `k == 0`.
+pub fn convrot_scratch_bytes(rows: usize, k: usize) -> Result<u64> {
+    if k == 0 {
+        return Ok(0);
+    }
+    let rows = u64::try_from(rows)?;
+    let k = u64::try_from(k)?;
+    let codes = rows.checked_mul(k).context("convrot codes bytes")?;
+    let upcast_cap = u64::try_from(crate::convrot::TENSOR_CORE_ROWS - 1)?;
+    let upcast = rows
+        .min(upcast_cap)
+        .checked_mul(k)
+        .and_then(|n| n.checked_mul(4))
+        .context("convrot upcast bytes")?;
+    codes
+        .max(upcast)
+        .checked_add(3)
+        .map(|n| (n / 4) * 4)
+        .context("convrot scratch alignment")
+}
+
+/// Bytes of one HyperFlow stored scratch for `rows`: when `k > 0`, `convrot_scratch_bytes(rows, k)`
+/// plus one f32 scale per row; plus `rows * stored_low_rank_pitch(low_rank)` bf16 elements.
 pub fn stored_scratch_bytes(spec: &H3Spec, rows: usize) -> Result<u64> {
     let Some((k, low_rank)) = stored_scratch_extents(spec)? else {
         return Ok(0);
     };
-    let rows = u64::try_from(rows)?;
-    let k = u64::try_from(k)?;
+    let rows_u64 = u64::try_from(rows)?;
     let mid = u64::try_from(stored_low_rank_pitch(low_rank))?;
-    let f32_elems = if k > 0 {
-        rows.checked_mul(k)
-            .and_then(|n| n.checked_add(rows))
-            .context("stored scratch elements")?
+    let convrot = if k > 0 {
+        convrot_scratch_bytes(rows, k)?
+            .checked_add(rows_u64.checked_mul(4).context("convrot scale bytes")?)
+            .context("stored scratch convrot bytes")?
     } else {
         0
     };
-    f32_elems
-        .checked_mul(4)
-        .and_then(|n| n.checked_add(rows.checked_mul(mid)?.checked_mul(2)?))
+    convrot
+        .checked_add(
+            rows_u64
+                .checked_mul(mid)
+                .and_then(|n| n.checked_mul(2))
+                .context("stored scratch mid bytes")?,
+        )
         .context("stored scratch bytes")
 }
 
@@ -3663,5 +3687,26 @@ fn hyperflow_component_selection_rejects_bf16_only_on_cuda() -> Result<()> {
         select_hyperflow_component(root, Some(&bf16), Some(&int8), false, |_, _| Ok(false))?,
         int8.0.as_path()
     );
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn convrot_scratch_bytes_matches_i8_at_tensor_core_rows_and_f32_below() -> Result<()> {
+    let k = 14_336usize;
+    assert_eq!(convrot_scratch_bytes(37_717, 0)?, 0);
+    // Below TENSOR_CORE_ROWS (17), upcast f32 buffer is rows * k * 4.
+    assert_eq!(convrot_scratch_bytes(7, k)?, (7 * k * 4) as u64);
+    assert_eq!(convrot_scratch_bytes(16, k)?, (16 * k * 4) as u64);
+    // At 17 rows, still covers any sub-17 f32 tail (16 * k * 4 = 917_504 B > 17 * k).
+    assert_eq!(convrot_scratch_bytes(17, k)?, (16 * k * 4) as u64);
+    // At production 37_717 rows, i8 codes dominate: 540_710_912 B (reclaiming 1_622_132_736 B vs f32).
+    assert_eq!(convrot_scratch_bytes(37_717, k)?, 540_710_912);
+    assert_eq!(
+        (37_717 * k * 4) as u64 - convrot_scratch_bytes(37_717, k)?,
+        1_622_132_736
+    );
+    // Odd byte count rounds up to 4-byte f32 alignment.
+    assert_eq!(convrot_scratch_bytes(65, 1)?, 68);
     Ok(())
 }

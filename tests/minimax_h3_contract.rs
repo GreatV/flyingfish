@@ -6,12 +6,12 @@ use flyingfish::{
         AUDIO_TAG, AdalnPlan, DecodePlan, FlowStep, Geometry, H3Spec, IMAGE_MIN_GENERATION_AREA,
         IMAGE_TAG, ImageLayout, ImageSchedule, ImageSpec, ImageVaeSpec, KeyframeAnchor,
         LinearStorage, PackedLayout, RowTimesteps, Schedule, TEXT_TAG, VIDEO_TAG, VaeSpec,
-        VaeTiles, dropped_block, hyperflow_steps, image_canvas, image_edit_rows,
-        image_latent_extent, image_layout, image_picture_label, image_reference_latent_extent,
-        image_reference_size, image_rgb8, image_row_plan, image_row_timesteps, image_text_rows,
-        mix_temb, pad_lowrank, patchify_latents, report_stored_placement, row_timestep_plan,
-        stored_scratch_bytes, stored_scratch_extents, unchunked_activation_bytes,
-        unpatchify_latents,
+        VaeTiles, convrot_scratch_bytes, dropped_block, hyperflow_steps, image_canvas,
+        image_edit_rows, image_latent_extent, image_layout, image_picture_label,
+        image_reference_latent_extent, image_reference_size, image_rgb8, image_row_plan,
+        image_row_timesteps, image_text_rows, mix_temb, pad_lowrank, patchify_latents,
+        report_stored_placement, row_timestep_plan, stored_scratch_bytes, stored_scratch_extents,
+        unchunked_activation_bytes, unpatchify_latents,
     },
     prefill::DensePlacement,
 };
@@ -2117,13 +2117,14 @@ fn hyperflow_stored_placement_prints_124_resident_and_345_streamed() -> Result<(
         "scratch extents {k} {low_rank}"
     );
     let per_row = |n: usize| -> Result<u64> {
+        let convrot = convrot_scratch_bytes(n, k)?;
         let n = u64::try_from(n)?;
         let pitch = if low_rank == 0 {
             1
         } else {
             low_rank.div_ceil(8) * 8
         };
-        Ok(n * u64::try_from(k)? * 4 + n * 4 + n * u64::try_from(pitch)? * 2)
+        Ok(convrot + n * 4 + n * u64::try_from(pitch)? * 2)
     };
     let video_audio_scratch = per_row(rows)?;
     let scratch = per_row(packed)? + per_row(text_rows)?;
