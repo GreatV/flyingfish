@@ -7048,11 +7048,16 @@ impl Dit {
             .chain(&self.refiners)
             .find(|b| b.storage.is_some())
             .context("MiniMax dense setup requires a resident published block")?;
-        let qualify = |role: usize, rows: usize, output: Tensor<bf16, 2>| -> Result<()> {
+        let qualify = |role: usize,
+                       rows: usize,
+                       activation: &CudaSlice<bf16>,
+                       output: Tensor<bf16, 2>|
+         -> Result<()> {
             let BlockLinear::Dense { weight, .. } = block.linears[role] else {
                 bail!("MiniMax qualification expected a dense projection");
             };
             let width = weight.shape[0] as usize;
+            let k = weight.shape[1] as usize;
             let elements = rows.checked_mul(width).context("dense setup extent")?;
             if elements > work.k_raw.len().min(work.v_raw.len()) {
                 if crate::backend::diagnostics_enabled() {
@@ -7063,14 +7068,7 @@ impl Dit {
                 }
                 return Ok(());
             }
-            let input = rows_view(
-                &work.normed,
-                stream,
-                0,
-                rows,
-                weight.shape[1] as usize,
-                weight.shape[1] as usize,
-            )?;
+            let input = rows_view(activation, stream, 0, rows, k, k)?;
             let copies = [
                 rows_view(&work.k_raw, stream, 0, rows, width, width)?,
                 rows_view(&work.v_raw, stream, 0, rows, width, width)?,
@@ -7084,12 +7082,19 @@ impl Dit {
             )
         };
         let q = matrix(&work.q_raw, stream, work.rows, work.q_raw.len() / work.rows)?;
-        qualify(Q, work.rows, q)?;
-        qualify(FF_IN, work.chunk, work.hidden)?;
+        qualify(Q, work.rows, &work.normed, q)?;
+        qualify(FF_IN, work.chunk, &work.normed, work.hidden)?;
         let tail = work.rows % work.chunk;
         if tail > 0 {
-            qualify(FF_IN, tail, work.hidden)?;
+            qualify(FF_IN, tail, &work.normed, work.hidden)?;
         }
+        ensure!(
+            work.rows > 0 && work.normed.len().is_multiple_of(work.rows),
+            "attention-out rows"
+        );
+        let hidden = work.normed.len() / work.rows;
+        let out = rows_view(&work.normed, stream, 0, work.rows, hidden, hidden)?;
+        qualify(OUT, work.rows, &work.q_raw, out)?;
         Ok(())
     }
 
@@ -19266,9 +19271,11 @@ mod tests {
         let spec = H3Spec::read(&model)?;
         ensure!(!spec.is_hyperflow()?, "non-HyperFlow video");
         let geometry = Geometry::resolve(&spec, 768, 1344, 124)?;
-        let text = vec![TEXT_TAG; 4];
+        // 1023 text tokens, one first-frame anchor, 124 frames, 1344x768.
+        let text = vec![TEXT_TAG; 1023];
         let layout = PackedLayout::build(&spec, &geometry, &text, &[KeyframeAnchor::First])?;
         let rows = layout.rows();
+        ensure!(rows == 39741, "packed rows");
         let initial = ffn_chunk(rows);
         let output = 2 * spec.ffn;
         let comparison = rows * spec.heads * spec.head_dim;
@@ -19348,7 +19355,7 @@ mod tests {
                 dit.work.rows
             );
             ensure!(
-                dit.work.rows == rows && fits,
+                dit.work.rows == 39741 && fits,
                 "FF_IN qualify skipped for lack of comparison buffer"
             );
             let shape = |rows| LinearShape {
@@ -19371,7 +19378,20 @@ mod tests {
                     "tail family parent missing or ordinary tail parent prepared"
                 );
             }
-            println!("H3_VIDEO_GATE_QUALIFY PASS family_parent=1 ordinary_parent=0");
+            ensure!(
+                blas.dense_parent_count(
+                    LinearShape {
+                        rows: dit.work.rows,
+                        output: spec.hidden,
+                        input: spec.heads * spec.head_dim,
+                    },
+                    false,
+                ) == 1,
+                "attention-out parent missing"
+            );
+            println!(
+                "H3_VIDEO_GATE_QUALIFY PASS family_parent=1 ordinary_parent=0 attention_out_parent=1"
+            );
             Ok(())
         })();
         let cleanup = fs::remove_dir_all(&runtime);
