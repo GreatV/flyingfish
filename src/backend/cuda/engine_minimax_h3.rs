@@ -5864,10 +5864,25 @@ fn stored_allocation_granularity(d: &Device) -> Result<usize> {
     #[cfg(feature = "cuda")]
     let granularity = {
         use cudarc::driver::sys::{self, CUmemAllocationGranularity_flags as G};
+        #[repr(C)]
+        struct DeviceLocation {
+            type_: sys::CUmemLocationType,
+            id: std::ffi::c_int,
+        }
+        const _: () = assert!(
+            std::mem::size_of::<DeviceLocation>() == std::mem::size_of::<sys::CUmemLocation>()
+        );
+        const _: () = assert!(
+            std::mem::align_of::<DeviceLocation>() == std::mem::align_of::<sys::CUmemLocation>()
+        );
         let mut properties: sys::CUmemAllocationProp = unsafe { std::mem::zeroed() };
         properties.type_ = sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
-        properties.location.type_ = sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
-        properties.location.__bindgen_anon_1.id = d.ctx.cu_device();
+        properties.location = unsafe {
+            std::mem::transmute::<DeviceLocation, sys::CUmemLocation>(DeviceLocation {
+                type_: sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
+                id: d.ctx.cu_device(),
+            })
+        };
         let mut granularity = 0;
         unsafe {
             sys::cuMemGetAllocationGranularity(
