@@ -1101,7 +1101,7 @@ mod tests {
                 let pos = live
                     .iter()
                     .position(|&x| x == step.block)
-                    .expect("release_after block not live");
+                    .with_context(|| format!("release_after block {} not live", step.block))?;
                 live.remove(pos);
             }
         }
